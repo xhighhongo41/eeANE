@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 開発資料フォルダ
+開発資料
+開発資料/*
+開発資料/**/*
+
+# PROJECT.md
+PROJECT.md
+
