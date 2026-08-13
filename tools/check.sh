@@ -4,4 +4,4 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 uv run ruff check .
 uv run ruff format --check .
-# uv run pytest -q  # enabled in T3
+uv run pytest -q
