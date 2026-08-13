@@ -225,3 +225,8 @@ __marimo__/
 # PROJECT.md
 PROJECT.md
 
+# eeANE: local models and PoC outputs
+models/
+poc/results/
+testdata/corpus/raw/
+
