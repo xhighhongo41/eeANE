@@ -24,6 +24,11 @@ from transformers.models.modernbert import modeling_modernbert
 TARGETS = {"macos13": ct.target.macOS13, "macos15": ct.target.macOS15}
 PRECISIONS = {"fp16": ct.precision.FLOAT16, "fp32": ct.precision.FLOAT32}
 
+# Captured at import time so patch_eager_attention_rank4() can delegate the
+# non-eager attention paths to the untouched upstream implementation, and so
+# that applying the patch twice cannot recurse.
+_ORIGINAL_ATTENTION_FORWARD = modeling_modernbert.ModernBertAttention.forward
+
 
 def patch_rotate_half() -> None:
     """Replace ModernBert's ``rotate_half`` with a static-shape equivalent.
@@ -42,6 +47,107 @@ def patch_rotate_half() -> None:
         return torch.cat((-x2, x1), dim=-1)
 
     modeling_modernbert.rotate_half = rotate_half
+
+
+def patch_eager_attention_rank4() -> None:
+    """Rewrite ModernBert's eager attention without rank-5 intermediates.
+
+    Upstream splits the fused projection with
+    ``qkv.view(bs, -1, 3, heads, head_dim).transpose(3, 1).unbind(dim=2)``,
+    which materializes rank-5 tensors. At B=1 the leading batch axis is
+    degenerate and the ANE compiler copes, but for B>1 loading the compiled
+    model on CPU_AND_NE fails with
+    "MILCompilerForANE error: failed to compile ANE model using ANEF.
+    Error=_ANECompiler : ANECCompile() FAILED." and the whole model silently
+    falls back to CPU (where the ``finfo.min`` mask makes the outputs NaN,
+    the v0.1 known limitation).
+
+    Because ``Wqkv`` emits the three projections contiguously along the last
+    axis with the 3 as the outermost sub-index, ``chunk(3, dim=-1)``
+    followed by a rank-4 ``view``/``transpose`` selects exactly the same
+    elements as the upstream rank-5 path. The rewrite is therefore
+    bit-exact (verified: max |patched - upstream| = 0.0 on ruri-v3-310m)
+    and only changes tensor rank, never semantics.
+
+    Only the ``eager`` attention path is rewritten; ``sdpa`` and
+    ``flash_attention_2`` keep the upstream implementation, so the FP32
+    baselines used by the sanity checks are unaffected.
+
+    Raises:
+        ValueError: If a patched module's head geometry contradicts the
+            ``heads * head_dim == all_head_size`` layout assumption.
+    """
+
+    def eager_attention_rank4(
+        module: modeling_modernbert.ModernBertAttention,
+        qkv: torch.Tensor,
+        attention_mask: torch.Tensor,
+        sliding_window_mask: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        local_attention: tuple[int, int],
+        bs: int,
+        dim: int,
+        output_attentions: bool = False,
+        **_kwargs: Any,
+    ) -> tuple[torch.Tensor, ...]:
+        """Eager attention over a rank-3 ``qkv`` of shape (B, S, 3*H*D)."""
+        cos, sin = module.rotary_emb(qkv, position_ids=position_ids)
+        heads, head_dim = module.num_heads, module.head_dim
+        # (B, S, 3*H*D) -> three (B, H, S, D) tensors, all rank 4.
+        query, key, value = (
+            part.view(bs, -1, heads, head_dim).transpose(1, 2) for part in qkv.chunk(3, dim=-1)
+        )
+        query, key = modeling_modernbert.apply_rotary_pos_emb(query, key, cos, sin)
+
+        scale = head_dim**-0.5
+        attn_weights = torch.matmul(query, key.transpose(2, 3)) * scale
+        if local_attention != (-1, -1):
+            attention_mask = sliding_window_mask
+        attn_weights = attn_weights + attention_mask
+        # Upstream upcasts the softmax to fp32 before casting back.
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query.dtype
+        )
+        attn_weights = torch.nn.functional.dropout(
+            attn_weights, p=module.attention_dropout, training=module.training
+        )
+        attn_output = torch.matmul(attn_weights, value)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, dim)
+        if output_attentions:
+            return (attn_output, attn_weights)
+        return (attn_output,)
+
+    def attention_forward(
+        self: modeling_modernbert.ModernBertAttention,
+        hidden_states: torch.Tensor,
+        output_attentions: bool = False,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, ...]:
+        """Replacement for ``ModernBertAttention.forward``."""
+        if self.config._attn_implementation != "eager":
+            return _ORIGINAL_ATTENTION_FORWARD(
+                self, hidden_states, output_attentions=output_attentions, **kwargs
+            )
+        if self.all_head_size != self.num_heads * self.head_dim:
+            raise ValueError(
+                "unexpected ModernBert head geometry "
+                f"({self.num_heads} heads x {self.head_dim} != {self.all_head_size}); "
+                "the rank-4 qkv split assumption does not hold"
+            )
+        # The rank-5 view of the upstream forward is skipped entirely.
+        attn_outputs = eager_attention_rank4(
+            self,
+            qkv=self.Wqkv(hidden_states),
+            local_attention=self.local_attention,
+            bs=hidden_states.shape[0],
+            dim=self.all_head_size,
+            output_attentions=output_attentions,
+            **kwargs,
+        )
+        hidden_states = self.out_drop(self.Wo(attn_outputs[0]))
+        return (hidden_states,) + attn_outputs[1:]
+
+    modeling_modernbert.ModernBertAttention.forward = attention_forward
 
 
 def patch_mask_fill_value(model: torch.nn.Module, fill_value: float) -> None:
@@ -84,14 +190,29 @@ def trace_model(wrapper: torch.nn.Module, example: dict[str, np.ndarray]) -> tor
 
 
 def convert_model(
-    traced: torch.jit.ScriptModule, seq_len: int, precision: str, target: str, output_name: str
+    traced: torch.jit.ScriptModule,
+    seq_len: int,
+    precision: str,
+    target: str,
+    output_name: str,
+    batch_size: int = 1,
 ) -> ct.models.MLModel:
-    """Convert the traced module to an in-memory ML program (§4.4)."""
+    """Convert the traced module to an in-memory ML program (§4.4).
+
+    Args:
+        traced: Module produced by :func:`trace_model`.
+        seq_len: Fixed sequence length S.
+        precision: Key into :data:`PRECISIONS`.
+        target: Key into :data:`TARGETS`.
+        output_name: Name given to the single graph output.
+        batch_size: Fixed batch size B (v0.3実装計画.md §4.2). The default
+            of 1 reproduces the v0.1/v0.2 artifacts bit-for-bit.
+    """
     return ct.convert(
         traced,
         inputs=[
-            ct.TensorType(name="input_ids", shape=(1, seq_len), dtype=np.int32),
-            ct.TensorType(name="attention_mask", shape=(1, seq_len), dtype=np.int32),
+            ct.TensorType(name="input_ids", shape=(batch_size, seq_len), dtype=np.int32),
+            ct.TensorType(name="attention_mask", shape=(batch_size, seq_len), dtype=np.int32),
         ],
         outputs=[ct.TensorType(name=output_name)],
         convert_to="mlprogram",

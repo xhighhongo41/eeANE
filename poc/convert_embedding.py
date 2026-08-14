@@ -2,11 +2,14 @@
 
 Pipeline (see 開発資料/v0.1実装計画.md §4.1-§4.5):
 HF model -> EmbeddingWrapper (in-graph mean pooling) -> torch.jit.trace
--> ct.convert (mlprogram, fixed (1, S) int32 inputs) -> .mlpackage
+-> ct.convert (mlprogram, fixed (B, S) int32 inputs) -> .mlpackage
 -> `xcrun coremlcompiler` -> .mlmodelc -> sanity check on CPU_AND_NE.
 
+The batch size B is fixed at conversion time (v0.3実装計画.md §4.2);
+``--batch 1`` reproduces the v0.1/v0.2 artifacts and their naming.
+
 Usage:
-    uv run python poc/convert_embedding.py --seq-len 512
+    uv run python poc/convert_embedding.py --seq-len 512 --batch 4
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from typing import Any
 import coremltools as ct
 import numpy as np
 import torch
+from transformers import PreTrainedTokenizerBase
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -42,6 +46,7 @@ from poc.convert_common import (  # noqa: E402
     build_versions_info,
     compile_model,
     convert_model,
+    patch_eager_attention_rank4,
     patch_mask_fill_value,
     patch_rotate_half,
     resolve_output_key,
@@ -62,6 +67,16 @@ SANITY_TEXTS: list[str] = [
 
 # Minimum cosine similarity against the PyTorch FP32 baseline (§4.5 step 6).
 SANITY_COSINE_THRESHOLD = 0.99
+
+# Filler text for the rows that pad the last sanity batch when the number of
+# sanity texts is not a multiple of B. The empty string encodes to special
+# tokens only, so the row still has a non-empty attention mask (a fully
+# masked row would risk NaN, v0.3実装計画.md §4.2).
+BATCH_PADDING_TEXT = ""
+
+# Minimum cosine similarity between rows of a batch holding the same text
+# (batch consistency check, v0.3実装計画.md §4.2 / R1).
+BATCH_CONSISTENCY_COSINE_THRESHOLD = 0.99999
 
 
 class EmbeddingWrapper(torch.nn.Module):
@@ -101,6 +116,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments (``argv`` defaults to ``sys.argv[1:]``)."""
     parser = argparse.ArgumentParser(description="Convert ruri-v3-310m to a Core ML program.")
     parser.add_argument("--seq-len", type=int, required=True, help="Fixed sequence length S.")
+    parser.add_argument("--batch", type=int, default=1, help="Fixed batch size B (default: 1).")
     parser.add_argument(
         "--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Local HF model directory."
     )
@@ -135,8 +151,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_stem(args: argparse.Namespace) -> str:
-    """Build the artifact base name, e.g. ``s512_b1_eager_macos13`` (§4.4)."""
-    stem = f"s{args.seq_len}_b1_{args.attn}_{args.target}"
+    """Build the artifact base name, e.g. ``s512_b4_eager_macos13`` (§4.4).
+
+    ``--batch 1`` yields the same name as the v0.1/v0.2 artifacts.
+    """
+    stem = f"s{args.seq_len}_b{args.batch}_{args.attn}_{args.target}"
     if args.precision == "fp32":
         stem += "_fp32"
     if args.mask_fill_value is not None:
@@ -145,35 +164,135 @@ def build_stem(args: argparse.Namespace) -> str:
     return stem
 
 
-def run_sanity_check(mlmodelc_path: Path, model_dir: Path, seq_len: int) -> dict[str, Any]:
+def _fill_batch(rows: np.ndarray, padding_row: np.ndarray, batch_size: int) -> np.ndarray:
+    """Pad a partial input chunk up to ``batch_size`` rows.
+
+    Args:
+        rows: Chunk of tokenized rows, shape (n, S) with ``n <= batch_size``.
+        padding_row: Filler row, shape (1, S).
+        batch_size: Fixed batch size B expected by the model.
+
+    Returns:
+        Array of shape (batch_size, S); ``rows`` itself when already full.
+    """
+    missing = batch_size - rows.shape[0]
+    if missing <= 0:
+        return rows
+    return np.concatenate([rows, np.repeat(padding_row, missing, axis=0)], axis=0)
+
+
+def _predict_rows(
+    compiled: ct.models.CompiledMLModel,
+    tokens: dict[str, np.ndarray],
+    padding: dict[str, np.ndarray],
+    batch_size: int,
+) -> tuple[str, np.ndarray]:
+    """Embed all tokenized rows with a model whose batch size is fixed to B.
+
+    Rows are grouped into chunks of ``batch_size``; a trailing partial chunk
+    is padded with :data:`BATCH_PADDING_TEXT` rows whose outputs are dropped.
+
+    Args:
+        compiled: Loaded compiled model.
+        tokens: Tokenized rows, each value of shape (N, S).
+        padding: Tokenized filler row, each value of shape (1, S).
+        batch_size: Fixed batch size B of the model.
+
+    Returns:
+        Tuple of the resolved output key and the embeddings, shape (N, H).
+
+    Raises:
+        ValueError: If ``tokens`` holds no rows.
+    """
+    n_rows = int(tokens["input_ids"].shape[0])
+    if n_rows == 0:
+        raise ValueError("no rows to predict")
+    output_key = ""
+    rows: list[np.ndarray] = []
+    for start in range(0, n_rows, batch_size):
+        end = min(start + batch_size, n_rows)
+        prediction = compiled.predict(
+            {
+                key: _fill_batch(tokens[key][start:end], padding[key], batch_size)
+                for key in ("input_ids", "attention_mask")
+            }
+        )
+        output_key = output_key or resolve_output_key(prediction, "embedding")
+        values = np.asarray(prediction[output_key], dtype=np.float32).reshape(batch_size, -1)
+        rows.extend(values[: end - start])
+    return output_key, np.stack(rows)
+
+
+def check_batch_consistency(
+    compiled: ct.models.CompiledMLModel,
+    tokenizer: PreTrainedTokenizerBase,
+    seq_len: int,
+    batch_size: int,
+    output_key: str,
+) -> dict[str, Any]:
+    """Verify that rows of one batch do not influence each other (R1).
+
+    Predicts a single batch whose B rows all hold ``SANITY_TEXTS[0]`` and
+    compares row 0 with every other row.
+
+    Args:
+        compiled: Loaded compiled model.
+        tokenizer: Tokenizer returned by ``load_tokenizer``.
+        seq_len: Fixed sequence length S.
+        batch_size: Fixed batch size B of the model (must be > 1).
+        output_key: Output key resolved by :func:`_predict_rows`.
+
+    Returns:
+        Dict with the per-row cosine similarities against row 0, their
+        min/max, the threshold, and the pass/fail flag.
+    """
+    tokens = tokenize_batch(tokenizer, [SANITY_TEXTS[0]] * batch_size, seq_len)
+    prediction = compiled.predict(
+        {"input_ids": tokens["input_ids"], "attention_mask": tokens["attention_mask"]}
+    )
+    embeddings = np.asarray(prediction[output_key], dtype=np.float32).reshape(batch_size, -1)
+    # Compare row 0 against rows 1..B-1 of the very same prediction.
+    reference = np.repeat(embeddings[:1], batch_size - 1, axis=0)
+    cosines = cosine_rowwise(reference, embeddings[1:])
+    return {
+        "text_index": 0,
+        "cosine_per_row": [float(c) for c in cosines],
+        "cosine_min": float(cosines.min()),
+        "cosine_max": float(cosines.max()),
+        "cosine_threshold": BATCH_CONSISTENCY_COSINE_THRESHOLD,
+        "passed": bool(np.isfinite(cosines).all())
+        and bool(cosines.min() >= BATCH_CONSISTENCY_COSINE_THRESHOLD),
+    }
+
+
+def run_sanity_check(
+    mlmodelc_path: Path, model_dir: Path, seq_len: int, batch_size: int = 1
+) -> dict[str, Any]:
     """Run the Core ML model on CPU_AND_NE and compare with the FP32 baseline.
 
     Args:
         mlmodelc_path: Compiled model directory.
         model_dir: Local HF model directory (for the baseline and tokenizer).
         seq_len: Fixed sequence length S.
+        batch_size: Fixed batch size B of the compiled model.
 
     Returns:
-        Dict with the output key, per-text cosine similarities, and the
-        pass/fail flags for (a) finiteness and (b) the cosine threshold.
+        Dict with the output key, per-text cosine similarities, the batch
+        consistency result (``None`` for B=1), and the pass/fail flags for
+        (a) finiteness, (b) the cosine threshold and (c) batch consistency.
     """
     tokenizer = load_tokenizer(model_dir)
-    batch = tokenize_batch(tokenizer, SANITY_TEXTS, seq_len)
+    tokens = tokenize_batch(tokenizer, SANITY_TEXTS, seq_len)
+    padding = tokenize_batch(tokenizer, [BATCH_PADDING_TEXT], seq_len)
     compiled = ct.models.CompiledMLModel(
         str(mlmodelc_path), compute_units=ct.ComputeUnit.CPU_AND_NE
     )
-    output_key: str | None = None
-    rows: list[np.ndarray] = []
-    for i in range(len(SANITY_TEXTS)):
-        prediction = compiled.predict(
-            {
-                "input_ids": batch["input_ids"][i : i + 1],
-                "attention_mask": batch["attention_mask"][i : i + 1],
-            }
-        )
-        output_key = output_key or resolve_output_key(prediction, "embedding")
-        rows.append(np.asarray(prediction[output_key], dtype=np.float32).reshape(-1))
-    coreml_emb = np.stack(rows)
+    output_key, coreml_emb = _predict_rows(compiled, tokens, padding, batch_size)
+    consistency = (
+        check_batch_consistency(compiled, tokenizer, seq_len, batch_size, output_key)
+        if batch_size > 1
+        else None
+    )
 
     # FP32 reference: sdpa attention, pooling shared via poc.common.mean_pool.
     baseline_model = load_torch_model(model_dir, attn="sdpa")
@@ -186,12 +305,18 @@ def run_sanity_check(mlmodelc_path: Path, model_dir: Path, seq_len: int) -> dict
     return {
         "output_key": output_key,
         "compute_units": "CPU_AND_NE",
+        "batch_size": batch_size,
         "cosine_per_text": [float(c) for c in cosines],
         "cosine_min": float(cosines.min()),
         "cosine_mean": float(cosines.mean()),
         "cosine_threshold": SANITY_COSINE_THRESHOLD,
+        "batch_consistency": consistency,
         "finite": finite,
-        "passed": finite and bool(cosines.min() >= SANITY_COSINE_THRESHOLD),
+        "passed": (
+            finite
+            and bool(cosines.min() >= SANITY_COSINE_THRESHOLD)
+            and (consistency is None or bool(consistency["passed"]))
+        ),
     }
 
 
@@ -206,6 +331,7 @@ def build_metadata(
     return {
         "args": {
             "seq_len": args.seq_len,
+            "batch": args.batch,
             "model_dir": str(args.model_dir),
             "out_root": str(args.out_root),
             "attn": args.attn,
@@ -216,6 +342,7 @@ def build_metadata(
         "versions": build_versions_info(),
         "patches": {
             "rotate_half_static": True,
+            "eager_attention_rank4": True,
             "mask_fill_value": args.mask_fill_value is not None,
         },
         "artifacts": {"mlpackage": str(mlpackage_path), "mlmodelc": str(mlmodelc_path)},
@@ -236,6 +363,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.seq_len <= 0:
         raise SystemExit("--seq-len must be a positive integer")
+    if args.batch <= 0:
+        raise SystemExit("--batch must be a positive integer")
     stem = build_stem(args)
     out_dir = args.out_root / args.model_dir.resolve().name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -253,6 +382,12 @@ def main(argv: list[str] | None = None) -> int:
     if head_dim % 2 != 0:
         raise SystemExit(f"odd RoPE head dim ({head_dim}) is incompatible with patch_rotate_half")
     patch_rotate_half()
+    # Rank-5 attention intermediates make the ANE compiler reject the model
+    # at B>1 (v0.3実装計画.md §4.11). The rewrite is bit-exact and is applied
+    # at every batch size so the S×B sweep compares one graph shape instead
+    # of mixing rank-5 (B=1) and rank-4 (B>1) variants.
+    print("      applying rank-4 eager attention rewrite")
+    patch_eager_attention_rank4()
     if args.mask_fill_value is not None:
         print(f"      applying experimental mask fill value {args.mask_fill_value}")
         patch_mask_fill_value(model, args.mask_fill_value)
@@ -261,15 +396,19 @@ def main(argv: list[str] | None = None) -> int:
     print("[2/7] Wrapping with in-graph mean pooling")
     wrapper = EmbeddingWrapper(model).eval()
 
-    print(f"[3/7] Tracing with a fixed (1, {args.seq_len}) example input")
+    print(f"[3/7] Tracing with a fixed ({args.batch}, {args.seq_len}) example input")
     step = time.perf_counter()
-    example = tokenize_batch(tokenizer, [TRACE_EXAMPLE_TEXT], args.seq_len)
+    # The single trace text is replicated to B rows so the traced graph
+    # already carries the target batch size.
+    example = tokenize_batch(tokenizer, [TRACE_EXAMPLE_TEXT] * args.batch, args.seq_len)
     traced = trace_model(wrapper, example)
     timings["trace"] = time.perf_counter() - step
 
     print(f"[4/7] Converting to mlprogram ({args.precision}, {args.target})")
     step = time.perf_counter()
-    mlmodel = convert_model(traced, args.seq_len, args.precision, args.target, "embedding")
+    mlmodel = convert_model(
+        traced, args.seq_len, args.precision, args.target, "embedding", batch_size=args.batch
+    )
     timings["convert"] = time.perf_counter() - step
     del traced, wrapper, model
     gc.collect()
@@ -288,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("[7/7] Sanity check on CPU_AND_NE")
     step = time.perf_counter()
-    sanity = run_sanity_check(mlmodelc_path, args.model_dir, args.seq_len)
+    sanity = run_sanity_check(mlmodelc_path, args.model_dir, args.seq_len, args.batch)
     timings["sanity"] = time.perf_counter() - step
     timings["total"] = time.perf_counter() - started
 
@@ -300,6 +439,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"      finite outputs  : {sanity['finite']}")
     print(f"      cosine vs FP32  : {[round(c, 5) for c in sanity['cosine_per_text']]}")
     print(f"      cosine min/mean : {sanity['cosine_min']:.5f} / {sanity['cosine_mean']:.5f}")
+    consistency = sanity["batch_consistency"]
+    if consistency is not None:
+        print(
+            f"      batch rows cos  : min {consistency['cosine_min']:.7f} / "
+            f"max {consistency['cosine_max']:.7f} "
+            f"(threshold {consistency['cosine_threshold']}, passed={consistency['passed']})"
+        )
     print(f"      timings (sec)   : {metadata['timings_sec']}")
     print(f"      metadata        : {metadata_path}")
     if not sanity["passed"]:
