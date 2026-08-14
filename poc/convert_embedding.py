@@ -14,9 +14,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import platform
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,8 +23,6 @@ from typing import Any
 import coremltools as ct
 import numpy as np
 import torch
-import transformers
-from transformers.models.modernbert import modeling_modernbert
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -41,6 +37,15 @@ from poc.common import (  # noqa: E402
     load_torch_model,
     mean_pool,
     tokenize_batch,
+)
+from poc.convert_common import (  # noqa: E402
+    build_versions_info,
+    compile_model,
+    convert_model,
+    patch_mask_fill_value,
+    patch_rotate_half,
+    resolve_output_key,
+    trace_model,
 )
 
 # Short Japanese sentence used as the example input for torch.jit.trace.
@@ -57,9 +62,6 @@ SANITY_TEXTS: list[str] = [
 
 # Minimum cosine similarity against the PyTorch FP32 baseline (§4.5 step 6).
 SANITY_COSINE_THRESHOLD = 0.99
-
-_TARGETS = {"macos13": ct.target.macOS13, "macos15": ct.target.macOS15}
-_PRECISIONS = {"fp16": ct.precision.FLOAT16, "fp32": ct.precision.FLOAT32}
 
 
 class EmbeddingWrapper(torch.nn.Module):
@@ -143,131 +145,6 @@ def build_stem(args: argparse.Namespace) -> str:
     return stem
 
 
-def patch_rotate_half() -> None:
-    """Replace ModernBert's ``rotate_half`` with a static-shape equivalent.
-
-    The upstream implementation slices with ``x.shape[-1] // 2``, which
-    traces to ``aten::size -> floor_divide -> aten::Int``. coremltools 9.0
-    cannot convert that ``aten::Int`` under numpy 2.x and raises
-    "only 0-dimensional arrays can be converted to Python scalars"
-    (§4.8 C1). ``torch.chunk`` with a constant chunk count yields the
-    identical result without any dynamic shape arithmetic; this is exact
-    because RoPE head dimensions are always even.
-    """
-
-    def rotate_half(x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
-    modeling_modernbert.rotate_half = rotate_half
-
-
-def patch_mask_fill_value(model: torch.nn.Module, fill_value: float) -> None:
-    """Override ModernBert attention mask generation with a finite fill value.
-
-    ``ModernBertModel._update_attention_mask`` fills masked positions with
-    ``torch.finfo(float32).min``, which becomes ``-inf`` once the graph is
-    cast to FP16 and can make softmax produce NaN for fully masked rows.
-    This monkeypatch reproduces the same masks with a finite fill value.
-
-    Args:
-        model: The loaded ModernBertModel instance.
-        fill_value: Finite value used for masked positions (e.g. -30000.0).
-    """
-    local_attention = model.config.local_attention
-
-    def _update(attention_mask: torch.Tensor, output_attentions: bool = False) -> tuple:
-        seq_len = attention_mask.shape[-1]
-        global_mask = (1.0 - attention_mask[:, None, None, :].float()) * fill_value  # (B,1,1,S)
-        rows = torch.arange(seq_len).unsqueeze(0)
-        distance = (rows - rows.T).abs()  # (S, S)
-        window = (distance <= local_attention // 2)[None, None, :, :]  # (1,1,S,S)
-        sliding_window_mask = global_mask.masked_fill(~window, fill_value)  # (B,1,S,S)
-        return global_mask, sliding_window_mask
-
-    model._update_attention_mask = _update
-
-
-def trace_model(
-    wrapper: EmbeddingWrapper, example: dict[str, np.ndarray]
-) -> torch.jit.ScriptModule:
-    """Trace the wrapper with a tokenized fixed-shape example input."""
-    # nn.Embedding requires int64 indices at trace time; Core ML inputs are
-    # declared as int32 separately in convert_model().
-    input_ids = torch.from_numpy(example["input_ids"]).long()
-    attention_mask = torch.from_numpy(example["attention_mask"]).long()
-    with torch.no_grad():
-        traced = torch.jit.trace(wrapper, (input_ids, attention_mask), strict=False)
-    return traced.eval()
-
-
-def convert_model(
-    traced: torch.jit.ScriptModule, seq_len: int, precision: str, target: str
-) -> ct.models.MLModel:
-    """Convert the traced module to an in-memory ML program (§4.4)."""
-    return ct.convert(
-        traced,
-        inputs=[
-            ct.TensorType(name="input_ids", shape=(1, seq_len), dtype=np.int32),
-            ct.TensorType(name="attention_mask", shape=(1, seq_len), dtype=np.int32),
-        ],
-        outputs=[ct.TensorType(name="embedding")],
-        convert_to="mlprogram",
-        compute_precision=_PRECISIONS[precision],
-        minimum_deployment_target=_TARGETS[target],
-    )
-
-
-def compile_model(mlpackage_path: Path, mlmodelc_path: Path) -> None:
-    """Compile an .mlpackage into an .mlmodelc directory.
-
-    The compiler names its output after the input package, so compilation
-    runs in a staging directory and the result is moved to the requested
-    path to keep the naming under our control.
-
-    Args:
-        mlpackage_path: Existing .mlpackage path.
-        mlmodelc_path: Destination .mlmodelc path (replaced if present).
-
-    Raises:
-        RuntimeError: If the compiler failed or produced no .mlmodelc directory.
-    """
-    staging = mlmodelc_path.with_suffix(".compile_tmp")
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
-    try:
-        result = subprocess.run(
-            ["xcrun", "coremlcompiler", "compile", str(mlpackage_path), str(staging)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"coremlcompiler failed ({result.returncode}): {result.stderr}")
-        produced = sorted(staging.glob("*.mlmodelc"))
-        if not produced:
-            raise RuntimeError(f"coremlcompiler produced no .mlmodelc in {staging}")
-        if mlmodelc_path.exists():
-            shutil.rmtree(mlmodelc_path)
-        shutil.move(str(produced[0]), str(mlmodelc_path))
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-
-def _resolve_output_key(prediction: dict[str, Any]) -> str:
-    """Pick the embedding output key from a ``predict`` result dict.
-
-    Raises:
-        RuntimeError: If the model returned no outputs.
-    """
-    keys = list(prediction)
-    if not keys:
-        raise RuntimeError("Core ML model returned no outputs")
-    # Prefer the requested name but tolerate a renamed output.
-    return "embedding" if "embedding" in keys else keys[0]
-
-
 def run_sanity_check(mlmodelc_path: Path, model_dir: Path, seq_len: int) -> dict[str, Any]:
     """Run the Core ML model on CPU_AND_NE and compare with the FP32 baseline.
 
@@ -294,7 +171,7 @@ def run_sanity_check(mlmodelc_path: Path, model_dir: Path, seq_len: int) -> dict
                 "attention_mask": batch["attention_mask"][i : i + 1],
             }
         )
-        output_key = output_key or _resolve_output_key(prediction)
+        output_key = output_key or resolve_output_key(prediction, "embedding")
         rows.append(np.asarray(prediction[output_key], dtype=np.float32).reshape(-1))
     coreml_emb = np.stack(rows)
 
@@ -336,14 +213,7 @@ def build_metadata(
             "precision": args.precision,
             "mask_fill_value": args.mask_fill_value,
         },
-        "versions": {
-            "torch": torch.__version__,
-            "transformers": transformers.__version__,
-            "coremltools": ct.__version__,
-            "numpy": np.__version__,
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-        },
+        "versions": build_versions_info(),
         "patches": {
             "rotate_half_static": True,
             "mask_fill_value": args.mask_fill_value is not None,
@@ -399,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[4/7] Converting to mlprogram ({args.precision}, {args.target})")
     step = time.perf_counter()
-    mlmodel = convert_model(traced, args.seq_len, args.precision, args.target)
+    mlmodel = convert_model(traced, args.seq_len, args.precision, args.target, "embedding")
     timings["convert"] = time.perf_counter() - step
     del traced, wrapper, model
     gc.collect()
