@@ -14,6 +14,7 @@ Usage:
     uv run python poc/benchmark_latency.py --seq-len 512 --compute-units CPU_AND_NE
     uv run python poc/benchmark_latency.py --model reranker --seq-len 512 \\
         --compute-units CPU_AND_NE
+    uv run python poc/benchmark_latency.py --seq-len 512 --batch 4
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import resource
 import statistics
 import sys
 import time
@@ -53,9 +55,9 @@ _DEFAULT_MODEL_DIRS: dict[str, Path] = {
     "reranker": DEFAULT_RERANKER_DIR,
 }
 
-# Number of leading corpus paragraphs (or query/paragraph pairs, for the
-# reranker) used as the round-robin input pool.
-NUM_INPUT_TEXTS = 8
+# Minimum round-robin input pool size, regardless of batch size
+# (v0.3実装計画.md §4.4). See _input_pool_size().
+MIN_INPUT_TEXTS = 8
 
 # Predict calls run (and discarded) before the timed warm loop begins.
 NUM_WARMUP_PREDICTS = 5
@@ -102,7 +104,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Compiled model path. Defaults to the T5 naming convention "
-        "(models/compiled/<model-dir-name>/s{S}_b1_eager_macos13.mlmodelc).",
+        "(models/compiled/<model-dir-name>/s{S}_b{B}_eager_macos13.mlmodelc).",
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="Batch size B for predict() calls, matching a converted "
+        "s{S}_b{B}_eager_macos13.mlmodelc (v0.3実装計画.md §4.4). Defaults to 1.",
     )
     parser.add_argument("--n", type=int, default=50, help="Number of timed warm predict() calls.")
     parser.add_argument(
@@ -120,28 +129,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def default_mlmodelc_path(model_dir: Path, seq_len: int) -> Path:
+def default_mlmodelc_path(model_dir: Path, seq_len: int, batch: int) -> Path:
     """Build the default compiled model path, following T5's naming scheme.
 
     Matches ``poc/convert_embedding.py``'s (and ``poc/convert_reranker.py``'s)
     ``build_stem``/output directory for the default conversion settings
     (``attn=eager``, ``target=macos13``, ``precision=fp16``). Shared by both
     the embedding and reranker benchmarks since the naming scheme only
-    depends on ``model_dir``'s resolved name (v0.2実装計画.md §4.7).
+    depends on ``model_dir``'s resolved name (v0.2実装計画.md §4.7). The
+    batch size ``B`` was added to the fixed-shape naming convention by the
+    batch-aware conversion pipeline (v0.3実装計画.md §4.2/§4.4).
 
     Args:
         model_dir: Local HF model directory (only its resolved name is used).
         seq_len: Fixed sequence length S.
+        batch: Fixed batch size B.
 
     Returns:
         Path to the expected ``.mlmodelc`` directory.
     """
-    stem = f"s{seq_len}_b1_eager_macos13"
+    stem = f"s{seq_len}_b{batch}_eager_macos13"
     return _REPO_ROOT / "models" / "compiled" / model_dir.resolve().name / f"{stem}.mlmodelc"
 
 
-def prepare_inputs(model_dir: Path, seq_len: int) -> dict[str, np.ndarray]:
-    """Tokenize the first ``NUM_INPUT_TEXTS`` corpus paragraphs ahead of time.
+def _input_pool_size(batch: int) -> int:
+    """Compute the required round-robin input pool size for a batch size.
+
+    Guarantees at least two full batches so the round-robin cycle (see
+    :func:`run_cold_and_warm_benchmark`) has more than one distinct batch to
+    rotate through, while keeping the original single-row benchmark's input
+    diversity floor of :data:`MIN_INPUT_TEXTS` rows (v0.3実装計画.md §4.4).
+
+    Args:
+        batch: Batch size B.
+
+    Returns:
+        Required number of tokenized input rows.
+    """
+    return max(MIN_INPUT_TEXTS, 2 * batch)
+
+
+def prepare_inputs(model_dir: Path, seq_len: int, pool_size: int) -> dict[str, np.ndarray]:
+    """Tokenize the first ``pool_size`` corpus paragraphs ahead of time.
 
     Tokenization must happen outside the timed predict() loop so that
     latency measurements reflect Core ML inference only.
@@ -149,26 +178,28 @@ def prepare_inputs(model_dir: Path, seq_len: int) -> dict[str, np.ndarray]:
     Args:
         model_dir: Local HF model directory used to load the tokenizer.
         seq_len: Fixed sequence length S.
+        pool_size: Number of round-robin input rows required, from
+            :func:`_input_pool_size`.
 
     Returns:
         Dict with ``input_ids``/``attention_mask``, each shape
-        ``(NUM_INPUT_TEXTS, seq_len)`` int32.
+        ``(pool_size, seq_len)`` int32.
     """
     tokenizer = load_tokenizer(model_dir)
     paragraphs = load_corpus_paragraphs()
-    texts = paragraphs[:NUM_INPUT_TEXTS]
-    if len(texts) < NUM_INPUT_TEXTS:
-        raise SystemExit(f"corpus provided only {len(texts)} paragraphs, need {NUM_INPUT_TEXTS}")
+    texts = paragraphs[:pool_size]
+    if len(texts) < pool_size:
+        raise SystemExit(f"corpus provided only {len(texts)} paragraphs, need {pool_size}")
     return tokenize_batch(tokenizer, texts, seq_len)
 
 
-def prepare_reranker_inputs(model_dir: Path, seq_len: int) -> dict[str, np.ndarray]:
-    """Tokenize the first ``NUM_INPUT_TEXTS`` (query, paragraph) pairs ahead of time.
+def prepare_reranker_inputs(model_dir: Path, seq_len: int, pool_size: int) -> dict[str, np.ndarray]:
+    """Tokenize the first ``pool_size`` (query, paragraph) pairs ahead of time.
 
     Pairs are generated in query-major order (outer loop over
     :func:`load_rerank_queries`, inner loop over
     :func:`load_corpus_paragraphs`) per v0.2実装計画.md §4.7, then truncated
-    to the first ``NUM_INPUT_TEXTS`` pairs. As with :func:`prepare_inputs`,
+    to the first ``pool_size`` pairs. As with :func:`prepare_inputs`,
     tokenization happens outside the timed predict() loop so that latency
     measurements reflect Core ML inference only.
 
@@ -176,41 +207,47 @@ def prepare_reranker_inputs(model_dir: Path, seq_len: int) -> dict[str, np.ndarr
         model_dir: Local HF reranker model directory used to load the
             tokenizer.
         seq_len: Fixed sequence length S.
+        pool_size: Number of round-robin input rows required, from
+            :func:`_input_pool_size`.
 
     Returns:
         Dict with ``input_ids``/``attention_mask``, each shape
-        ``(NUM_INPUT_TEXTS, seq_len)`` int32.
+        ``(pool_size, seq_len)`` int32.
     """
     tokenizer = load_tokenizer(model_dir)
     queries = load_rerank_queries()
     paragraphs = load_corpus_paragraphs()
     pairs = [(query["query"], paragraph) for query in queries for paragraph in paragraphs]
-    pairs = pairs[:NUM_INPUT_TEXTS]
-    if len(pairs) < NUM_INPUT_TEXTS:
-        raise SystemExit(
-            f"query/paragraph pool provided only {len(pairs)} pairs, need {NUM_INPUT_TEXTS}"
-        )
+    pairs = pairs[:pool_size]
+    if len(pairs) < pool_size:
+        raise SystemExit(f"query/paragraph pool provided only {len(pairs)} pairs, need {pool_size}")
     return tokenize_pairs(tokenizer, pairs, seq_len)
 
 
-def _predict_input(model: Any, inputs: dict[str, np.ndarray], index: int) -> None:
-    """Run a single predict() call on one round-robin input row.
+def _predict_input(model: Any, inputs: dict[str, np.ndarray], index: int, batch: int) -> None:
+    """Run a single predict() call on one round-robin batch of input rows.
 
     Args:
         model: Loaded ``CompiledMLModel``.
         inputs: Batch tensors from :func:`prepare_inputs`.
-        index: Row index (already reduced modulo the pool size by the caller).
+        index: Batch index (already reduced modulo the number of batches in
+            the pool by the caller).
+        batch: Batch size B; selects the ``[index*B : (index+1)*B]`` row
+            slice from ``inputs`` (B=1 reproduces the original single-row
+            behavior, v0.3実装計画.md §4.4).
     """
+    start = index * batch
+    end = start + batch
     model.predict(
         {
-            "input_ids": inputs["input_ids"][index : index + 1],
-            "attention_mask": inputs["attention_mask"][index : index + 1],
+            "input_ids": inputs["input_ids"][start:end],
+            "attention_mask": inputs["attention_mask"][start:end],
         }
     )
 
 
 def run_cold_and_warm_benchmark(
-    model: Any, inputs: dict[str, np.ndarray], n: int
+    model: Any, inputs: dict[str, np.ndarray], n: int, batch: int
 ) -> dict[str, Any]:
     """Measure cold load/first-predict timing and warm predict() statistics.
 
@@ -222,29 +259,32 @@ def run_cold_and_warm_benchmark(
         model: Freshly constructed ``CompiledMLModel``.
         inputs: Round-robin input pool from :func:`prepare_inputs`.
         n: Number of timed warm predict() calls.
+        batch: Batch size B (see :func:`_predict_input`).
 
     Returns:
         Dict with ``first_predict_sec`` and the warm statistics.
     """
-    pool_size = inputs["input_ids"].shape[0]
+    # Round-robin period is measured in batches, not rows, so each cycle
+    # covers the whole pool exactly once regardless of B.
+    num_batches = inputs["input_ids"].shape[0] // batch
     counter = 0
 
     # First predict() after construction: the "cold" inference cost.
     step = time.perf_counter()
-    _predict_input(model, inputs, counter % pool_size)
+    _predict_input(model, inputs, counter % num_batches, batch)
     first_predict_sec = time.perf_counter() - step
     counter += 1
 
     # Warmup predicts (discarded), so the timed loop sees a settled model.
     for _ in range(NUM_WARMUP_PREDICTS):
-        _predict_input(model, inputs, counter % pool_size)
+        _predict_input(model, inputs, counter % num_batches, batch)
         counter += 1
 
     # Timed warm loop.
     warm_times: list[float] = []
     for _ in range(n):
         step = time.perf_counter()
-        _predict_input(model, inputs, counter % pool_size)
+        _predict_input(model, inputs, counter % num_batches, batch)
         warm_times.append(time.perf_counter() - step)
         counter += 1
 
@@ -254,12 +294,15 @@ def run_cold_and_warm_benchmark(
     }
 
 
-def summarize_warm_times(warm_times: list[float], seq_len: int) -> dict[str, float]:
+def summarize_warm_times(warm_times: list[float], seq_len: int, batch: int) -> dict[str, float]:
     """Compute median/p90/mean/min latency and tokens/sec from warm timings.
 
     Args:
         warm_times: Per-call predict() durations in seconds.
         seq_len: Fixed sequence length S, used for the tokens/sec estimate.
+        batch: Batch size B; each predict() call processes ``seq_len *
+            batch`` padded tokens, so ``tokens_per_sec`` reports padded
+            (not effective) throughput (v0.3実装計画.md §4.4).
 
     Returns:
         Dict of summary statistics (seconds unless noted).
@@ -271,7 +314,7 @@ def summarize_warm_times(warm_times: list[float], seq_len: int) -> dict[str, flo
         "p90_sec": float(np.percentile(warm_times, 90)),
         "mean_sec": statistics.mean(warm_times),
         "min_sec": min(warm_times),
-        "tokens_per_sec": seq_len / median_sec,
+        "tokens_per_sec": seq_len * batch / median_sec,
     }
 
 
@@ -358,7 +401,7 @@ def compute_plan_report(mlmodelc_path: Path, compute_units: str) -> dict[str, An
 
 
 def run_sustain_loop(
-    model: Any, inputs: dict[str, np.ndarray], sustain_seconds: int
+    model: Any, inputs: dict[str, np.ndarray], sustain_seconds: int, batch: int
 ) -> dict[str, Any]:
     """Run predict() continuously for manual `powermetrics` ANE observation.
 
@@ -366,12 +409,13 @@ def run_sustain_loop(
         model: Loaded ``CompiledMLModel``.
         inputs: Round-robin input pool from :func:`prepare_inputs`.
         sustain_seconds: Duration to keep looping, in seconds.
+        batch: Batch size B (see :func:`_predict_input`).
 
     Returns:
         Dict with the elapsed time and total predict() call count.
     """
     print("Run 'sudo powermetrics --samplers ane_power -i 1000' in another terminal now.")
-    pool_size = inputs["input_ids"].shape[0]
+    num_batches = inputs["input_ids"].shape[0] // batch
     counter = 0
     next_report_at = SUSTAIN_REPORT_INTERVAL_SEC
     start = time.perf_counter()
@@ -379,7 +423,7 @@ def run_sustain_loop(
         elapsed = time.perf_counter() - start
         if elapsed >= sustain_seconds:
             break
-        _predict_input(model, inputs, counter % pool_size)
+        _predict_input(model, inputs, counter % num_batches, batch)
         counter += 1
         elapsed = time.perf_counter() - start
         if elapsed >= next_report_at:
@@ -418,8 +462,10 @@ def build_environment_info(mlmodelc_path: Path, compute_units: str, model: str) 
     }
 
 
-def result_path(seq_len: int, compute_units: str, sustain: bool, model: str = "embedding") -> Path:
-    """Build the results JSON output path per §4.7 naming convention.
+def result_path(
+    seq_len: int, compute_units: str, sustain: bool, model: str = "embedding", batch: int = 1
+) -> Path:
+    """Build the results JSON output path per §4.7/§4.4 naming convention.
 
     Args:
         seq_len: Fixed sequence length S.
@@ -428,18 +474,23 @@ def result_path(seq_len: int, compute_units: str, sustain: bool, model: str = "e
         model: One of the ``--model`` CLI choices. ``"reranker"`` prefixes
             the filename with ``rerank_`` (v0.2実装計画.md §4.7); the default
             ``"embedding"`` keeps the v0.1 filename unchanged.
+        batch: Batch size B, always embedded explicitly as ``b{B}`` (even
+            for B=1) so batch sweeps never collide with each other or with
+            pre-v0.3 result files, which are left untouched (v0.3実装計画.md
+            §4.4).
     """
     results_dir = _REPO_ROOT / "poc" / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
     prefix = "latency_sustain" if sustain else "latency"
     if model == "reranker":
         prefix = f"rerank_{prefix}"
-    return results_dir / f"{prefix}_s{seq_len}_{compute_units}.json"
+    return results_dir / f"{prefix}_s{seq_len}_b{batch}_{compute_units}.json"
 
 
 def print_summary(result: dict[str, Any]) -> None:
     """Print a human-readable summary of the benchmark result to stdout."""
     print(f"mode            : {result['mode']}")
+    print(f"batch           : {result['batch']}")
     print(f"compute_units   : {result['environment']['compute_units']}")
     print(f"mlmodelc        : {result['environment']['mlmodelc_path']}")
     if result["mode"] == "sustain":
@@ -447,6 +498,7 @@ def print_summary(result: dict[str, Any]) -> None:
         print(f"load_sec        : {result['load_sec']:.4f}")
         print(f"sustain_seconds : {sustain['sustain_seconds']}")
         print(f"total_predicts  : {sustain['total_predicts']}")
+        print(f"peak_rss_bytes  : {result['peak_rss_bytes']}")
         return
     print(f"load_sec        : {result['cold']['load_sec']:.4f}")
     print(f"first_predict   : {result['cold']['first_predict_sec']:.4f}")
@@ -457,6 +509,7 @@ def print_summary(result: dict[str, Any]) -> None:
     print(f"mean_sec        : {warm['mean_sec']:.4f}")
     print(f"min_sec         : {warm['min_sec']:.4f}")
     print(f"tokens_per_sec  : {warm['tokens_per_sec']:.2f}")
+    print(f"peak_rss_bytes  : {result['peak_rss_bytes']}")
     plan = result["compute_plan"]
     if plan.get("skipped"):
         print(f"compute_plan    : skipped ({plan['reason']})")
@@ -481,18 +534,24 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.seq_len <= 0:
         raise SystemExit("--seq-len must be a positive integer")
+    if args.batch <= 0:
+        raise SystemExit("--batch must be a positive integer")
     # §4.7: --model-dir defaults to the embedding or reranker model directory
     # depending on --model, unless the caller overrides it explicitly.
     model_dir = args.model_dir or _DEFAULT_MODEL_DIRS[args.model]
-    mlmodelc_path = args.mlmodelc or default_mlmodelc_path(model_dir, args.seq_len)
+    mlmodelc_path = args.mlmodelc or default_mlmodelc_path(model_dir, args.seq_len, args.batch)
     if not mlmodelc_path.exists():
         raise SystemExit(f"compiled model not found: {mlmodelc_path}")
 
-    print(f"Preparing {NUM_INPUT_TEXTS} tokenized inputs (S={args.seq_len}, model={args.model})")
+    pool_size = _input_pool_size(args.batch)
+    print(
+        f"Preparing {pool_size} tokenized inputs "
+        f"(S={args.seq_len}, B={args.batch}, model={args.model})"
+    )
     if args.model == "reranker":
-        inputs = prepare_reranker_inputs(model_dir, args.seq_len)
+        inputs = prepare_reranker_inputs(model_dir, args.seq_len, pool_size)
     else:
-        inputs = prepare_inputs(model_dir, args.seq_len)
+        inputs = prepare_inputs(model_dir, args.seq_len, pool_size)
 
     print(f"Cold-loading {mlmodelc_path} (compute_units={args.compute_units})")
     step = time.perf_counter()
@@ -506,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
     environment = build_environment_info(mlmodelc_path, args.compute_units, args.model)
     result: dict[str, Any] = {
         "seq_len": args.seq_len,
+        "batch": args.batch,
         "environment": environment,
     }
 
@@ -514,14 +574,14 @@ def main(argv: list[str] | None = None) -> int:
             print("NOTE: --compute-plan is ignored in --sustain mode.")
         result["mode"] = "sustain"
         result["load_sec"] = load_sec
-        result["sustain"] = run_sustain_loop(model, inputs, args.sustain)
+        result["sustain"] = run_sustain_loop(model, inputs, args.sustain, args.batch)
     else:
         result["mode"] = "benchmark"
         print(
             f"Running cold first-predict + {NUM_WARMUP_PREDICTS} warmup + {args.n} timed predicts"
         )
-        cold_warm = run_cold_and_warm_benchmark(model, inputs, args.n)
-        warm = summarize_warm_times(cold_warm["warm_times_sec"], args.seq_len)
+        cold_warm = run_cold_and_warm_benchmark(model, inputs, args.n, args.batch)
+        warm = summarize_warm_times(cold_warm["warm_times_sec"], args.seq_len, args.batch)
         result["cold"] = {
             "load_sec": load_sec,
             "first_predict_sec": cold_warm["first_predict_sec"],
@@ -535,8 +595,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             result["compute_plan"] = {}
 
+    # Recorded right before the measurement ends, per §4.4 (macOS reports
+    # ru_maxrss in bytes, unlike Linux's KB).
+    result["peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
     out_path = result_path(
-        args.seq_len, args.compute_units, sustain=args.sustain > 0, model=args.model
+        args.seq_len,
+        args.compute_units,
+        sustain=args.sustain > 0,
+        model=args.model,
+        batch=args.batch,
     )
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
