@@ -48,6 +48,7 @@ uv run python poc/convert_embedding.py --seq-len 128
 uv run python poc/convert_embedding.py --seq-len 512
 uv run python poc/convert_embedding.py --seq-len 1024
 uv run python poc/convert_reranker.py --seq-len 512
+uv run python poc/convert_reranker.py --seq-len 1024
 
 # Start the server (fixed settings: 127.0.0.1:7997)
 uv run python -m eeane.server
@@ -56,15 +57,17 @@ uv run python -m eeane.server
 Endpoints:
 
 - `GET /health` — status and the sequence-length buckets in service
-- `POST /v1/embeddings` — OpenAI-compatible (`input` as string or list,
-  `encoding_format` `float`/`base64`); embeddings are L2-normalized,
-  matching Infinity_emb's behavior
+- `POST /v1/embeddings` (alias: `POST /embeddings`) — OpenAI-compatible
+  (`input` as string or list, `encoding_format` `float`/`base64`);
+  embeddings are L2-normalized, matching Infinity_emb's behavior
 - `POST /rerank`, `POST /v1/rerank` — Infinity-compatible
   (`query`/`documents`/`top_n`/`return_documents`/`raw_scores`)
 
-Each input is routed to the smallest fitting sequence-length bucket
-(embeddings: 128/512/1024 tokens; reranker: 512) and truncated to the
-largest bucket when longer, with a server-side warning.
+The embeddings and rerank endpoints are served both under `/v1` and at
+the root, so a base URL with or without the `/v1` suffix works. Each input is routed to the
+smallest fitting sequence-length bucket (embeddings: 128/512/1024
+tokens; reranker: 512/1024) and truncated to the largest bucket when
+longer, with a server-side warning.
 
 To use eeANE from [Open WebUI](https://github.com/open-webui/open-webui):
 set the embedding engine to OpenAI with base URL

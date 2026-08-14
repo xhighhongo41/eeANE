@@ -138,6 +138,9 @@ def create_app(engine: InferenceEngine | None = None, normalize: bool | None = N
             },
         )
 
+    # Registered under /v1 (OpenAI convention) and at the root (where
+    # Infinity_emb serves it), so either base-URL style works unchanged.
+    @app.post("/embeddings", response_model=EmbeddingsResponse)
     @app.post("/v1/embeddings", response_model=EmbeddingsResponse)
     def create_embeddings(request: Request, body: EmbeddingsRequest) -> EmbeddingsResponse:
         """Embed the request's texts (OpenAI-compatible, §4.4)."""
@@ -165,9 +168,11 @@ def create_app(engine: InferenceEngine | None = None, normalize: bool | None = N
         ]
         used_tokens = int(sum(batch.used_tokens))
 
-        _warn_truncated("/v1/embeddings", batch.truncated_indices, batch.orig_tokens, batch.buckets)
+        path = request.url.path
+        _warn_truncated(path, batch.truncated_indices, batch.orig_tokens, batch.buckets)
         logger.info(
-            "POST /v1/embeddings inputs=%d buckets=%s truncated=%d elapsed_ms=%.1f",
+            "POST %s inputs=%d buckets=%s truncated=%d elapsed_ms=%.1f",
+            path,
             len(body.input),
             _format_buckets(batch.buckets),
             len(batch.truncated_indices),

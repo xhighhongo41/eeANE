@@ -24,6 +24,7 @@ EMBEDDING_COMPILED = {
 }
 RERANKER_COMPILED = {
     512: _COMPILED_ROOT / "ruri-v3-reranker-310m" / "s512_b1_eager_macos13.mlmodelc",
+    1024: _COMPILED_ROOT / "ruri-v3-reranker-310m" / "s1024_b1_eager_macos13.mlmodelc",
 }
 
 # Model ids reported in API responses.

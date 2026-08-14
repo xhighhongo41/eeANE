@@ -151,6 +151,17 @@ def test_embeddings_accepts_single_string(client: TestClient) -> None:
     assert payload["model"] == "ruri-v3-310m"
 
 
+def test_embeddings_root_alias_matches_v1_path(client: TestClient) -> None:
+    """/embeddings (Infinity-style root path) must behave like /v1/embeddings."""
+    body = {"input": ["hello", "world"]}
+
+    root = client.post("/embeddings", json=body)
+    v1 = client.post("/v1/embeddings", json=body)
+
+    assert root.status_code == 200
+    assert root.json() == v1.json()
+
+
 def test_embeddings_preserve_input_order_and_values(client: TestClient) -> None:
     """List input must keep request order, index it, and echo the stub values."""
     texts = ["a", "bbb", "cc"]

@@ -44,6 +44,7 @@ uv run python poc/convert_embedding.py --seq-len 128
 uv run python poc/convert_embedding.py --seq-len 512
 uv run python poc/convert_embedding.py --seq-len 1024
 uv run python poc/convert_reranker.py --seq-len 512
+uv run python poc/convert_reranker.py --seq-len 1024
 
 # サーバー起動 (固定設定: 127.0.0.1:7997)
 uv run python -m eeane.server
@@ -52,15 +53,16 @@ uv run python -m eeane.server
 エンドポイント:
 
 - `GET /health` — ステータスとサービス中のシーケンス長バケツ
-- `POST /v1/embeddings` — OpenAI互換 (`input`は文字列またはリスト、
-  `encoding_format`は`float`/`base64`)。埋め込みはL2正規化して返します
-  (Infinity_embと同じ挙動)
+- `POST /v1/embeddings` (エイリアス: `POST /embeddings`) — OpenAI互換
+  (`input`は文字列またはリスト、`encoding_format`は`float`/`base64`)。
+  埋め込みはL2正規化して返します (Infinity_embと同じ挙動)
 - `POST /rerank`, `POST /v1/rerank` — Infinity互換
   (`query`/`documents`/`top_n`/`return_documents`/`raw_scores`)
 
-各入力はトークン数に応じて最小の固定長バケツ(埋め込み: 128/512/1024、
-reranker: 512)に自動ルーティングされ、最大バケツを超える入力は警告
-ログ付きで切り詰められます。
+embeddings/rerankエンドポイントは`/v1`配下とルート直下の両方で提供される
+ため、base URLは`/v1`付き・なしのどちらでも動作します。各入力はトークン数に応じて最小の
+固定長バケツ(埋め込み: 128/512/1024、reranker: 512/1024)に自動ルーティング
+され、最大バケツを超える入力は警告ログ付きで切り詰められます。
 
 [Open WebUI](https://github.com/open-webui/open-webui)から使う場合:
 埋め込みエンジンをOpenAIにしてbase URLを`http://127.0.0.1:7997/v1`、
