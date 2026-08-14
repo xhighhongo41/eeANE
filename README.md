@@ -8,16 +8,23 @@ Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **Status: early development (v0.2, proof of concept).**
-> The PoC now covers both
+> **Status: early development (v0.3, proof of concept).**
+> The PoC covers both
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (a Japanese ModernBERT embedding model, v0.1) and
 > [cl-nagoya/ruri-v3-reranker-310m](https://huggingface.co/cl-nagoya/ruri-v3-reranker-310m)
 > (its cross-encoder reranker, v0.2): both are converted to Core ML
 > through a shared pipeline and verified for ANE inference, numerical
-> accuracy against the PyTorch FP32 baseline, and latency. There is no
-> server or installable package yet — the planned OpenAI-compatible
-> embeddings / rerank server arrives in later milestones.
+> accuracy against the PyTorch FP32 baseline, and latency. v0.3 added
+> batch-size-N conversion and a full performance study on an M2 Mac
+> mini — sequence-length/batch latency matrix, real-document
+> throughput, and head-to-head comparisons against PyTorch on the GPU
+> (MPS) and an Infinity_emb deployment. Highlights: up to ~13,600
+> effective tokens/s for embeddings (2–3x the MPS GPU baseline), a
+> 36-document rerank in ~2.0 s (vs ~4.7 s on MPS), and both models
+> resident in ~420 MB, loading in ~0.2 s each. There is no server or
+> installable package yet — the planned OpenAI-compatible embeddings /
+> rerank server arrives in later milestones.
 
 ## Requirements
 
@@ -45,6 +52,11 @@ uv run python poc/benchmark_latency.py --seq-len 512 --compute-units CPU_AND_NE 
 uv run python poc/convert_reranker.py --seq-len 512
 uv run python poc/verify_reranker_accuracy.py --seq-len 512
 uv run python poc/benchmark_latency.py --model reranker --seq-len 512 --compute-units CPU_AND_NE --compute-plan
+
+# Performance study (v0.3)
+uv run python poc/run_sweep.py --seq-lens 128,512 --batches 1,2      # S x B latency matrix
+uv run python poc/benchmark_throughput.py --model embedding --chunk-tokens 128 --batch 2
+uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 32  # GPU baseline
 ```
 
 ## License
