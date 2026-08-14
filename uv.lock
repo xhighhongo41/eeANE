@@ -130,7 +130,7 @@ wheels = [
 
 [[package]]
 name = "eeane"
-version = "0.1.0.dev0"
+version = "0.2.0.dev0"
 source = { virtual = "." }
 
 [package.dev-dependencies]

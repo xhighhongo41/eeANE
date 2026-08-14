@@ -6,8 +6,14 @@ compiled .mlmodelc -> CompiledMLModel (cold load + first predict timing)
 -> optional MLComputePlan op-placement report -> optional sustained-load
 mode for manual `powermetrics` observation.
 
+``--model reranker`` benchmarks the ruri-v3-reranker-310m cross-encoder
+instead (v0.2実装計画.md §4.7); the embedding path (``--model`` omitted or
+``embedding``) is unchanged from v0.1.
+
 Usage:
     uv run python poc/benchmark_latency.py --seq-len 512 --compute-units CPU_AND_NE
+    uv run python poc/benchmark_latency.py --model reranker --seq-len 512 \\
+        --compute-units CPU_AND_NE
 """
 
 from __future__ import annotations
@@ -33,12 +39,22 @@ if str(_REPO_ROOT) not in sys.path:
 
 from poc.common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    DEFAULT_RERANKER_DIR,
     load_corpus_paragraphs,
+    load_rerank_queries,
     load_tokenizer,
     tokenize_batch,
+    tokenize_pairs,
 )
 
-# Number of leading corpus paragraphs used as the round-robin input pool.
+# Which --model choice maps to which default local HF model directory.
+_DEFAULT_MODEL_DIRS: dict[str, Path] = {
+    "embedding": DEFAULT_MODEL_DIR,
+    "reranker": DEFAULT_RERANKER_DIR,
+}
+
+# Number of leading corpus paragraphs (or query/paragraph pairs, for the
+# reranker) used as the round-robin input pool.
 NUM_INPUT_TEXTS = 8
 
 # Predict calls run (and discarded) before the timed warm loop begins.
@@ -68,7 +84,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Core ML compute unit selection.",
     )
     parser.add_argument(
-        "--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Local HF model directory."
+        "--model",
+        choices=list(_DEFAULT_MODEL_DIRS),
+        default="embedding",
+        help="Which PoC model to benchmark: the embedding backbone (default) "
+        "or the reranker cross-encoder (v0.2実装計画.md §4.7).",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Local HF model directory. Defaults to common.DEFAULT_MODEL_DIR or "
+        "common.DEFAULT_RERANKER_DIR depending on --model.",
     )
     parser.add_argument(
         "--mlmodelc",
@@ -96,9 +123,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def default_mlmodelc_path(model_dir: Path, seq_len: int) -> Path:
     """Build the default compiled model path, following T5's naming scheme.
 
-    Matches ``poc/convert_embedding.py``'s ``build_stem``/output directory
-    for the default conversion settings (``attn=eager``, ``target=macos13``,
-    ``precision=fp16``).
+    Matches ``poc/convert_embedding.py``'s (and ``poc/convert_reranker.py``'s)
+    ``build_stem``/output directory for the default conversion settings
+    (``attn=eager``, ``target=macos13``, ``precision=fp16``). Shared by both
+    the embedding and reranker benchmarks since the naming scheme only
+    depends on ``model_dir``'s resolved name (v0.2実装計画.md §4.7).
 
     Args:
         model_dir: Local HF model directory (only its resolved name is used).
@@ -131,6 +160,37 @@ def prepare_inputs(model_dir: Path, seq_len: int) -> dict[str, np.ndarray]:
     if len(texts) < NUM_INPUT_TEXTS:
         raise SystemExit(f"corpus provided only {len(texts)} paragraphs, need {NUM_INPUT_TEXTS}")
     return tokenize_batch(tokenizer, texts, seq_len)
+
+
+def prepare_reranker_inputs(model_dir: Path, seq_len: int) -> dict[str, np.ndarray]:
+    """Tokenize the first ``NUM_INPUT_TEXTS`` (query, paragraph) pairs ahead of time.
+
+    Pairs are generated in query-major order (outer loop over
+    :func:`load_rerank_queries`, inner loop over
+    :func:`load_corpus_paragraphs`) per v0.2実装計画.md §4.7, then truncated
+    to the first ``NUM_INPUT_TEXTS`` pairs. As with :func:`prepare_inputs`,
+    tokenization happens outside the timed predict() loop so that latency
+    measurements reflect Core ML inference only.
+
+    Args:
+        model_dir: Local HF reranker model directory used to load the
+            tokenizer.
+        seq_len: Fixed sequence length S.
+
+    Returns:
+        Dict with ``input_ids``/``attention_mask``, each shape
+        ``(NUM_INPUT_TEXTS, seq_len)`` int32.
+    """
+    tokenizer = load_tokenizer(model_dir)
+    queries = load_rerank_queries()
+    paragraphs = load_corpus_paragraphs()
+    pairs = [(query["query"], paragraph) for query in queries for paragraph in paragraphs]
+    pairs = pairs[:NUM_INPUT_TEXTS]
+    if len(pairs) < NUM_INPUT_TEXTS:
+        raise SystemExit(
+            f"query/paragraph pool provided only {len(pairs)} pairs, need {NUM_INPUT_TEXTS}"
+        )
+    return tokenize_pairs(tokenizer, pairs, seq_len)
 
 
 def _predict_input(model: Any, inputs: dict[str, np.ndarray], index: int) -> None:
@@ -334,8 +394,16 @@ def run_sustain_loop(
     }
 
 
-def build_environment_info(mlmodelc_path: Path, compute_units: str) -> dict[str, Any]:
-    """Assemble environment/version metadata recorded alongside measurements."""
+def build_environment_info(mlmodelc_path: Path, compute_units: str, model: str) -> dict[str, Any]:
+    """Assemble environment/version metadata recorded alongside measurements.
+
+    Args:
+        mlmodelc_path: Compiled model directory being benchmarked.
+        compute_units: One of the ``--compute-units`` CLI choices.
+        model: One of the ``--model`` CLI choices (``"embedding"`` or
+            ``"reranker"``), recorded so results JSONs are self-describing
+            (v0.2実装計画.md §4.7).
+    """
     return {
         "torch": torch.__version__,
         "transformers": transformers.__version__,
@@ -346,14 +414,26 @@ def build_environment_info(mlmodelc_path: Path, compute_units: str) -> dict[str,
         "mac_ver": platform.mac_ver(),
         "compute_units": compute_units,
         "mlmodelc_path": str(mlmodelc_path),
+        "model": model,
     }
 
 
-def result_path(seq_len: int, compute_units: str, sustain: bool) -> Path:
-    """Build the results JSON output path per §4.7 naming convention."""
+def result_path(seq_len: int, compute_units: str, sustain: bool, model: str = "embedding") -> Path:
+    """Build the results JSON output path per §4.7 naming convention.
+
+    Args:
+        seq_len: Fixed sequence length S.
+        compute_units: One of the ``--compute-units`` CLI choices.
+        sustain: Whether this run used ``--sustain`` mode.
+        model: One of the ``--model`` CLI choices. ``"reranker"`` prefixes
+            the filename with ``rerank_`` (v0.2実装計画.md §4.7); the default
+            ``"embedding"`` keeps the v0.1 filename unchanged.
+    """
     results_dir = _REPO_ROOT / "poc" / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
     prefix = "latency_sustain" if sustain else "latency"
+    if model == "reranker":
+        prefix = f"rerank_{prefix}"
     return results_dir / f"{prefix}_s{seq_len}_{compute_units}.json"
 
 
@@ -401,12 +481,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.seq_len <= 0:
         raise SystemExit("--seq-len must be a positive integer")
-    mlmodelc_path = args.mlmodelc or default_mlmodelc_path(args.model_dir, args.seq_len)
+    # §4.7: --model-dir defaults to the embedding or reranker model directory
+    # depending on --model, unless the caller overrides it explicitly.
+    model_dir = args.model_dir or _DEFAULT_MODEL_DIRS[args.model]
+    mlmodelc_path = args.mlmodelc or default_mlmodelc_path(model_dir, args.seq_len)
     if not mlmodelc_path.exists():
         raise SystemExit(f"compiled model not found: {mlmodelc_path}")
 
-    print(f"Preparing {NUM_INPUT_TEXTS} tokenized inputs (S={args.seq_len})")
-    inputs = prepare_inputs(args.model_dir, args.seq_len)
+    print(f"Preparing {NUM_INPUT_TEXTS} tokenized inputs (S={args.seq_len}, model={args.model})")
+    if args.model == "reranker":
+        inputs = prepare_reranker_inputs(model_dir, args.seq_len)
+    else:
+        inputs = prepare_inputs(model_dir, args.seq_len)
 
     print(f"Cold-loading {mlmodelc_path} (compute_units={args.compute_units})")
     step = time.perf_counter()
@@ -417,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     load_sec = time.perf_counter() - step
 
-    environment = build_environment_info(mlmodelc_path, args.compute_units)
+    environment = build_environment_info(mlmodelc_path, args.compute_units, args.model)
     result: dict[str, Any] = {
         "seq_len": args.seq_len,
         "environment": environment,
@@ -449,7 +535,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             result["compute_plan"] = {}
 
-    out_path = result_path(args.seq_len, args.compute_units, sustain=args.sustain > 0)
+    out_path = result_path(
+        args.seq_len, args.compute_units, sustain=args.sustain > 0, model=args.model
+    )
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print()

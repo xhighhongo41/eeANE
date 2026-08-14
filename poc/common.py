@@ -11,12 +11,19 @@ formula (see v0.1実装計画.md §4.2).
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    AutoModel,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -24,6 +31,16 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_DIR: Path = Path(
     os.environ.get("EEANE_MODEL_DIR", str(_REPO_ROOT / "models" / "ruri-v3-310m"))
 )
+
+# Local reranker model directory, overridable via the EEANE_RERANKER_DIR env
+# var (v0.2実装計画.md §4.4).
+DEFAULT_RERANKER_DIR: Path = Path(
+    os.environ.get("EEANE_RERANKER_DIR", str(_REPO_ROOT / "models" / "ruri-v3-reranker-310m"))
+)
+
+# Hand-written reranker query set (v0.2実装計画.md §4.5), consumed by
+# verify_reranker_accuracy.py and benchmark_latency.py.
+RERANK_QUERIES_PATH: Path = _REPO_ROOT / "testdata" / "rerank_queries.json"
 
 # Fixed Aozora Bunko test corpus directory (populated by T3).
 CORPUS_DIR: Path = _REPO_ROOT / "testdata" / "corpus"
@@ -239,3 +256,145 @@ def _split_paragraphs(text: str) -> list[str]:
     if current:
         blocks.append("\n".join(current).strip())
     return blocks
+
+
+def load_reranker_torch_model(model_dir: Path, attn: str = "sdpa") -> PreTrainedModel:
+    """Load the PyTorch FP32 reranker model used as the accuracy baseline.
+
+    Args:
+        model_dir: Path to the local HuggingFace-format model directory.
+        attn: Attention implementation to request (e.g. ``"sdpa"``, ``"eager"``).
+
+    Returns:
+        The ``ModernBertForSequenceClassification`` model in eval mode, FP32
+        precision (see v0.2実装計画.md §2.2).
+    """
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_dir, attn_implementation=attn, torch_dtype=torch.float32
+    )
+    return model.eval()
+
+
+def tokenize_pairs(
+    tokenizer: PreTrainedTokenizerBase, pairs: list[tuple[str, str]], seq_len: int
+) -> dict[str, np.ndarray]:
+    """Tokenize (query, document) pairs into fixed-shape int32 arrays.
+
+    Delegates to the tokenizer's built-in pair encoding
+    (``tokenizer(queries, documents, ...)``) so that the
+    ``<s> query </s> <s> document </s>`` template (v0.2実装計画.md §2.2) is
+    produced by the tokenizer's post_processor rather than reimplemented
+    here. ``truncation=True`` uses the tokenizer's default
+    ``longest_first`` strategy across both sequences (v0.2実装計画.md
+    §4.4). Any key other than ``input_ids``/``attention_mask`` returned by
+    the tokenizer (e.g. ``token_type_ids``) is discarded, since the
+    reranker forward only accepts those two inputs.
+
+    Args:
+        tokenizer: Tokenizer returned by :func:`load_tokenizer`.
+        pairs: List of (query, document) pairs.
+        seq_len: Fixed sequence length used for padding/truncation.
+
+    Returns:
+        Dict with ``input_ids`` and ``attention_mask``, each of shape
+        ``(len(pairs), seq_len)`` and dtype ``np.int32``.
+    """
+    queries = [query for query, _ in pairs]
+    documents = [document for _, document in pairs]
+    encoded = tokenizer(
+        queries,
+        documents,
+        padding="max_length",
+        truncation=True,
+        max_length=seq_len,
+        return_tensors="np",
+    )
+    return {
+        "input_ids": encoded["input_ids"].astype(np.int32),
+        "attention_mask": encoded["attention_mask"].astype(np.int32),
+    }
+
+
+def score_pytorch(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    pairs: list[tuple[str, str]],
+    seq_len: int,
+) -> np.ndarray:
+    """Compute FP32 baseline raw reranker logits with a batch-size-1 loop.
+
+    Args:
+        model: Model returned by :func:`load_reranker_torch_model`.
+        tokenizer: Tokenizer returned by :func:`load_tokenizer`.
+        pairs: List of (query, document) pairs.
+        seq_len: Fixed sequence length used for tokenization.
+
+    Returns:
+        Raw logits array of shape (len(pairs),), dtype float32.
+    """
+    batch = tokenize_pairs(tokenizer, pairs, seq_len)
+    scores = np.empty(len(pairs), dtype=np.float32)
+    with torch.no_grad():
+        for i in range(len(pairs)):
+            # nn.Embedding lookup requires int64 indices; tokenize_pairs
+            # returns int32 for Core ML compatibility, so cast here.
+            input_ids = torch.from_numpy(batch["input_ids"][i : i + 1]).long()
+            attention_mask = torch.from_numpy(batch["attention_mask"][i : i + 1]).long()
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs[0]  # (1, 1)
+            scores[i] = logits.reshape(-1)[0].item()
+    return scores
+
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    """Compute a numerically stable sigmoid.
+
+    Branches on the sign of ``x`` so ``np.exp`` is only ever evaluated on
+    non-positive arguments, avoiding overflow for large-magnitude inputs
+    (see v0.2実装計画.md §4.4).
+
+    Args:
+        x: Input array (raw logits).
+
+    Returns:
+        Array of the same shape as ``x``, with values in (0, 1).
+    """
+    is_positive = x >= 0
+    exp_neg_abs = np.exp(-np.abs(x))
+    return np.where(is_positive, 1.0 / (1.0 + exp_neg_abs), exp_neg_abs / (1.0 + exp_neg_abs))
+
+
+def spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute the Spearman rank correlation between two score arrays.
+
+    Uses double-argsort ordinal ranks followed by Pearson correlation
+    (v0.2実装計画.md §4.4 reference implementation). Continuous score
+    inputs are assumed: tied values are broken by array position
+    (ordinal ranks) rather than averaged, so this is not the exact
+    tie-corrected Spearman formula. scipy is intentionally not used (no
+    new dependency).
+
+    Args:
+        a: First score array, shape (N,).
+        b: Second score array, shape (N,).
+
+    Returns:
+        Spearman rank correlation coefficient in [-1, 1].
+    """
+    ar = np.argsort(np.argsort(a)).astype(np.float64)
+    br = np.argsort(np.argsort(b)).astype(np.float64)
+    ar -= ar.mean()
+    br -= br.mean()
+    denom = np.sqrt((ar * ar).sum() * (br * br).sum())
+    return float((ar * br).sum() / max(denom, 1e-12))
+
+
+def load_rerank_queries() -> list[dict]:
+    """Load the hand-written reranker query set (v0.2実装計画.md §4.5).
+
+    Returns:
+        List of dicts with keys ``id``, ``query``, and ``source_work``, in
+        the order stored on disk at :data:`RERANK_QUERIES_PATH`.
+    """
+    with RERANK_QUERIES_PATH.open(encoding="utf-8") as f:
+        return json.load(f)

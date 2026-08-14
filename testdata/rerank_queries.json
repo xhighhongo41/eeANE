@@ -1,0 +1,47 @@
+[
+  {
+    "id": "kumonoito-1",
+    "query": "地獄に落ちた男が極楽から垂れてきた一本の蜘蛛の糸を登ろうとする場面",
+    "source_work": "kumonoito"
+  },
+  {
+    "id": "kumonoito-2",
+    "query": "お釈迦様が極楽の蓮池のふちを歩いている描写",
+    "source_work": "kumonoito"
+  },
+  {
+    "id": "kumonoito-3",
+    "query": "罪人が生前にたった一つだけ行った蜘蛛を助けるという善行",
+    "source_work": "kumonoito"
+  },
+  {
+    "id": "sangetsuki-1",
+    "query": "詩人になる夢に敗れた男が虎に変身してしまう物語",
+    "source_work": "sangetsuki"
+  },
+  {
+    "id": "sangetsuki-2",
+    "query": "李徴が旧友の袁傪に自分の詩を書き取らせて伝えようとする場面",
+    "source_work": "sangetsuki"
+  },
+  {
+    "id": "sangetsuki-3",
+    "query": "臆病な自尊心と尊大な羞恥心についての告白",
+    "source_work": "sangetsuki"
+  },
+  {
+    "id": "kokoro-1",
+    "query": "語り手が鎌倉の海水浴場で先生とはじめて出会ったいきさつ",
+    "source_work": "kokoro"
+  },
+  {
+    "id": "kokoro-2",
+    "query": "海辺の掛茶屋で見かけた西洋人の様子",
+    "source_work": "kokoro"
+  },
+  {
+    "id": "kokoro-3",
+    "query": "若い書生が年上の人物を先生と呼んで慕う理由",
+    "source_work": "kokoro"
+  }
+]
