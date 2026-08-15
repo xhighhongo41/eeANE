@@ -13,8 +13,10 @@ call is serialized inside the engine, so the endpoints are plain ``def``
 functions that FastAPI runs in its thread pool (``/health`` and
 ``/models`` stay ``async`` and answer immediately).
 
-Run it with ``uv run python -m eeane.server`` (single process, single
+Run it with ``uv run python -m eeane serve`` (single process, single
 worker: multiple workers would load the models several times).
+``uv run python -m eeane.server`` remains as a thin alias for the same
+command until v0.10 (see :func:`main`).
 """
 
 from __future__ import annotations
@@ -27,11 +29,11 @@ from collections import Counter
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 
-import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 
 from eeane import __version__, runtime
-from eeane.config import EeaneConfig, load_config
+from eeane.cli import main as cli_main
+from eeane.config import EeaneConfig
 from eeane.engine import CoreMLEngine, InferenceEngine
 from eeane.schemas import (
     EmbeddingObject,
@@ -448,29 +450,13 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
 
 
 def main() -> None:
-    """Serve the resolved configuration's host/port in one process.
+    """Interim alias for ``python -m eeane serve`` (kept until v0.10).
 
-    Interim entry point for ``python -m eeane.server``: the configuration
-    is resolved with the same search order the CLI uses, without any
-    command-line override. ``python -m eeane serve`` (v0.5 T3) becomes the
-    real entry point and this function a thin wrapper around it.
+    ``python -m eeane.server`` predates the ``eeane`` CLI (v0.4); it is
+    kept as a thin wrapper so existing invocations keep working, per
+    開発資料/v0.5実装計画.md §0-6.
     """
-    loaded = load_config()
-    config = loaded.config
-    # uvicorn only configures its own loggers, so enable output for
-    # "eeane.server" here (the app itself never touches global logging).
-    logging.basicConfig(
-        level=logging.getLevelNamesMapping()[config.server.log_level.upper()],
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    logger.info(
-        "configuration source: %s",
-        loaded.source if loaded.source is not None else "built-in defaults",
-    )
-    # An app instance (not an import string) is passed on purpose: it makes
-    # the multi-worker mode unavailable, which would load the models once
-    # per worker (§4.1).
-    uvicorn.run(create_app(config), host=config.server.host, port=config.server.port)
+    raise SystemExit(cli_main(["serve"]))
 
 
 if __name__ == "__main__":
