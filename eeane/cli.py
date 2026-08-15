@@ -1,6 +1,6 @@
-"""Command-line interface for eeANE (v0.5実装計画.md §4.3).
+"""Command-line interface for eeANE (v0.5実装計画.md §4.3, v0.6実装計画.md §4.1).
 
-Provides two subcommands:
+Provides three subcommands:
 
 * ``eeane serve`` -- resolve the configuration, initialize logging, and
   run the FastAPI application with uvicorn (single process, single
@@ -9,8 +9,12 @@ Provides two subcommands:
   human-readable form (with the API key value always masked), without
   starting the server. Useful to validate a config file before deploying
   it.
+* ``eeane compile`` -- convert a HuggingFace-distribution-format model
+  into ANE-ready artifacts (``.mlmodelc`` + metadata). Standalone: it
+  does not read ``eeane.toml``. Requires the ``[compile]`` extra
+  (torch/transformers); see :func:`eeane.compiler.require_compile_dependencies`.
 
-Both subcommands share the same configuration resolution
+``serve``/``check-config`` share the same configuration resolution
 (:func:`eeane.config.load_config`) and precedence rules (CLI overrides >
 ``EEANE_API_KEY`` > config file > built-in defaults).
 """
@@ -35,16 +39,20 @@ logger = logging.getLogger("eeane.cli")
 _GROUP_OTHER_READABLE = 0o044
 
 _LOG_LEVEL_CHOICES = ("debug", "info", "warning", "error")
+_COMPILE_KIND_CHOICES = ("auto", "embedding", "reranker")
+_COMPILE_PRECISION_CHOICES = ("fp16", "fp32")
+_COMPILE_TARGET_CHOICES = ("macos13", "macos15")
+_COMPILE_ATTN_CHOICES = ("eager", "sdpa")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the ``eeane`` argument parser (``serve`` / ``check-config``).
+    """Build the ``eeane`` argument parser (``serve`` / ``check-config`` / ``compile``).
 
     Returns:
         A configured :class:`argparse.ArgumentParser`. Invalid arguments
         (unknown subcommand, bad ``--log-level`` choice, non-int
-        ``--port``, ...) make ``parse_args`` exit with code 2, which is
-        argparse's standard behaviour.
+        ``--port``, malformed ``--buckets``, ...) make ``parse_args``
+        exit with code 2, which is argparse's standard behaviour.
     """
     parser = argparse.ArgumentParser(prog="eeane", description="eeANE embedding/reranker server.")
     subparsers = parser.add_subparsers(dest="command")
@@ -70,7 +78,135 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_option(check_config_parser)
     check_config_parser.set_defaults(func=_cmd_check_config)
 
+    _add_compile_subparser(subparsers)
+
     return parser
+
+
+def _add_compile_subparser(
+    subparsers: argparse._SubParsersAction,  # type: ignore[type-arg]
+) -> None:
+    """Add the ``compile`` subcommand (v0.6実装計画.md §4.1).
+
+    ``compile`` is standalone: it does not read ``eeane.toml`` and has
+    no ``--config`` option (unlike ``serve``/``check-config``).
+
+    Args:
+        subparsers: The ``add_subparsers`` action returned by the parent
+            parser, to attach the new subcommand to.
+    """
+    compile_parser = subparsers.add_parser(
+        "compile",
+        help="Convert a HuggingFace-format model into ANE-ready compiled artifacts.",
+    )
+    compile_parser.add_argument(
+        "source",
+        help="Local model directory path, or a HuggingFace model ID (e.g. cl-nagoya/ruri-v3-310m).",
+    )
+    compile_parser.add_argument(
+        "--kind",
+        choices=_COMPILE_KIND_CHOICES,
+        default="auto",
+        help="Model kind. 'auto' (default) detects it from config.json.",
+    )
+    compile_parser.add_argument(
+        "--buckets",
+        type=_parse_buckets,
+        default=None,
+        help="Comma-separated positive sequence lengths to compile, e.g. "
+        "128,512,1024 (default: kind-dependent, resolved after kind detection).",
+    )
+    compile_parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Root directory for compiled artifacts (default: ~/.cache/eeane, "
+        "respects XDG_CACHE_HOME).",
+    )
+    compile_parser.add_argument(
+        "--emit-config",
+        type=Path,
+        default=None,
+        help="Write the generated [[models]] TOML snippet to this file "
+        "(it is always printed to stdout too).",
+    )
+    compile_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompile even if matching artifacts already exist (default: skip them).",
+    )
+    compile_parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="Batch size to compile for (advanced; default: 1).",
+    )
+    compile_parser.add_argument(
+        "--precision",
+        choices=_COMPILE_PRECISION_CHOICES,
+        default="fp16",
+        help="Compute precision for the compiled model (default: fp16).",
+    )
+    compile_parser.add_argument(
+        "--target",
+        choices=_COMPILE_TARGET_CHOICES,
+        default="macos13",
+        help="Minimum deployment target (default: macos13).",
+    )
+    compile_parser.add_argument(
+        "--attn",
+        choices=_COMPILE_ATTN_CHOICES,
+        default="eager",
+        help="Attention implementation to trace (default: eager).",
+    )
+    compile_parser.add_argument(
+        "--keep-mlpackage",
+        action="store_true",
+        help="Keep the intermediate .mlpackage after compiling to .mlmodelc (default: delete it).",
+    )
+    compile_parser.add_argument(
+        "--skip-selfcheck",
+        action="store_true",
+        help="Skip the post-conversion self-check (development use; default: run it).",
+    )
+    compile_parser.set_defaults(func=_cmd_compile)
+
+
+def _parse_buckets(value: str) -> list[int]:
+    """Parse a comma-separated ``--buckets`` value into positive integers.
+
+    Args:
+        value: Raw option value, e.g. ``"128,512,1024"``.
+
+    Returns:
+        The parsed bucket lengths, in the given order.
+
+    Raises:
+        argparse.ArgumentTypeError: If ``value`` is empty, any element is
+            empty/whitespace, is not an integer, or is not strictly
+            positive (``<= 0``). Used as an argparse ``type=`` callback,
+            so this becomes a clean ``parse_args`` exit code 2.
+    """
+    elements = value.split(",")
+    buckets: list[int] = []
+    for raw_element in elements:
+        element = raw_element.strip()
+        if not element:
+            raise argparse.ArgumentTypeError(
+                f"invalid --buckets value {value!r}: elements must not be empty"
+            )
+        try:
+            bucket = int(element)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid --buckets value {value!r}: {element!r} is not an integer"
+            ) from exc
+        if bucket <= 0:
+            raise argparse.ArgumentTypeError(
+                f"invalid --buckets value {value!r}: {element!r} must be a positive integer"
+            )
+        buckets.append(bucket)
+    return buckets
 
 
 def _add_config_option(subparser: argparse.ArgumentParser) -> None:
@@ -176,6 +312,35 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
     _print_effective_config(loaded)
     _warn_if_key_file_readable(loaded)
     return 0
+
+
+def _cmd_compile(args: argparse.Namespace) -> int:
+    """Check ``[compile]`` dependencies and run model compilation (the ``compile`` subcommand).
+
+    Unlike ``serve``/``check-config``, this does not read ``eeane.toml``:
+    ``eeane compile`` is a standalone conversion tool (v0.6実装計画.md
+    §4.1). ``eeane.compiler`` is imported here, not at module load time,
+    so that ``eeane serve``/``check-config`` keep working in
+    environments without the ``[compile]`` extra (torch/transformers)
+    installed.
+
+    Args:
+        args: Parsed ``compile`` arguments (see
+            :func:`_add_compile_subparser`).
+
+    Returns:
+        ``1`` if a ``[compile]``-only dependency is missing. Otherwise,
+        the exit code returned by :func:`eeane.compiler.run_compile`.
+    """
+    from eeane import compiler
+
+    try:
+        compiler.require_compile_dependencies()
+    except compiler.MissingCompileDependencyError as exc:
+        print(f"eeane: {exc}", file=sys.stderr)
+        return 1
+
+    return compiler.run_compile(args)
 
 
 def _warn_if_key_file_readable(loaded: LoadedConfig) -> None:
