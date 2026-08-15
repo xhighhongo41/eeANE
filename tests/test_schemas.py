@@ -172,7 +172,7 @@ def test_health_response_construction() -> None:
     """HealthResponse must accept the documented status/version/models shape."""
     response = HealthResponse(
         status="ok",
-        version="0.4.0.dev0",
+        version="0.5.0.dev0",
         models={"embedding": [128, 512, 1024], "reranker": [512]},
     )
 

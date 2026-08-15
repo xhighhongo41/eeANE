@@ -174,6 +174,36 @@ class RerankResponse(BaseModel):
     usage: Usage
 
 
+class ModelCard(BaseModel):
+    """A single served model within a ``GET /models`` response (OpenAI-compatible).
+
+    Attributes:
+        id: Model id as configured in eeANE (``[[models]] id``).
+        object: Discriminator, always ``"model"``.
+        created: Unix timestamp of the server start-up. eeANE has no
+            per-model creation time, so the process start is reported.
+        owned_by: Owner string, always ``"eeane"``.
+    """
+
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str = "eeane"
+
+
+class ModelListResponse(BaseModel):
+    """Response body for ``GET /models`` and ``GET /v1/models``.
+
+    Attributes:
+        object: Discriminator, always ``"list"``.
+        data: One card per configured model (the embedding model, plus the
+            reranker model when one is configured).
+    """
+
+    object: Literal["list"] = "list"
+    data: list[ModelCard]
+
+
 class HealthResponse(BaseModel):
     """Response body for ``GET /health``.
 

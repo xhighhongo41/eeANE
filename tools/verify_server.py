@@ -50,7 +50,8 @@ if str(_REPO_ROOT) not in sys.path:
     # regardless of the current working directory.
     sys.path.insert(0, str(_REPO_ROOT))
 
-from eeane import runtime, settings  # noqa: E402
+from eeane import runtime  # noqa: E402
+from eeane.config import load_config  # noqa: E402
 from eeane.engine import CoreMLEngine  # noqa: E402
 from poc.common import (  # noqa: E402
     CORPUS_DIR,
@@ -63,6 +64,11 @@ from poc.common import (  # noqa: E402
 
 DEFAULT_BASE_URL = "http://127.0.0.1:7997"
 DEFAULT_TIMEOUT = 120.0
+
+# Resolved once, with the same search order the server uses, so the
+# baseline engine and the normalization check match the running server's
+# configuration.
+CONFIG = load_config().config
 
 # (source work, corpus file, kokoro-only paragraph cap) in the exact file
 # order load_corpus_paragraphs() uses, so per-paragraph work tags can be
@@ -111,7 +117,7 @@ class BaselineEngine:
         if self._engine is None:
             print("Loading baseline CoreMLEngine (direct Core ML predict, in-process)...")
             started = time.perf_counter()
-            self._engine = CoreMLEngine.from_settings()
+            self._engine = CoreMLEngine.from_config(CONFIG)
             print(f"  loaded in {time.perf_counter() - started:.2f}s")
         return self._engine
 
@@ -393,7 +399,7 @@ def cmd_verify_embedding(
     engine = baseline.get()
     baseline_batch = engine.embed(texts)
     baseline_vectors = baseline_batch.vectors.astype(np.float64)
-    if settings.NORMALIZE_EMBEDDINGS:
+    if CONFIG.embedding_model.normalize:
         baseline_vectors = runtime.l2_normalize(baseline_vectors)
 
     cosine = _cosine_rowwise(http_vectors, baseline_vectors)

@@ -230,3 +230,6 @@ models/
 poc/results/
 testdata/corpus/raw/
 
+
+# eeANE: local server configuration (commit eeane.example.toml instead)
+eeane.toml

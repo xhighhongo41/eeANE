@@ -1,0 +1,48 @@
+# eeANE server configuration example.
+#
+# Copy this file to ./eeane.toml (or ~/.config/eeane/eeane.toml) and edit
+# it, or pass an explicit path with `eeane serve --config <path>`.
+# Search order: --config > ./eeane.toml > ~/.config/eeane/eeane.toml >
+# built-in defaults. CLI flags (--host/--port/--log-level) and the
+# EEANE_API_KEY environment variable override the file.
+#
+# The values below reproduce the built-in defaults (the v0.4 fixed
+# configuration). Relative paths are resolved against the directory this
+# file lives in.
+
+[server]
+host = "127.0.0.1"          # Bind address. Use a LAN/tailnet IP to serve other machines.
+port = 7997
+log_level = "info"          # debug | info | warning | error
+# api_key = "change-me"     # Enables Bearer auth on every endpoint except /health.
+                            # EEANE_API_KEY takes precedence over this value.
+                            # Keep this file private (chmod 600) when setting a key here.
+# health_rate_limit = 60    # /health requests per minute per client IP. 0 disables.
+
+# Exactly one embedding model entry is required. One reranker entry is
+# optional (omit it for an embedding-only server; /rerank then answers 503).
+# Serving several models of the same kind is planned for a later version.
+
+[[models]]
+id = "ruri-v3-310m"
+kind = "embedding"           # embedding | reranker
+model_dir = "models/ruri-v3-310m"
+normalize = true             # L2-normalize embeddings (Infinity-compatible). Embedding only.
+# output_name = "embedding"  # Core ML output tensor; derived from kind when omitted.
+
+# Sequence-length bucket -> compiled Core ML artifact. Requests are routed
+# to the smallest bucket that fits; longer inputs are truncated to the
+# largest one.
+[models.artifacts]
+128 = "models/compiled/ruri-v3-310m/s128_b1_eager_macos13.mlmodelc"
+512 = "models/compiled/ruri-v3-310m/s512_b1_eager_macos13.mlmodelc"
+1024 = "models/compiled/ruri-v3-310m/s1024_b1_eager_macos13.mlmodelc"
+
+[[models]]
+id = "ruri-v3-reranker-310m"
+kind = "reranker"
+model_dir = "models/ruri-v3-reranker-310m"
+
+[models.artifacts]
+512 = "models/compiled/ruri-v3-reranker-310m/s512_b1_eager_macos13.mlmodelc"
+1024 = "models/compiled/ruri-v3-reranker-310m/s1024_b1_eager_macos13.mlmodelc"
