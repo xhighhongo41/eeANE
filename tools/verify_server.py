@@ -1,19 +1,26 @@
-"""Verification client for the eeANE server (v0.4実装計画.md §4.7, T5).
+"""Verification client for the eeANE server.
 
 Standard library only (``urllib.request``), with the eeANE package and a
 handful of read-only test-data loaders from ``poc/common.py`` imported for
 building inputs and computing the Core ML direct-predict baseline. Like
-``poc/benchmark_infinity_client.py`` (v0.3 T8), every request is sent
-through an opener that explicitly bypasses ``HTTP_PROXY``/``HTTPS_PROXY``
-environment variables, since a proxy silently swallowing localhost traffic
-was a real incident in v0.3.
+``poc/benchmark_infinity_client.py``, every request is sent through an
+opener that explicitly bypasses the ``HTTP_PROXY``/``HTTPS_PROXY``
+environment variables: a proxy that silently swallows localhost traffic
+otherwise turns into a confusing "server is broken" report.
 
 Subcommands:
-    health           GET /health shape check (R1).
-    verify-embedding /v1/embeddings OpenAI compatibility + accuracy (R2).
-    verify-rerank    /rerank, /v1/rerank Infinity compatibility + accuracy (R3).
-    bench            HTTP round-trip latency measurement (part of R5).
+    health           GET /health shape check.
+    verify-embedding /v1/embeddings OpenAI compatibility and accuracy.
+    verify-rerank    /rerank, /v1/rerank Infinity compatibility and accuracy.
+    bench            HTTP round-trip latency measurement.
     all              Runs the four subcommands above in order.
+
+Both verify subcommands accept ``--model <id>``. Without it they run their
+full default-model suite, whose expected values are tied to the corpus and
+the model this repository ships. With it they run a model-neutral suite
+against the named model: HTTP responses are compared against direct Core
+ML predictions from that same model, and nothing is assumed about the
+model's width, buckets or retrieval quality.
 
 Exit codes: 0 = every check passed, 1 = at least one check failed, 2 = the
 server could not be reached at all (start it first with
@@ -22,7 +29,9 @@ server could not be reached at all (start it first with
 Usage:
     uv run python tools/verify_server.py health
     uv run python tools/verify_server.py verify-embedding
+    uv run python tools/verify_server.py verify-embedding --model MODEL_ID
     uv run python tools/verify_server.py verify-rerank
+    uv run python tools/verify_server.py verify-rerank --model MODEL_ID
     uv run python tools/verify_server.py bench
     uv run python tools/verify_server.py all
 """
@@ -51,7 +60,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from eeane import runtime  # noqa: E402
-from eeane.config import load_config  # noqa: E402
+from eeane.config import ModelEntry, load_config  # noqa: E402
 from eeane.engine import CoreMLEngine  # noqa: E402
 from poc.common import (  # noqa: E402
     CORPUS_DIR,
@@ -78,6 +87,27 @@ _WORK_FILES: list[tuple[str, Path, int | None]] = [
     ("sangetsuki", CORPUS_DIR / "sangetsuki.txt", None),
     ("kokoro", CORPUS_DIR / "kokoro.txt", 30),
 ]
+
+# Every check the ``--model`` (model-neutral) suites report, in output
+# order. Whatever is not reached is filled in as a failed "skipped" row, so
+# a run always answers the same set of questions.
+_EMBEDDING_MODEL_CHECKS: tuple[str, ...] = (
+    "http_200",
+    "data_count",
+    "index_order",
+    "response_model_id",
+    "embedding_dim_consistent",
+    "cosine_min_0.999999",
+    "base64_roundtrip",
+)
+_RERANK_MODEL_CHECKS: tuple[str, ...] = (
+    "requests_200",
+    "response_model_id",
+    "index_coverage",
+    "results_sorted",
+    "score_match",
+    "v1_rerank_matches_rerank",
+)
 
 
 class ServerUnreachable(Exception):
@@ -262,6 +292,113 @@ def _results_list(body: Any) -> list[Any]:
     return []
 
 
+def _fill_skipped(checks: list[CheckResult], names: tuple[str, ...], reason: str) -> None:
+    """Append a failed placeholder row for every check that could not run.
+
+    Checks already present in ``checks`` are left alone, so a caller can
+    hand over the whole suite's name list at any point of the run without
+    tracking how far it got.
+
+    Args:
+        checks: Accumulated checks (appended to in place).
+        names: Every check name the suite reports, in output order.
+        reason: Short explanation shown as ``"skipped: <reason>"``.
+    """
+    recorded = {check.name for check in checks}
+    checks.extend(
+        CheckResult(name, False, f"skipped: {reason}") for name in names if name not in recorded
+    )
+
+
+def _resolve_model_check(model_id: str, kind: str) -> tuple[ModelEntry | None, CheckResult]:
+    """Look a ``--model`` id up in the configuration this tool loaded.
+
+    The baseline engine can only score models it serves, so an id that is
+    absent from the configuration (or names the other kind of model) is a
+    check failure here rather than an HTTP call that is doomed anyway.
+
+    Args:
+        model_id: Id requested on the command line.
+        kind: Kind the subcommand verifies (``"embedding"`` or
+            ``"reranker"``).
+
+    Returns:
+        A ``(entry, check)`` pair. ``entry`` is ``None`` exactly when the
+        check failed; the check's detail then names the usable ids.
+    """
+    entry = CONFIG.model_by_id(model_id)
+    if entry is None:
+        available = ", ".join(f"'{candidate.id}'" for candidate in CONFIG.models_of_kind(kind))
+        return None, CheckResult(
+            "model_configured",
+            False,
+            f"'{model_id}' is not in the configuration this tool loaded; "
+            f"available {kind} models: {available or '(none)'}",
+        )
+    if entry.kind != kind:
+        return None, CheckResult(
+            "model_configured",
+            False,
+            f"'{model_id}' is a {entry.kind} model, but this subcommand verifies {kind} models",
+        )
+    return entry, CheckResult("model_configured", True, f"id='{model_id}' kind={kind}")
+
+
+def _embedding_vectors(data: list[Any]) -> list[list[float]] | None:
+    """Extract the float vectors of an ``/v1/embeddings`` response.
+
+    Args:
+        data: The response's ``data`` list.
+
+    Returns:
+        One vector per entry, in response order, or ``None`` if any entry
+        is not a dict carrying a non-empty numeric ``embedding`` list
+        (booleans are numbers in Python, so they are rejected explicitly).
+    """
+    vectors: list[list[float]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        vector = item.get("embedding")
+        if not isinstance(vector, list) or not vector:
+            return None
+        if any(not isinstance(value, int | float) or isinstance(value, bool) for value in vector):
+            return None
+        vectors.append([float(value) for value in vector])
+    return vectors
+
+
+def _parse_results(results: list[Any], count: int) -> tuple[list[int], list[float]] | None:
+    """Extract the ``(index, relevance_score)`` pairs of a rerank response.
+
+    Args:
+        results: The response's ``results`` list.
+        count: Number of documents the request sent.
+
+    Returns:
+        Indices and scores in response order, or ``None`` when an entry is
+        malformed or the indices are not exactly ``0..count-1`` with no
+        repeats -- in which case comparing scores by index would be
+        meaningless (and could even read out of range).
+    """
+    indices: list[int] = []
+    scores: list[float] = []
+    for result in results:
+        if not isinstance(result, dict):
+            return None
+        index = result.get("index")
+        score = result.get("relevance_score")
+        if not isinstance(index, int) or isinstance(index, bool):
+            return None
+        if not isinstance(score, int | float) or isinstance(score, bool):
+            return None
+        indices.append(index)
+        scores.append(float(score))
+    if sorted(indices) != list(range(count)):
+        return None
+    return indices, scores
+
+
 def _print_summary(title: str, checks: list[CheckResult]) -> bool:
     """Print a PASS/FAIL summary table and return whether every check passed.
 
@@ -286,8 +423,38 @@ def _print_summary(title: str, checks: list[CheckResult]) -> bool:
     return overall
 
 
+def _health_entry_problem(entry: Any) -> str | None:
+    """Describe what is wrong with one ``/health`` model entry.
+
+    Args:
+        entry: One element of the response's ``models`` list.
+
+    Returns:
+        A short description of the first problem found, or ``None`` if the
+        entry carries a non-empty ``id``, a supported ``kind`` and a list
+        of integer ``buckets``.
+    """
+    if not isinstance(entry, dict):
+        return f"not an object: {entry!r}"
+    model_id = entry.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        return f"bad id: {model_id!r}"
+    kind = entry.get("kind")
+    if kind not in ("embedding", "reranker"):
+        return f"{model_id}: bad kind {kind!r}"
+    buckets = entry.get("buckets")
+    if not isinstance(buckets, list) or any(
+        not isinstance(bucket, int) or isinstance(bucket, bool) for bucket in buckets
+    ):
+        return f"{model_id}: bad buckets {buckets!r}"
+    return None
+
+
 def cmd_health(args: argparse.Namespace, opener: urllib.request.OpenerDirector) -> bool:
-    """Verify ``GET /health`` responds with the expected shape (R1).
+    """Verify ``GET /health`` responds with the expected shape.
+
+    The response lists one entry per served model, so the checks are
+    driven by that list rather than by any particular model being present.
 
     Args:
         args: Parsed CLI arguments (uses ``base_url``, ``timeout``).
@@ -299,17 +466,11 @@ def cmd_health(args: argparse.Namespace, opener: urllib.request.OpenerDirector) 
     status, body, elapsed = _request_json(
         opener, "GET", f"{args.base_url}/health", None, args.timeout
     )
+    check_names = ("status_ok", "version_present", "models_list", "models_entries_wellformed")
     checks: list[CheckResult] = [CheckResult("http_200", status == 200, f"elapsed={elapsed:.3f}s")]
     if status != 200:
         checks[-1].detail = _describe_error(status, body)
-        skipped_names = (
-            "status_ok",
-            "version_present",
-            "models_embedding_list",
-            "models_reranker_list",
-        )
-        for name in skipped_names:
-            checks.append(CheckResult(name, False, "skipped: non-200 response"))
+        _fill_skipped(checks, check_names, "non-200 response")
         return _print_summary("health", checks)
 
     payload = body if isinstance(body, dict) else {}
@@ -322,28 +483,60 @@ def cmd_health(args: argparse.Namespace, opener: urllib.request.OpenerDirector) 
             "version_present", isinstance(version, str) and bool(version), f"version={version!r}"
         )
     )
-    models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
-    embedding_list = models.get("embedding")
-    reranker_list = models.get("reranker")
+
+    models = payload.get("models")
     checks.append(
         CheckResult(
-            "models_embedding_list",
-            isinstance(embedding_list, list),
-            f"embedding={embedding_list!r}",
+            "models_list",
+            isinstance(models, list),
+            f"{len(models)} entries" if isinstance(models, list) else f"models={models!r}",
         )
     )
-    checks.append(
-        CheckResult(
-            "models_reranker_list", isinstance(reranker_list, list), f"reranker={reranker_list!r}"
-        )
-    )
+    if not isinstance(models, list):
+        _fill_skipped(checks, check_names, "models is not a list")
+        return _print_summary("health", checks)
+
+    problems = [
+        problem for entry in models if (problem := _health_entry_problem(entry)) is not None
+    ]
+    if problems:
+        detail = "; ".join(problems)
+    else:
+        # Safe to index only once every entry is known to be well-formed.
+        detail = ", ".join(f"{entry['id']}({entry['kind']})" for entry in models)
+    checks.append(CheckResult("models_entries_wellformed", not problems, detail))
     return _print_summary("health", checks)
 
 
 def cmd_verify_embedding(
     args: argparse.Namespace, opener: urllib.request.OpenerDirector, baseline: BaselineEngine
 ) -> bool:
-    """Verify ``/v1/embeddings`` OpenAI compatibility and accuracy (R2).
+    """Verify ``/v1/embeddings`` OpenAI compatibility and accuracy.
+
+    Args:
+        args: Parsed CLI arguments (uses ``base_url``, ``timeout``, and
+            ``model`` when the subcommand defines it).
+        opener: Proxy-bypassing opener shared across subcommands.
+        baseline: Shared, lazily-built Core ML baseline engine.
+
+    Returns:
+        Whether every check passed.
+    """
+    model_id = getattr(args, "model", None)
+    if model_id is not None:
+        return _verify_embedding_model(args, opener, baseline, model_id)
+    return _verify_embedding_default(args, opener, baseline)
+
+
+def _verify_embedding_default(
+    args: argparse.Namespace, opener: urllib.request.OpenerDirector, baseline: BaselineEngine
+) -> bool:
+    """Run the full ``/v1/embeddings`` suite against the server's default model.
+
+    Sends no ``model`` field, so the server answers with the first-listed
+    embedding model. The expected values (input count, embedding width,
+    bucket routing) describe the model and corpus this repository ships;
+    use ``--model`` for a model-neutral run.
 
     Args:
         args: Parsed CLI arguments (uses ``base_url``, ``timeout``).
@@ -459,10 +652,180 @@ def cmd_verify_embedding(
     return _print_summary("verify-embedding", checks)
 
 
+def _verify_embedding_model(
+    args: argparse.Namespace,
+    opener: urllib.request.OpenerDirector,
+    baseline: BaselineEngine,
+    model_id: str,
+) -> bool:
+    """Verify ``/v1/embeddings`` against one named model, model-neutrally.
+
+    The corpus paragraphs are embedded twice -- over HTTP with ``model``
+    set to ``model_id``, and by direct Core ML prediction with the same
+    model -- and only the agreement between the two, plus the response's
+    own self-consistency, is judged. No embedding width, bucket layout or
+    retrieval quality is assumed, so the suite applies to any configured
+    embedding model.
+
+    Args:
+        args: Parsed CLI arguments (uses ``base_url``, ``timeout``).
+        opener: Proxy-bypassing opener shared across subcommands.
+        baseline: Shared, lazily-built Core ML baseline engine.
+        model_id: Id sent as the request's ``model`` field.
+
+    Returns:
+        Whether every check passed.
+    """
+    entry, model_check = _resolve_model_check(model_id, "embedding")
+    checks: list[CheckResult] = [model_check]
+    if entry is None:
+        _fill_skipped(checks, _EMBEDDING_MODEL_CHECKS, "unusable --model")
+        return _print_summary("verify-embedding", checks)
+
+    texts = load_corpus_paragraphs()
+    if not texts:
+        _fill_skipped(checks, _EMBEDDING_MODEL_CHECKS, "the corpus loader returned no paragraph")
+        return _print_summary("verify-embedding", checks)
+
+    url = f"{args.base_url}/v1/embeddings"
+    status, body, elapsed = _request_json(
+        opener, "POST", url, {"input": texts, "model": model_id}, args.timeout
+    )
+    if status != 200:
+        checks.append(CheckResult("http_200", False, _describe_error(status, body)))
+        _fill_skipped(checks, _EMBEDDING_MODEL_CHECKS, "non-200 response")
+        return _print_summary("verify-embedding", checks)
+    checks.append(CheckResult("http_200", True, f"elapsed={elapsed:.3f}s"))
+
+    payload = body if isinstance(body, dict) else {}
+    data = payload.get("data")
+    count_ok = isinstance(data, list) and len(data) == len(texts)
+    checks.append(
+        CheckResult(
+            "data_count",
+            count_ok,
+            f"got {len(data) if isinstance(data, list) else 'n/a'} of {len(texts)}",
+        )
+    )
+    if not count_ok:
+        _fill_skipped(checks, _EMBEDDING_MODEL_CHECKS, "bad data shape")
+        return _print_summary("verify-embedding", checks)
+
+    order = [item.get("index") if isinstance(item, dict) else None for item in data]
+    checks.append(CheckResult("index_order", order == list(range(len(texts)))))
+
+    served_model = payload.get("model")
+    checks.append(
+        CheckResult(
+            "response_model_id",
+            served_model == model_id,
+            f"response model={served_model!r} requested={model_id!r}",
+        )
+    )
+
+    # A single width is what makes the vectors comparable at all; the
+    # configured width, when the cache recorded one, must agree with it.
+    vectors = _embedding_vectors(data)
+    dims = sorted({len(vector) for vector in vectors}) if vectors is not None else []
+    comparable = len(dims) == 1
+    checks.append(
+        CheckResult(
+            "embedding_dim_consistent",
+            comparable and (entry.embedding_dim is None or dims[0] == entry.embedding_dim),
+            f"dims={dims or 'unusable embedding values'} configured={entry.embedding_dim}",
+        )
+    )
+    if vectors is None or not comparable:
+        _fill_skipped(checks, _EMBEDDING_MODEL_CHECKS, "embeddings are not a uniform float matrix")
+        return _print_summary("verify-embedding", checks)
+
+    http_vectors = np.asarray(vectors, dtype=np.float64)
+    engine = baseline.get()
+    baseline_vectors = engine.embed(texts, model_id=model_id).vectors.astype(np.float64)
+    if entry.normalize:
+        baseline_vectors = runtime.l2_normalize(baseline_vectors)
+    if baseline_vectors.shape != http_vectors.shape:
+        checks.append(
+            CheckResult(
+                "cosine_min_0.999999",
+                False,
+                f"shape mismatch: http={http_vectors.shape} baseline={baseline_vectors.shape}",
+            )
+        )
+    else:
+        cosine = _cosine_rowwise(http_vectors, baseline_vectors)
+        cosine_min = float(cosine.min())
+        checks.append(
+            CheckResult(
+                "cosine_min_0.999999",
+                cosine_min >= 0.999999,
+                f"min={cosine_min:.8f} mean={float(cosine.mean()):.8f} "
+                f"worst_index={int(cosine.argmin())}",
+            )
+        )
+
+    b64_status, b64_body, _elapsed = _request_json(
+        opener,
+        "POST",
+        url,
+        {"input": [texts[0]], "encoding_format": "base64", "model": model_id},
+        args.timeout,
+    )
+    if b64_status == 200 and isinstance(b64_body, dict):
+        b64_data = b64_body.get("data") or [{}]
+        first = b64_data[0] if isinstance(b64_data[0], dict) else {}
+        encoded = first.get("embedding")
+        if isinstance(encoded, str):
+            decoded = runtime.base64_to_floats(encoded).astype(np.float64)
+            shape_ok = decoded.shape == (dims[0],)
+            b64_ok = shape_ok and np.allclose(decoded, http_vectors[0], atol=1e-6)
+            if b64_ok:
+                detail = ""
+            elif not shape_ok:
+                detail = f"decoded shape={decoded.shape}, expected ({dims[0]},)"
+            else:
+                detail = f"max|delta|={np.max(np.abs(decoded - http_vectors[0])):.3e}"
+        else:
+            b64_ok = False
+            detail = f"embedding field is not a string: {type(encoded)!r}"
+    else:
+        b64_ok = False
+        detail = _describe_error(b64_status, b64_body)
+    checks.append(CheckResult("base64_roundtrip", b64_ok, detail))
+
+    return _print_summary("verify-embedding", checks)
+
+
 def cmd_verify_rerank(
     args: argparse.Namespace, opener: urllib.request.OpenerDirector, baseline: BaselineEngine
 ) -> bool:
-    """Verify ``/rerank``/``/v1/rerank`` Infinity compatibility and accuracy (R3).
+    """Verify ``/rerank``/``/v1/rerank`` Infinity compatibility and accuracy.
+
+    Args:
+        args: Parsed CLI arguments (uses ``base_url``, ``timeout``, and
+            ``model`` when the subcommand defines it).
+        opener: Proxy-bypassing opener shared across subcommands.
+        baseline: Shared, lazily-built Core ML baseline engine.
+
+    Returns:
+        Whether every check passed.
+    """
+    model_id = getattr(args, "model", None)
+    if model_id is not None:
+        return _verify_rerank_model(args, opener, baseline, model_id)
+    return _verify_rerank_default(args, opener, baseline)
+
+
+def _verify_rerank_default(
+    args: argparse.Namespace, opener: urllib.request.OpenerDirector, baseline: BaselineEngine
+) -> bool:
+    """Run the full rerank suite against the server's default reranker.
+
+    Sends no ``model`` field, so the server answers with the first-listed
+    reranker. Besides the protocol and accuracy checks, this suite also
+    asserts the retrieval quality expected of the model and corpus this
+    repository ships (the top-1 hit must come from the query's source
+    work); use ``--model`` for a model-neutral run.
 
     Args:
         args: Parsed CLI arguments (uses ``base_url``, ``timeout``).
@@ -633,6 +996,147 @@ def cmd_verify_rerank(
     return _print_summary("verify-rerank", checks)
 
 
+def _verify_rerank_model(
+    args: argparse.Namespace,
+    opener: urllib.request.OpenerDirector,
+    baseline: BaselineEngine,
+    model_id: str,
+) -> bool:
+    """Verify ``/rerank``/``/v1/rerank`` against one named reranker, model-neutrally.
+
+    Every stored query is scored against the corpus paragraphs twice --
+    over HTTP with ``model`` set to ``model_id``, and by direct Core ML
+    prediction with the same model -- and only the agreement between the
+    two, plus the response's own consistency (sorting, index coverage,
+    reported model id, both URL paths), is judged. Which document a model
+    ranks first is its own business and is not checked, so the suite
+    applies to any configured reranker.
+
+    Args:
+        args: Parsed CLI arguments (uses ``base_url``, ``timeout``).
+        opener: Proxy-bypassing opener shared across subcommands.
+        baseline: Shared, lazily-built Core ML baseline engine.
+        model_id: Id sent as the request's ``model`` field.
+
+    Returns:
+        Whether every check passed.
+    """
+    entry, model_check = _resolve_model_check(model_id, "reranker")
+    checks: list[CheckResult] = [model_check]
+    if entry is None:
+        _fill_skipped(checks, _RERANK_MODEL_CHECKS, "unusable --model")
+        return _print_summary("verify-rerank", checks)
+
+    queries = load_rerank_queries()
+    paragraphs = load_corpus_paragraphs()
+    if not queries or not paragraphs:
+        _fill_skipped(checks, _RERANK_MODEL_CHECKS, "the test-data loaders returned nothing")
+        return _print_summary("verify-rerank", checks)
+    engine = baseline.get()
+
+    request_issues: list[str] = []
+    model_issues: list[str] = []
+    index_issues: list[str] = []
+    sort_issues: list[str] = []
+    max_score_delta = 0.0
+    worst_detail = "n/a"
+
+    for query in queries:
+        status, body, _elapsed = _request_json(
+            opener,
+            "POST",
+            f"{args.base_url}/rerank",
+            {"query": query["query"], "documents": paragraphs, "model": model_id},
+            args.timeout,
+        )
+        if status != 200:
+            request_issues.append(f"{query['id']}: {_describe_error(status, body)}")
+            continue
+
+        served_model = body.get("model") if isinstance(body, dict) else None
+        if served_model != model_id:
+            model_issues.append(f"{query['id']}: model={served_model!r}")
+
+        results = _results_list(body)
+        parsed = _parse_results(results, len(paragraphs))
+        if parsed is None:
+            # Without a clean 0..N-1 index set, scores cannot be matched
+            # up with the baseline at all, so this query is not scored.
+            index_issues.append(
+                f"{query['id']}: results do not cover the {len(paragraphs)} sent documents "
+                f"exactly once (got {len(results)} entries)"
+            )
+            continue
+        indices, scores = parsed
+
+        if scores != sorted(scores, reverse=True):
+            sort_issues.append(query["id"])
+
+        rerank_batch = engine.rerank(query["query"], paragraphs, model_id=model_id)
+        baseline_scores = runtime.sigmoid(rerank_batch.logits)
+        for index, score in zip(indices, scores, strict=True):
+            delta = abs(score - float(baseline_scores[index]))
+            if delta > max_score_delta:
+                max_score_delta = delta
+                worst_detail = f"query={query['id']} index={index}"
+
+    scored = len(queries) - len(request_issues) - len(index_issues)
+    blocked = bool(request_issues or index_issues)
+    checks.append(
+        CheckResult(
+            "requests_200",
+            not request_issues,
+            "; ".join(request_issues) or f"{len(queries)}/{len(queries)} ok",
+        )
+    )
+    checks.append(
+        CheckResult(
+            "response_model_id",
+            not request_issues and not model_issues,
+            "; ".join(model_issues) or f"all responses report '{model_id}'",
+        )
+    )
+    checks.append(
+        CheckResult("index_coverage", not blocked, "; ".join(index_issues) or f"{scored} queries")
+    )
+    checks.append(
+        CheckResult("results_sorted", not blocked and not sort_issues, "; ".join(sort_issues))
+    )
+    checks.append(
+        CheckResult(
+            "score_match",
+            not blocked and max_score_delta <= 1e-6,
+            f"max|delta|={max_score_delta:.3e} ({worst_detail})",
+        )
+    )
+
+    # Both URL paths must answer identically: /v1/rerank is the OpenAI-style
+    # spelling of the same endpoint, not a separate implementation.
+    sample_query = queries[0]["query"]
+    payload = {"query": sample_query, "documents": paragraphs, "model": model_id}
+    status_v1, body_v1, _elapsed = _request_json(
+        opener, "POST", f"{args.base_url}/v1/rerank", payload, args.timeout
+    )
+    status_legacy, body_legacy, _elapsed = _request_json(
+        opener, "POST", f"{args.base_url}/rerank", payload, args.timeout
+    )
+    v1_parity_ok = (
+        status_v1 == 200
+        and status_legacy == 200
+        and _results_list(body_v1) == _results_list(body_legacy)
+        and len(_results_list(body_v1)) == len(paragraphs)
+    )
+    checks.append(
+        CheckResult(
+            "v1_rerank_matches_rerank",
+            v1_parity_ok,
+            f"status_v1={status_v1} status_legacy={status_legacy}",
+        )
+    )
+
+    return _print_summary("verify-rerank", checks)
+
+
 def cmd_bench(args: argparse.Namespace, opener: urllib.request.OpenerDirector) -> bool:
     """Measure HTTP round-trip latency for rerank and embedding (part of R5).
 
@@ -755,19 +1259,33 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Per-request HTTP timeout, in seconds (default: {DEFAULT_TIMEOUT}).",
     )
 
+    # Only the two verify subcommands can target a specific model: bench
+    # measures the default path, and `all` runs the default suites.
+    model_option = argparse.ArgumentParser(add_help=False)
+    model_option.add_argument(
+        "--model",
+        default=None,
+        metavar="ID",
+        help=(
+            "Verify this configured model id instead of the server's default model. "
+            "Runs a model-neutral suite: HTTP responses are compared against the same "
+            "model's direct Core ML predictions, with no model-specific expectation."
+        ),
+    )
+
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("health", parents=[common], help="Check GET /health (R1).")
+    subparsers.add_parser("health", parents=[common], help="Check GET /health.")
     subparsers.add_parser(
         "verify-embedding",
-        parents=[common],
-        help="Verify /v1/embeddings compatibility and accuracy (R2).",
+        parents=[common, model_option],
+        help="Verify /v1/embeddings compatibility and accuracy.",
     )
     subparsers.add_parser(
         "verify-rerank",
-        parents=[common],
-        help="Verify /rerank and /v1/rerank compatibility and accuracy (R3).",
+        parents=[common, model_option],
+        help="Verify /rerank and /v1/rerank compatibility and accuracy.",
     )
-    subparsers.add_parser("bench", parents=[common], help="Measure HTTP round-trip latency (R5).")
+    subparsers.add_parser("bench", parents=[common], help="Measure HTTP round-trip latency.")
     subparsers.add_parser(
         "all", parents=[common], help="Run health, verify-embedding, verify-rerank, bench."
     )
