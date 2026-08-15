@@ -7,8 +7,8 @@ Two layers:
   self-check), which are pure data and run anywhere.
 * ``eeane.compiler.backends.modernbert``: the numerics ported from the
   frozen PoC scripts (masked mean pooling, stable sigmoid, patched-eager
-  == unpatched-sdpa forward outputs) plus its conformance to the backend
-  interface that pipeline.py drives.
+  == unpatched-sdpa forward outputs) plus the conformance of every
+  registered backend to the interface that pipeline.py drives.
 
 Tests needing the real 310M models skip themselves when
 ``models/ruri-v3-310m`` / ``models/ruri-v3-reranker-310m`` are absent.
@@ -31,6 +31,7 @@ from transformers.models.modernbert import modeling_modernbert
 
 from eeane.compiler.backends import base
 from eeane.compiler.backends import modernbert as mb
+from eeane.compiler.backends import xlm_roberta as xlmr
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 EMBEDDING_MODEL_DIR = _REPO_ROOT / "models" / "ruri-v3-310m"
@@ -209,6 +210,10 @@ _PROTOCOL_METHODS = sorted(
     if not name.startswith("_") and callable(member)
 )
 
+# Every registered backend implementation, so that a new architecture is
+# held to the same interface as the existing ones.
+_BACKEND_CLASSES = [mb.ModernBertBackend, xlmr.XlmRobertaBackend]
+
 
 def _parameters(function: Any) -> list[tuple[str, Any]]:
     """Return a function's parameter names and defaults, ignoring annotations."""
@@ -231,12 +236,13 @@ def test_the_protocol_declares_the_documented_members() -> None:
     }
 
 
+@pytest.mark.parametrize("backend_class", _BACKEND_CLASSES, ids=lambda cls: cls.__name__)
 @pytest.mark.parametrize("method", _PROTOCOL_METHODS)
-def test_modernbert_backend_matches_the_declared_signature(method: str) -> None:
-    """Every interface member must exist on the backend with the declared parameters."""
-    implemented = getattr(mb.ModernBertBackend, method, None)
+def test_every_backend_matches_the_declared_signature(backend_class: type, method: str) -> None:
+    """Every interface member must exist on each backend with the declared parameters."""
+    implemented = getattr(backend_class, method, None)
 
-    assert implemented is not None, f"ModernBertBackend does not implement {method}()"
+    assert implemented is not None, f"{backend_class.__name__} does not implement {method}()"
     assert _parameters(implemented) == _parameters(getattr(base.CompileBackend, method))
 
 
