@@ -6,9 +6,7 @@
 # built-in defaults. CLI flags (--host/--port/--log-level) and the
 # EEANE_API_KEY environment variable override the file.
 #
-# The values below reproduce the built-in defaults (the v0.4 fixed
-# configuration). Relative paths are resolved against the directory this
-# file lives in.
+# Relative paths are resolved against the directory this file lives in.
 
 [server]
 host = "127.0.0.1"          # Bind address. Use a LAN/tailnet IP to serve other machines.
@@ -18,31 +16,40 @@ log_level = "info"          # debug | info | warning | error
                             # EEANE_API_KEY takes precedence over this value.
                             # Keep this file private (chmod 600) when setting a key here.
 # health_rate_limit = 60    # /health requests per minute per client IP. 0 disables.
+# cache_root = "~/.cache/eeane"  # Compiled-model cache used to resolve minimal
+                                 # [[models]] entries. Matches `eeane compile --out-dir`.
 
-# Exactly one embedding model entry is required. One reranker entry is
-# optional (omit it for an embedding-only server; /rerank then answers 503).
-# Serving several models of the same kind is planned for a later version.
-
-[[models]]
-id = "ruri-v3-310m"
-kind = "embedding"           # embedding | reranker
-tokenizer = "models/compiled/ruri-v3-310m/tokenizer.json"  # Frozen by `eeane compile`.
-normalize = true             # L2-normalize embeddings (Infinity-compatible). Embedding only.
-# output_name = "embedding"  # Core ML output tensor; derived from kind when omitted.
-
-# Sequence-length bucket -> compiled Core ML artifact. Requests are routed
-# to the smallest bucket that fits; longer inputs are truncated to the
-# largest one.
-[models.artifacts]
-128 = "models/compiled/ruri-v3-310m/s128_b1_eager_macos13.mlmodelc"
-512 = "models/compiled/ruri-v3-310m/s512_b1_eager_macos13.mlmodelc"
-1024 = "models/compiled/ruri-v3-310m/s1024_b1_eager_macos13.mlmodelc"
+# Any number of [[models]] entries may be listed; at least one embedding
+# model is required, rerankers are optional (without one, /rerank answers
+# 503). Within each kind the FIRST entry listed is the default model,
+# used when a request does not name one; requests select any other entry
+# with their `model` field.
+#
+# The minimal form gives only the id: kind, tokenizer, artifacts and the
+# embedding width are resolved from the compiled-model cache written by
+# `eeane compile`, loading the buckets its calibration recommends.
 
 [[models]]
-id = "ruri-v3-reranker-310m"
-kind = "reranker"
-tokenizer = "models/compiled/ruri-v3-reranker-310m/tokenizer.json"
+id = "cl-nagoya/ruri-v3-310m"
+# normalize = true           # L2-normalize embeddings (the default). Embedding only.
 
-[models.artifacts]
-512 = "models/compiled/ruri-v3-reranker-310m/s512_b1_eager_macos13.mlmodelc"
-1024 = "models/compiled/ruri-v3-reranker-310m/s1024_b1_eager_macos13.mlmodelc"
+[[models]]
+id = "cl-nagoya/ruri-v3-reranker-310m"
+
+# [[models]]
+# id = "intfloat/multilingual-e5-base"
+
+# The explicit form pins every field independently of the cache -- for
+# artifacts moved elsewhere, or to serve a hand-picked bucket set.
+# Requests are routed to the smallest bucket that fits; longer inputs
+# are truncated to the largest one.
+
+# [[models]]
+# id = "my-pinned-model"
+# kind = "embedding"           # embedding | reranker
+# tokenizer = "models/compiled/my-model/tokenizer.json"  # Frozen by `eeane compile`.
+# normalize = true
+# # output_name = "embedding"  # Core ML output tensor; derived from kind when omitted.
+# [models.artifacts]
+# 128 = "models/compiled/my-model/s128_b1_eager_macos13.mlmodelc"
+# 512 = "models/compiled/my-model/s512_b1_eager_macos13.mlmodelc"

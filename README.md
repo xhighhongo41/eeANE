@@ -8,7 +8,7 @@ Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **Status: early development (v0.6).**
+> **Status: early development (v0.7).**
 > v0.1–v0.3 proved the concept:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (a Japanese ModernBERT embedding model) and
@@ -38,6 +38,19 @@ and most of your unified memory free for other work.
 > hardware compatibility report, and prints a ready-to-paste config
 > snippet. The server itself no longer needs torch or transformers —
 > heavyweight dependencies moved to the optional `[compile]` extra.
+> **v0.7 lays the multi-architecture, multi-model foundation**: a
+> defined backend interface makes adding an architecture a matter of
+> writing one backend module, and the first non-ModernBERT backend
+> (XLM-RoBERTa) is verified end to end on
+> [multilingual-e5-base](https://huggingface.co/intfloat/multilingual-e5-base),
+> [multilingual-e5-large](https://huggingface.co/intfloat/multilingual-e5-large)
+> and [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)
+> (compile → serve → exact HTTP/Core ML agreement, 93–98% ANE
+> placement). The server now serves any number of embedding and
+> reranker models at once and routes each request by its `model`
+> field, `eeane compile` records a per-machine calibration in the
+> artifact cache, and a `[[models]]` config entry can be just an
+> `id = "..."` line — everything else is resolved from that cache.
 > Packaged one-command installs arrive in later milestones.
 
 ## Requirements
@@ -48,36 +61,49 @@ and most of your unified memory free for other work.
   uses `xcrun coremlcompiler`
 - [uv](https://docs.astral.sh/uv/) (for the development environment)
 
-## Compiling models and running the server (v0.6)
+## Compiling models and running the server
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git
 cd eeANE
 uv sync --extra compile   # torch/transformers are needed only for compiling
 
-# Compile a model straight from its Hugging Face ID (auto-downloaded)
-# or from a local directory in HF distribution form. One-time; the
+# Compile models straight from their Hugging Face IDs (auto-downloaded)
+# or from local directories in HF distribution form. One-time; the
 # artifacts land under ~/.cache/eeane/ and each bucket takes ~30-100 s:
 uv run python -m eeane compile cl-nagoya/ruri-v3-310m
 uv run python -m eeane compile cl-nagoya/ruri-v3-reranker-310m
+uv run python -m eeane compile intfloat/multilingual-e5-base
 
-# Each run ends with a ready-made [[models]] TOML snippet on stdout --
-# paste the snippets into ./eeane.toml (see eeane.example.toml for the
-# [server] section), then start the server:
+# Each run ends with a ready-made [[models]] TOML snippet on stdout.
+# Since v0.7 the snippet is minimal -- usually just the model id --
+# because the server resolves everything else from the compiled-model
+# cache. Paste the snippets into ./eeane.toml (see eeane.example.toml),
+# then start the server:
 uv run python -m eeane serve
 ```
 
-`eeane compile` picks the model backend from the model's `config.json`
-(v0.6 supports the ModernBERT architecture), detects whether it is an
-embedding model or a reranker, and defaults to buckets 128/512/1024
-(embedding) or 512/1024 (reranker); `--buckets 512,2048` compiles a
-custom set (S2048 is verified on M2 at ~518 ms/inference). Re-running
+`eeane compile` picks the model backend from the model's `config.json`.
+Two architecture families are supported: **ModernBERT** (verified on
+cl-nagoya/ruri-v3-310m and its reranker) and **XLM-RoBERTa** (verified
+on intfloat/multilingual-e5-base, intfloat/multilingual-e5-large and
+BAAI/bge-reranker-v2-m3; for embedding models the mean/CLS pooling
+declared by the model directory is applied automatically). More
+families are planned after 1.0. The compiler detects whether a model is
+an embedding model or a reranker and defaults to buckets 128/512/1024
+(embedding) or 512/1024 (reranker), clipped to the model's maximum
+sequence length (multilingual-e5, capped at 512 tokens, compiles as
+128/512); `--buckets 512,2048` compiles a custom set (S2048 is verified
+on M2 at ~518 ms/inference). Re-running
 skips up-to-date artifacts (`--force` reconverts). After every
 conversion a **self-check** verifies accuracy against the FP32 original,
 measures how many operations landed on the Neural Engine, and records
 warm latency — the printed summary doubles as a compatibility report:
 if you run eeANE on hardware we have not verified (M1/M3/M4...), please
-paste it into an issue. The tokenizer is frozen into the artifact
+paste it into an issue. The per-bucket measurements are aggregated into
+a calibration record (`model_info.json`) in the cache; buckets whose
+self-check failed are dropped from the recommended set that
+cache-resolved configs load. The tokenizer is frozen into the artifact
 directory and verified to reproduce the original tokenization exactly,
 so the server needs neither the original model files nor the
 transformers library at run time (see
@@ -102,13 +128,18 @@ uv run python -m eeane serve --host 192.168.1.20 --port 7997
 uv run python -m eeane check-config --config /path/to/eeane.toml
 ```
 
-The config file defines the served models (frozen `tokenizer.json`,
-compiled artifact per sequence-length bucket, L2 normalization) — which
-is exactly what the `eeane compile` snippet fills in — so buckets can
-be added or removed without touching code. The reranker entry may be
-omitted for an embedding-only server (`/rerank` then answers 503).
-`uv run python -m eeane.server` (the v0.4 entry point) remains as an
-alias for `eeane serve`.
+The config file lists the served models — any number of embedding and
+reranker entries. A `[[models]]` entry usually needs only its
+`id = "..."`: the kind, frozen tokenizer, per-bucket artifacts and
+embedding width are then resolved from the compiled-model cache
+(`server.cache_root`, default `~/.cache/eeane/`), honouring the
+calibration's recommended buckets. Spelling out `kind`, `tokenizer` and
+`[models.artifacts]` explicitly (the pre-v0.7 form) still works and
+pins the entry independently of the cache. Within each kind the
+first-listed entry is the default model, used when a request does not
+name one. Reranker entries may be omitted entirely for an
+embedding-only server (`/rerank` then answers 503).
+`uv run python -m eeane.server` remains as an alias for `eeane serve`.
 
 ### Serving beyond localhost
 
@@ -125,21 +156,26 @@ LAN/VPN, put the server behind a reverse proxy or firewall.
 
 ### Endpoints
 
-- `GET /health` — status and the sequence-length buckets in service
-  (unauthenticated, rate-limited)
-- `GET /models` (alias: `GET /v1/models`) — OpenAI-compatible model
-  listing
+- `GET /health` — status and one entry per served model (`id`, `kind`,
+  buckets in service; the per-model list format is new in v0.7),
+  unauthenticated, rate-limited
+- `GET /models` (alias: `GET /v1/models`) — OpenAI-compatible listing
+  of every served model
 - `POST /v1/embeddings` (alias: `POST /embeddings`) — OpenAI-compatible
   (`input` as string or list, `encoding_format` `float`/`base64`);
-  embeddings are L2-normalized, matching Infinity_emb's behavior
+  embeddings are L2-normalized by default (per-model `normalize`)
 - `POST /rerank`, `POST /v1/rerank` — Infinity-compatible
   (`query`/`documents`/`top_n`/`return_documents`/`raw_scores`)
 
-The embeddings and rerank endpoints are served both under `/v1` and at
-the root, so a base URL with or without the `/v1` suffix works. Each input is routed to the
-smallest fitting sequence-length bucket (defaults — embeddings:
-128/512/1024 tokens; reranker: 512/1024) and truncated to the largest
-bucket when longer, with a server-side warning.
+The optional `model` field of the embeddings and rerank requests
+selects the served model by its configured id; omitting it selects the
+first-listed model of the endpoint's kind. An unknown id gets a 404
+listing the servable ids, and naming a model of the other kind gets a
+400. The embeddings and rerank endpoints are served both under `/v1`
+and at the root, so a base URL with or without the `/v1` suffix works.
+Each input is routed to the smallest fitting sequence-length bucket of
+its model and truncated to the largest bucket when longer, with a
+server-side warning.
 
 To use eeANE from [Open WebUI](https://github.com/open-webui/open-webui):
 set the embedding engine to OpenAI with base URL
@@ -153,6 +189,9 @@ inference, API compatibility, latency):
 
 ```sh
 uv run python tools/verify_server.py all
+# Check one specific served model against direct Core ML inference:
+uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
+uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
 ```
 
 ## Trying the PoC (historical development snapshot)

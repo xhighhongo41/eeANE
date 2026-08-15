@@ -8,7 +8,7 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 コンパイル済みモデルは数秒でロードでき、ANE上で推論するため、GPUと
 ユニファイドメモリの大部分を他の作業のために空けておけます。
 
-> **開発状況: 初期開発中 (v0.6)。**
+> **開発状況: 初期開発中 (v0.7)。**
 > v0.1〜v0.3で概念実証を完了:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (日本語ModernBERT埋め込みモデル)と
@@ -33,8 +33,20 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 > が走り、そのレポートはハードウェア互換性レポートを兼ねます。最後に
 > 設定ファイルへそのまま貼れるスニペットを出力します。サーバー本体は
 > torch/transformersに依存しなくなり、重量級の依存はオプションの
-> `[compile]`エクストラへ分離されました。パッケージ配布は後の
-> マイルストーンで実装予定です。
+> `[compile]`エクストラへ分離されました。**v0.7で多アーキテクチャ・
+> 多モデルの基盤ができました**: バックエンドインターフェースの確定に
+> より、アーキテクチャの追加は「バックエンドモジュールを1つ書く」作業
+> に定型化されました。最初の非ModernBERTバックエンド(XLM-RoBERTa)は
+> [multilingual-e5-base](https://huggingface.co/intfloat/multilingual-e5-base)・
+> [multilingual-e5-large](https://huggingface.co/intfloat/multilingual-e5-large)・
+> [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)
+> でエンドツーエンド検証済みです(compile→serve→HTTP応答とCore ML直接
+> 推論の完全一致、ANE配置率93〜98%)。サーバーは任意の数のembedding/
+> rerankerモデルを同時サービングし、リクエストの`model`フィールドで
+> ルーティングします。`eeane compile`はマシン別のキャリブレーション
+> 実測を成果物キャッシュに記録し、設定の`[[models]]`エントリは
+> `id = "..."`の1行だけで書けるようになりました(残りはキャッシュから
+> 自動解決)。パッケージ配布は後のマイルストーンで実装予定です。
 
 ## 動作要件
 
@@ -44,7 +56,7 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
   が`xcrun coremlcompiler`を使用します
 - [uv](https://docs.astral.sh/uv/) (開発環境用)
 
-## モデルのコンパイルとサーバー起動 (v0.6)
+## モデルのコンパイルとサーバー起動
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git
@@ -56,22 +68,33 @@ uv sync --extra compile   # torch/transformersはコンパイル時のみ必要
 # ~/.cache/eeane/ 配下に生成され、1バケツあたり約30〜100秒です:
 uv run python -m eeane compile cl-nagoya/ruri-v3-310m
 uv run python -m eeane compile cl-nagoya/ruri-v3-reranker-310m
+uv run python -m eeane compile intfloat/multilingual-e5-base
 
 # 各実行の最後に[[models]]のTOMLスニペットが標準出力に表示されます。
-# それを ./eeane.toml に貼り付けて([server]節はeeane.example.toml参照)、
-# サーバーを起動します:
+# v0.7以降のスニペットは最小形(基本はモデルidのみ)です — 残りの情報は
+# サーバーがコンパイル済みキャッシュから自動解決します。スニペットを
+# ./eeane.toml に貼り付けて(eeane.example.toml参照)、サーバーを起動します:
 uv run python -m eeane serve
 ```
 
-`eeane compile`はモデルの`config.json`からバックエンドを自動選択し
-(v0.6はModernBERTアーキテクチャに対応)、embedding/rerankerの種別も
-自動判別します。バケツの既定は埋め込み128/512/1024、reranker 512/1024
-で、`--buckets 512,2048`のように変更できます(S2048はM2実機で約518ms/
-推論を検証済み)。再実行時は最新の成果物をスキップします(`--force`で
-再変換)。変換後には**セルフチェック**が走り、FP32基準の精度検証・
-Neural Engineへの配置率計測・ウォームレイテンシ記録を行います。表示
-されるサマリは互換性レポートを兼ねるので、未検証ハードウェア
-(M1/M3/M4など)で動かした際はぜひIssueに貼ってください。トークナイザは
+`eeane compile`はモデルの`config.json`からバックエンドを自動選択します。
+対応アーキテクチャは2系統: **ModernBERT**(cl-nagoya/ruri-v3-310mと
+同rerankerで検証済み)と**XLM-RoBERTa**(intfloat/multilingual-e5-base・
+intfloat/multilingual-e5-large・BAAI/bge-reranker-v2-m3で検証済み。
+embeddingモデルはモデルディレクトリが宣言するmean/CLSプーリングを自動
+適用)です。対応系統は1.0以降に順次拡充予定です。embedding/rerankerの
+種別も自動判別します。バケツの既定は埋め込み128/512/1024、reranker
+512/1024で、モデルの最大系列長へ自動クリップされます(最大512トークン
+のmultilingual-e5系は128/512になります)。`--buckets 512,2048`のように
+変更もできます(S2048はM2実機で約518ms/推論を検証済み)。再実行時は
+最新の成果物をスキップします(`--force`で再変換)。変換後には
+**セルフチェック**が走り、FP32基準の精度検証・Neural Engineへの配置率
+計測・ウォームレイテンシ記録を行います。表示されるサマリは互換性
+レポートを兼ねるので、未検証ハードウェア(M1/M3/M4など)で動かした際は
+ぜひIssueに貼ってください。バケツ別の実測はキャッシュ内の
+キャリブレーション記録(`model_info.json`)に集約され、セルフチェックに
+失敗したバケツはキャッシュ自動解決の設定がロードする推奨集合から
+除外されます。トークナイザは
 成果物ディレクトリへ凍結され、元のトークナイズとの完全一致が機械検証
 されるため、サーバー実行時には元のモデルファイルもtransformers
 ライブラリも不要です([docs/dependency-policy.md](docs/dependency-policy.md)
@@ -96,12 +119,17 @@ uv run python -m eeane serve --host 192.168.1.20 --port 7997
 uv run python -m eeane check-config --config /path/to/eeane.toml
 ```
 
-設定ファイルはサービングするモデル(凍結済み`tokenizer.json`、シーケンス長
-バケツごとのコンパイル済み成果物、L2正規化)を定義するため — これは
-まさに`eeane compile`のスニペットが埋める内容です — コードに
-触れずにバケツを増減できます。rerankerエントリは省略可能で、その場合は
-embedding専用サーバーになります(`/rerank`は503を返します)。
-`uv run python -m eeane.server`(v0.4の起動法)は`eeane serve`の
+設定ファイルにはサービングするモデルを列挙します — embedding/reranker
+とも複数エントリを書けます。`[[models]]`エントリは通常`id = "..."`だけ
+で足ります: kind・凍結済みトークナイザ・バケツごとの成果物・埋め込み
+次元は、`eeane compile`が書いたキャッシュ(`server.cache_root`、既定
+`~/.cache/eeane/`)から自動解決され、キャリブレーションの推奨バケツが
+ロードされます。`kind`/`tokenizer`/`[models.artifacts]`を明示する
+書き方(v0.7以前の形式)も引き続き有効で、キャッシュと独立にエントリを
+固定できます。各kindの中では設定に最初に書いたエントリが既定モデルに
+なり、`model`未指定のリクエストを処理します。rerankerエントリは省略
+可能で、その場合はembedding専用サーバーになります(`/rerank`は503を
+返します)。`uv run python -m eeane.server`は`eeane serve`の
 エイリアスとして引き続き使えます。
 
 ### localhost外への公開
@@ -120,19 +148,23 @@ LAN/VPNの外へ公開する場合はリバースプロキシやファイアウ�
 
 ### エンドポイント
 
-- `GET /health` — ステータスとサービス中のシーケンス長バケツ
-  (無認証・レート制限あり)
-- `GET /models` (エイリアス: `GET /v1/models`) — OpenAI互換のモデル一覧
+- `GET /health` — ステータスとサービス中モデルの一覧(モデルごとに
+  `id`/`kind`/バケツ。モデル別リスト形式はv0.7から)。無認証・レート制限あり
+- `GET /models` (エイリアス: `GET /v1/models`) — OpenAI互換の全モデル一覧
 - `POST /v1/embeddings` (エイリアス: `POST /embeddings`) — OpenAI互換
   (`input`は文字列またはリスト、`encoding_format`は`float`/`base64`)。
-  埋め込みはL2正規化して返します (Infinity_embと同じ挙動)
+  埋め込みは既定でL2正規化して返します (モデル毎の`normalize`設定)
 - `POST /rerank`, `POST /v1/rerank` — Infinity互換
   (`query`/`documents`/`top_n`/`return_documents`/`raw_scores`)
 
+embeddings/rerankリクエストの`model`フィールド(省略可)は、設定した
+モデルidでサービング対象を選択します。省略時はそのエンドポイントの
+kindの既定モデル(設定順の先頭)が使われます。未知のidは利用可能なid
+一覧付きの404、別kindのモデルidを指定した場合は400になります。
 embeddings/rerankエンドポイントは`/v1`配下とルート直下の両方で提供される
-ため、base URLは`/v1`付き・なしのどちらでも動作します。各入力はトークン数に応じて最小の
-固定長バケツ(デフォルト — 埋め込み: 128/512/1024、reranker: 512/1024)に
-自動ルーティングされ、最大バケツを超える入力は警告ログ付きで切り詰められます。
+ため、base URLは`/v1`付き・なしのどちらでも動作します。各入力はその
+モデルの最小の収まる固定長バケツに自動ルーティングされ、最大バケツを
+超える入力は警告ログ付きで切り詰められます。
 
 [Open WebUI](https://github.com/open-webui/open-webui)から使う場合:
 埋め込みエンジンをOpenAIにしてbase URLを`http://127.0.0.1:7997/v1`、
@@ -145,6 +177,9 @@ reranker APIキー欄にそのキーを入力してください — Open WebUI�
 
 ```sh
 uv run python tools/verify_server.py all
+# 特定のサービング中モデルをCore ML直接推論と突き合わせる場合:
+uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
+uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
 ```
 
 ## PoCを試す (歴史的な開発スナップショット)
