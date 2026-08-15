@@ -26,7 +26,7 @@ log_level = "info"          # debug | info | warning | error
 [[models]]
 id = "ruri-v3-310m"
 kind = "embedding"           # embedding | reranker
-model_dir = "models/ruri-v3-310m"
+tokenizer = "models/compiled/ruri-v3-310m/tokenizer.json"  # Frozen by `eeane compile`.
 normalize = true             # L2-normalize embeddings (Infinity-compatible). Embedding only.
 # output_name = "embedding"  # Core ML output tensor; derived from kind when omitted.
 
@@ -41,7 +41,7 @@ normalize = true             # L2-normalize embeddings (Infinity-compatible). Em
 [[models]]
 id = "ruri-v3-reranker-310m"
 kind = "reranker"
-model_dir = "models/ruri-v3-reranker-310m"
+tokenizer = "models/compiled/ruri-v3-reranker-310m/tokenizer.json"
 
 [models.artifacts]
 512 = "models/compiled/ruri-v3-reranker-310m/s512_b1_eager_macos13.mlmodelc"

@@ -36,7 +36,7 @@ health_rate_limit = 30
 [[models]]
 id = "emb-1"
 kind = "embedding"
-model_dir = "models/emb-1"
+tokenizer = "models/emb-1/tokenizer.json"
 normalize = false
 output_name = "custom_embedding"
 
@@ -47,7 +47,7 @@ output_name = "custom_embedding"
 [[models]]
 id = "rr-1"
 kind = "reranker"
-model_dir = "models/rr-1"
+tokenizer = "models/rr-1/tokenizer.json"
 
 [models.artifacts]
 512 = "compiled/rr-1/s512.mlmodelc"
@@ -57,7 +57,7 @@ _MINIMAL_TOML = """
 [[models]]
 id = "emb-only"
 kind = "embedding"
-model_dir = "models/emb-only"
+tokenizer = "models/emb-only/tokenizer.json"
 
 [models.artifacts]
 256 = "compiled/emb-only/s256.mlmodelc"
@@ -70,7 +70,7 @@ api_key = "file-key"
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb/s128.mlmodelc"
@@ -99,7 +99,7 @@ def test_full_toml_loads_all_fields(tmp_path: Path) -> None:
     assert embedding.normalize is False
     assert embedding.output_name == "custom_embedding"
     assert embedding.buckets == (128, 512)
-    assert embedding.model_dir == tmp_path / "models" / "emb-1"
+    assert embedding.tokenizer == tmp_path / "models" / "emb-1" / "tokenizer.json"
 
     reranker = loaded.config.reranker_model
     assert reranker is not None
@@ -129,7 +129,7 @@ def test_buckets_are_sorted_ascending_regardless_of_toml_order() -> None:
     entry = ModelEntry(
         id="m",
         kind="embedding",
-        model_dir=Path("models/m"),
+        tokenizer=Path("models/m/tokenizer.json"),
         artifacts={1024: Path("a"), 128: Path("b"), 512: Path("c")},
     )
 
@@ -144,7 +144,9 @@ def test_output_name_is_derived_from_kind_when_omitted(
     kind: str, expected_output_name: str
 ) -> None:
     """output_name must be derived from kind whenever it is not explicitly provided."""
-    entry = ModelEntry(id="m", kind=kind, model_dir=Path("m"), artifacts={128: Path("a")})
+    entry = ModelEntry(
+        id="m", kind=kind, tokenizer=Path("m/tokenizer.json"), artifacts={128: Path("a")}
+    )
 
     assert entry.output_name == expected_output_name
 
@@ -159,7 +161,10 @@ def test_embedding_model_accessor_returns_the_single_embedding_entry() -> None:
 def test_reranker_model_accessor_returns_none_when_absent() -> None:
     """reranker_model must return None for an embedding-only configuration."""
     embedding = ModelEntry(
-        id="emb", kind="embedding", model_dir=Path("models/emb"), artifacts={128: Path("a")}
+        id="emb",
+        kind="embedding",
+        tokenizer=Path("models/emb/tokenizer.json"),
+        artifacts={128: Path("a")},
     )
     config = EeaneConfig(models=[embedding])
 
@@ -167,13 +172,13 @@ def test_reranker_model_accessor_returns_none_when_absent() -> None:
 
 
 def test_relative_paths_resolve_against_config_file_directory(tmp_path: Path) -> None:
-    """model_dir/artifacts relative paths must resolve against the config file's directory."""
+    """tokenizer/artifacts relative paths must resolve against the config file's directory."""
     config_path = _write_toml(tmp_path / "eeane.toml", _MINIMAL_TOML)
 
     loaded = load_config(explicit_path=config_path, env={})
 
     embedding = loaded.config.embedding_model
-    assert embedding.model_dir == tmp_path / "models" / "emb-only"
+    assert embedding.tokenizer == tmp_path / "models" / "emb-only" / "tokenizer.json"
     assert embedding.artifacts[256] == tmp_path / "compiled" / "emb-only" / "s256.mlmodelc"
 
 
@@ -187,8 +192,8 @@ def test_relative_config_path_still_yields_absolute_model_paths(
     loaded = load_config(explicit_path=Path("eeane.toml"), env={})
 
     embedding = loaded.config.embedding_model
-    assert embedding.model_dir.is_absolute()
-    assert embedding.model_dir == tmp_path / "models" / "emb-only"
+    assert embedding.tokenizer.is_absolute()
+    assert embedding.tokenizer == tmp_path / "models" / "emb-only" / "tokenizer.json"
     assert embedding.artifacts[256] == tmp_path / "compiled" / "emb-only" / "s256.mlmodelc"
 
 
@@ -199,7 +204,7 @@ def test_absolute_artifact_paths_pass_through_unresolved(tmp_path: Path) -> None
 [[models]]
 id = "emb-only"
 kind = "embedding"
-model_dir = "models/emb-only"
+tokenizer = "models/emb-only/tokenizer.json"
 
 [models.artifacts]
 256 = "{absolute_artifact.as_posix()}"
@@ -222,7 +227,7 @@ bogus_top_level = true
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb/s128.mlmodelc"
@@ -242,7 +247,7 @@ bogus_server_key = true
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb/s128.mlmodelc"
@@ -253,13 +258,46 @@ model_dir = "models/emb"
         load_config(explicit_path=config_path, env={})
 
 
+def test_legacy_model_dir_key_raises_config_error(tmp_path: Path) -> None:
+    """The pre-v0.6 'model_dir' key must be rejected (replaced by 'tokenizer')."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+model_dir = "models/emb"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="model_dir"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_missing_tokenizer_key_raises_config_error(tmp_path: Path) -> None:
+    """A [[models]] entry without 'tokenizer' must be rejected (it is required)."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="tokenizer"):
+        load_config(explicit_path=config_path, env={})
+
+
 def test_unknown_model_key_raises_config_error(tmp_path: Path) -> None:
     """An unrecognized key in a [[models]] entry must be rejected with the key name."""
     toml_content = """
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 bogus_model_key = true
 
 [models.artifacts]
@@ -332,7 +370,7 @@ def test_zero_embedding_entries_raises_config_error(tmp_path: Path) -> None:
 [[models]]
 id = "rr"
 kind = "reranker"
-model_dir = "models/rr"
+tokenizer = "models/rr/tokenizer.json"
 
 [models.artifacts]
 512 = "compiled/rr/s512.mlmodelc"
@@ -349,7 +387,7 @@ def test_two_embedding_entries_raises_config_error_mentioning_v07(tmp_path: Path
 [[models]]
 id = "emb1"
 kind = "embedding"
-model_dir = "models/emb1"
+tokenizer = "models/emb1/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb1/s128.mlmodelc"
@@ -357,7 +395,7 @@ model_dir = "models/emb1"
 [[models]]
 id = "emb2"
 kind = "embedding"
-model_dir = "models/emb2"
+tokenizer = "models/emb2/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb2/s128.mlmodelc"
@@ -374,7 +412,7 @@ def test_two_reranker_entries_raises_config_error_mentioning_v07(tmp_path: Path)
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb/s128.mlmodelc"
@@ -382,7 +420,7 @@ model_dir = "models/emb"
 [[models]]
 id = "rr1"
 kind = "reranker"
-model_dir = "models/rr1"
+tokenizer = "models/rr1/tokenizer.json"
 
 [models.artifacts]
 512 = "compiled/rr1/s512.mlmodelc"
@@ -390,7 +428,7 @@ model_dir = "models/rr1"
 [[models]]
 id = "rr2"
 kind = "reranker"
-model_dir = "models/rr2"
+tokenizer = "models/rr2/tokenizer.json"
 
 [models.artifacts]
 512 = "compiled/rr2/s512.mlmodelc"
@@ -407,7 +445,7 @@ def test_duplicate_model_id_raises_config_error(tmp_path: Path) -> None:
 [[models]]
 id = "same-id"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb/s128.mlmodelc"
@@ -415,7 +453,7 @@ model_dir = "models/emb"
 [[models]]
 id = "same-id"
 kind = "reranker"
-model_dir = "models/rr"
+tokenizer = "models/rr/tokenizer.json"
 
 [models.artifacts]
 512 = "compiled/rr/s512.mlmodelc"
@@ -435,7 +473,7 @@ def test_empty_artifacts_raises_config_error(tmp_path: Path) -> None:
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 artifacts = {}
 """
     config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
@@ -450,7 +488,7 @@ def test_non_numeric_artifact_key_raises_config_error(tmp_path: Path) -> None:
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 abc = "compiled/emb/sabc.mlmodelc"
@@ -467,7 +505,7 @@ def test_non_positive_artifact_key_raises_config_error(tmp_path: Path) -> None:
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 "0" = "compiled/emb/s0.mlmodelc"
@@ -487,7 +525,7 @@ def test_reranker_with_explicit_normalize_raises_config_error(tmp_path: Path) ->
 [[models]]
 id = "emb"
 kind = "embedding"
-model_dir = "models/emb"
+tokenizer = "models/emb/tokenizer.json"
 
 [models.artifacts]
 128 = "compiled/emb/s128.mlmodelc"
@@ -495,7 +533,7 @@ model_dir = "models/emb"
 [[models]]
 id = "rr"
 kind = "reranker"
-model_dir = "models/rr"
+tokenizer = "models/rr/tokenizer.json"
 normalize = true
 
 [models.artifacts]
@@ -672,9 +710,12 @@ def test_no_config_file_anywhere_uses_built_in_default(
 # --- default_config() vs the v0.4 hard-coded values ----------------------
 
 # Literal copies of the constants the v0.4 hard-coded settings module
-# held (it is deleted in v0.5). The repository root is derived from this
-# test file, independently of eeane.config, so the comparison below still
-# checks the values instead of restating them.
+# held (it is deleted in v0.5), except for the tokenizer paths, which
+# v0.6 moved from the HuggingFace model directory to the frozen
+# tokenizer.json under models/compiled/ (v0.6実装計画.md §4.6). The
+# repository root is derived from this test file, independently of
+# eeane.config, so the comparison below still checks the values instead
+# of restating them.
 _V04_REPO_ROOT = Path(__file__).resolve().parent.parent
 _V04_COMPILED_ROOT = _V04_REPO_ROOT / "models" / "compiled"
 _V04_EMBEDDING_COMPILED = {
@@ -697,7 +738,7 @@ def test_default_config_matches_v04_settings_values() -> None:
 
     embedding = config.embedding_model
     assert embedding.id == "ruri-v3-310m"
-    assert embedding.model_dir == _V04_REPO_ROOT / "models" / "ruri-v3-310m"
+    assert embedding.tokenizer == _V04_COMPILED_ROOT / "ruri-v3-310m" / "tokenizer.json"
     assert embedding.artifacts == _V04_EMBEDDING_COMPILED
     assert embedding.buckets == tuple(sorted(_V04_EMBEDDING_COMPILED))
     assert embedding.normalize is True
@@ -706,7 +747,7 @@ def test_default_config_matches_v04_settings_values() -> None:
     reranker = config.reranker_model
     assert reranker is not None
     assert reranker.id == "ruri-v3-reranker-310m"
-    assert reranker.model_dir == _V04_REPO_ROOT / "models" / "ruri-v3-reranker-310m"
+    assert reranker.tokenizer == _V04_COMPILED_ROOT / "ruri-v3-reranker-310m" / "tokenizer.json"
     assert reranker.artifacts == _V04_RERANKER_COMPILED
     assert reranker.buckets == tuple(sorted(_V04_RERANKER_COMPILED))
     assert reranker.output_name == "logits"

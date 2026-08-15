@@ -2,8 +2,8 @@
 
 These check the wiring (HTTP -> engine -> ANE -> HTTP) on the actual
 compiled models; the heavy accuracy work belongs to tools/verify_server.py.
-The whole module is skipped when the artifacts or the HuggingFace model
-directories are absent, so CI-like environments stay green.
+The whole module is skipped when the compiled artifacts or the frozen
+tokenizer files are absent, so CI-like environments stay green.
 """
 
 from __future__ import annotations
@@ -24,14 +24,14 @@ _RERANKER = _CONFIG.reranker_model
 assert _RERANKER is not None, "the built-in default configuration always has a reranker"
 
 _REQUIRED_PATHS = [
-    _EMBEDDING.model_dir,
-    _RERANKER.model_dir,
+    _EMBEDDING.tokenizer,
+    _RERANKER.tokenizer,
     *_EMBEDDING.artifacts.values(),
     *_RERANKER.artifacts.values(),
 ]
 if not all(path.exists() for path in _REQUIRED_PATHS):
     pytest.skip(
-        "Core ML artifacts or HuggingFace model directories are missing",
+        "Core ML artifacts or frozen tokenizer files are missing",
         allow_module_level=True,
     )
 

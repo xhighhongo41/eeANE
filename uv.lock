@@ -173,40 +173,51 @@ wheels = [
 
 [[package]]
 name = "eeane"
-version = "0.5.0.dev0"
+version = "0.6.0.dev0"
 source = { virtual = "." }
-
-[package.dev-dependencies]
-dev = [
+dependencies = [
     { name = "coremltools" },
     { name = "fastapi" },
-    { name = "httpx2" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "sentence-transformers" },
-    { name = "sentencepiece" },
-    { name = "torch" },
-    { name = "transformers" },
+    { name = "tokenizers" },
     { name = "uvicorn" },
 ]
 
+[package.optional-dependencies]
+compile = [
+    { name = "sentencepiece" },
+    { name = "torch" },
+    { name = "transformers" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "httpx2" },
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "sentence-transformers" },
+]
+
 [package.metadata]
+requires-dist = [
+    { name = "coremltools", specifier = ">=9.0,<10" },
+    { name = "fastapi", specifier = ">=0.141,<1" },
+    { name = "numpy", specifier = ">=1.26,<3" },
+    { name = "sentencepiece", marker = "extra == 'compile'", specifier = ">=0.2" },
+    { name = "tokenizers", specifier = ">=0.22,<0.24" },
+    { name = "torch", marker = "extra == 'compile'", specifier = ">=2.7,<2.8" },
+    { name = "transformers", marker = "extra == 'compile'", specifier = ">=4.57,<4.58" },
+    { name = "uvicorn", specifier = ">=0.52,<1" },
+]
+provides-extras = ["compile"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "coremltools", specifier = ">=9.0,<9.1" },
-    { name = "fastapi", specifier = ">=0.141,<1" },
     { name = "httpx2", specifier = ">=2,<3" },
-    { name = "numpy", specifier = ">=1.26,<3" },
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "sentence-transformers", specifier = ">=5.0,<6" },
-    { name = "sentencepiece", specifier = ">=0.2" },
-    { name = "torch", specifier = ">=2.7,<2.8" },
-    { name = "transformers", specifier = ">=4.57,<4.58" },
-    { name = "uvicorn", specifier = ">=0.52,<1" },
 ]
 
 [[package]]

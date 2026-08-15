@@ -8,7 +8,7 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 コンパイル済みモデルは数秒でロードでき、ANE上で推論するため、GPUと
 ユニファイドメモリの大部分を他の作業のために空けておけます。
 
-> **開発状況: 初期開発中 (v0.5)。**
+> **開発状況: 初期開発中 (v0.6)。**
 > v0.1〜v0.3で概念実証を完了:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (日本語ModernBERT埋め込みモデル)と
@@ -24,34 +24,58 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 > TOML設定ファイル+`eeane serve` / `eeane check-config` CLI(bind
 > アドレス・ポート・モデルとバケツ構成・ログレベル)、localhost外へ
 > 公開するための任意のBearer APIキー認証、OpenAI互換`GET /models`、
-> `/health`のレート制限を追加。パッケージ配布と`eeane compile`は後の
+> `/health`のレート制限を追加。**v0.6でモデル変換が製品機能になりました**:
+> `eeane compile <model>`はローカルディレクトリまたはHugging FaceのモデルID
+> (自動ダウンロード)を受け取り、バケツごとの`.mlmodelc`成果物を
+> `~/.cache/eeane/`配下に生成します。トークナイザは成果物ディレクトリへ
+> 「凍結」され(元のトークナイズとトークン単位で一致することを機械検証)、
+> 変換後にはセルフチェック(FP32基準の精度・ANE配置率・ウォームレイテンシ)
+> が走り、そのレポートはハードウェア互換性レポートを兼ねます。最後に
+> 設定ファイルへそのまま貼れるスニペットを出力します。サーバー本体は
+> torch/transformersに依存しなくなり、重量級の依存はオプションの
+> `[compile]`エクストラへ分離されました。パッケージ配布は後の
 > マイルストーンで実装予定です。
 
 ## 動作要件
 
 - Apple Siliconマック (M1以降)
 - macOS 13以降
+- Xcodeコマンドラインツール (`xcode-select --install`) — `eeane compile`
+  が`xcrun coremlcompiler`を使用します
 - [uv](https://docs.astral.sh/uv/) (開発環境用)
 
-## サーバーを起動する (v0.5)
+## モデルのコンパイルとサーバー起動 (v0.6)
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git
 cd eeANE
-uv sync
+uv sync --extra compile   # torch/transformersはコンパイル時のみ必要
 
-# HF配布形式のモデルを models/ruri-v3-310m と models/ruri-v3-reranker-310m に
-# 配置してから (例: `huggingface-cli download cl-nagoya/ruri-v3-310m` で取得)、
-# サーバーがロードするCore ML成果物をコンパイルします (初回のみ、各約30秒):
-uv run python poc/convert_embedding.py --seq-len 128
-uv run python poc/convert_embedding.py --seq-len 512
-uv run python poc/convert_embedding.py --seq-len 1024
-uv run python poc/convert_reranker.py --seq-len 512
-uv run python poc/convert_reranker.py --seq-len 1024
+# Hugging FaceのモデルID(自動ダウンロード)またはHF配布形式のローカル
+# ディレクトリから直接コンパイルします。初回のみ。成果物は
+# ~/.cache/eeane/ 配下に生成され、1バケツあたり約30〜100秒です:
+uv run python -m eeane compile cl-nagoya/ruri-v3-310m
+uv run python -m eeane compile cl-nagoya/ruri-v3-reranker-310m
 
-# サーバー起動 (デフォルト: 127.0.0.1:7997、上記2モデル)
+# 各実行の最後に[[models]]のTOMLスニペットが標準出力に表示されます。
+# それを ./eeane.toml に貼り付けて([server]節はeeane.example.toml参照)、
+# サーバーを起動します:
 uv run python -m eeane serve
 ```
+
+`eeane compile`はモデルの`config.json`からバックエンドを自動選択し
+(v0.6はModernBERTアーキテクチャに対応)、embedding/rerankerの種別も
+自動判別します。バケツの既定は埋め込み128/512/1024、reranker 512/1024
+で、`--buckets 512,2048`のように変更できます(S2048はM2実機で約518ms/
+推論を検証済み)。再実行時は最新の成果物をスキップします(`--force`で
+再変換)。変換後には**セルフチェック**が走り、FP32基準の精度検証・
+Neural Engineへの配置率計測・ウォームレイテンシ記録を行います。表示
+されるサマリは互換性レポートを兼ねるので、未検証ハードウェア
+(M1/M3/M4など)で動かした際はぜひIssueに貼ってください。トークナイザは
+成果物ディレクトリへ凍結され、元のトークナイズとの完全一致が機械検証
+されるため、サーバー実行時には元のモデルファイルもtransformers
+ライブラリも不要です([docs/dependency-policy.md](docs/dependency-policy.md)
+参照)。
 
 ### 設定
 
@@ -72,8 +96,9 @@ uv run python -m eeane serve --host 192.168.1.20 --port 7997
 uv run python -m eeane check-config --config /path/to/eeane.toml
 ```
 
-設定ファイルはサービングするモデル(HFモデルディレクトリ、シーケンス長
-バケツごとのコンパイル済み成果物、L2正規化)を定義するため、コードに
+設定ファイルはサービングするモデル(凍結済み`tokenizer.json`、シーケンス長
+バケツごとのコンパイル済み成果物、L2正規化)を定義するため — これは
+まさに`eeane compile`のスニペットが埋める内容です — コードに
 触れずにバケツを増減できます。rerankerエントリは省略可能で、その場合は
 embedding専用サーバーになります(`/rerank`は503を返します)。
 `uv run python -m eeane.server`(v0.4の起動法)は`eeane serve`の
@@ -122,7 +147,11 @@ reranker APIキー欄にそのキーを入力してください — Open WebUI�
 uv run python tools/verify_server.py all
 ```
 
-## PoCを試す (開発スナップショット)
+## PoCを試す (歴史的な開発スナップショット)
+
+`poc/`のスクリプトはv0.1〜v0.3の研究記録として凍結されています。
+公式の変換手段は上記の`eeane compile`です。ベンチマーク用途では
+引き続き実行できます:
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git

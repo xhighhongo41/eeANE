@@ -15,7 +15,7 @@ _KEYLESS_TOML = """
 [[models]]
 id = "emb-only"
 kind = "embedding"
-model_dir = "models/emb-only"
+tokenizer = "models/emb-only/tokenizer.json"
 
 [models.artifacts]
 256 = "compiled/emb-only/s256.mlmodelc"
@@ -28,7 +28,7 @@ api_key = "top-secret-key"
 [[models]]
 id = "emb-only"
 kind = "embedding"
-model_dir = "models/emb-only"
+tokenizer = "models/emb-only/tokenizer.json"
 
 [models.artifacts]
 256 = "compiled/emb-only/s256.mlmodelc"

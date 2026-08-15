@@ -8,7 +8,7 @@ Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **Status: early development (v0.5).**
+> **Status: early development (v0.6).**
 > v0.1–v0.3 proved the concept:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (a Japanese ModernBERT embedding model) and
@@ -28,36 +28,60 @@ and most of your unified memory free for other work.
 > `eeane serve` / `eeane check-config` CLI (bind address, port,
 > models and their buckets, log level), optional Bearer API key
 > authentication for serving beyond localhost, an OpenAI-compatible
-> `GET /models` listing, and rate limiting on `/health`. Packaged
-> one-command installs and `eeane compile` arrive in later
-> milestones.
+> `GET /models` listing, and rate limiting on `/health`. **v0.6 turns
+> model conversion into a product**: `eeane compile <model>` takes a
+> local directory or a Hugging Face model ID (auto-downloaded),
+> converts it into per-bucket `.mlmodelc` artifacts under
+> `~/.cache/eeane/`, freezes the tokenizer alongside them (verified
+> token-for-token against the original), runs a self-check (accuracy
+> vs. FP32, ANE placement, warm latency) whose report doubles as a
+> hardware compatibility report, and prints a ready-to-paste config
+> snippet. The server itself no longer needs torch or transformers —
+> heavyweight dependencies moved to the optional `[compile]` extra.
+> Packaged one-command installs arrive in later milestones.
 
 ## Requirements
 
 - Apple Silicon Mac (M1 or later)
 - macOS 13 or later
+- Xcode Command Line Tools (`xcode-select --install`) — `eeane compile`
+  uses `xcrun coremlcompiler`
 - [uv](https://docs.astral.sh/uv/) (for the development environment)
 
-## Running the server (v0.5)
+## Compiling models and running the server (v0.6)
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git
 cd eeANE
-uv sync
+uv sync --extra compile   # torch/transformers are needed only for compiling
 
-# Place the models in HF distribution form under models/ruri-v3-310m and
-# models/ruri-v3-reranker-310m (e.g. download with
-# `huggingface-cli download cl-nagoya/ruri-v3-310m`), then compile the
-# Core ML artifacts the server loads (one-time, ~30 s each):
-uv run python poc/convert_embedding.py --seq-len 128
-uv run python poc/convert_embedding.py --seq-len 512
-uv run python poc/convert_embedding.py --seq-len 1024
-uv run python poc/convert_reranker.py --seq-len 512
-uv run python poc/convert_reranker.py --seq-len 1024
+# Compile a model straight from its Hugging Face ID (auto-downloaded)
+# or from a local directory in HF distribution form. One-time; the
+# artifacts land under ~/.cache/eeane/ and each bucket takes ~30-100 s:
+uv run python -m eeane compile cl-nagoya/ruri-v3-310m
+uv run python -m eeane compile cl-nagoya/ruri-v3-reranker-310m
 
-# Start the server (defaults: 127.0.0.1:7997, the two models above)
+# Each run ends with a ready-made [[models]] TOML snippet on stdout --
+# paste the snippets into ./eeane.toml (see eeane.example.toml for the
+# [server] section), then start the server:
 uv run python -m eeane serve
 ```
+
+`eeane compile` picks the model backend from the model's `config.json`
+(v0.6 supports the ModernBERT architecture), detects whether it is an
+embedding model or a reranker, and defaults to buckets 128/512/1024
+(embedding) or 512/1024 (reranker); `--buckets 512,2048` compiles a
+custom set (S2048 is verified on M2 at ~518 ms/inference). Re-running
+skips up-to-date artifacts (`--force` reconverts). After every
+conversion a **self-check** verifies accuracy against the FP32 original,
+measures how many operations landed on the Neural Engine, and records
+warm latency — the printed summary doubles as a compatibility report:
+if you run eeANE on hardware we have not verified (M1/M3/M4...), please
+paste it into an issue. The tokenizer is frozen into the artifact
+directory and verified to reproduce the original tokenization exactly,
+so the server needs neither the original model files nor the
+transformers library at run time (see
+[docs/dependency-policy.md](docs/dependency-policy.md)).
 
 ### Configuration
 
@@ -78,8 +102,9 @@ uv run python -m eeane serve --host 192.168.1.20 --port 7997
 uv run python -m eeane check-config --config /path/to/eeane.toml
 ```
 
-The config file defines the served models (HF model directory, compiled
-artifact per sequence-length bucket, L2 normalization), so buckets can
+The config file defines the served models (frozen `tokenizer.json`,
+compiled artifact per sequence-length bucket, L2 normalization) — which
+is exactly what the `eeane compile` snippet fills in — so buckets can
 be added or removed without touching code. The reranker entry may be
 omitted for an embedding-only server (`/rerank` then answers 503).
 `uv run python -m eeane.server` (the v0.4 entry point) remains as an
@@ -130,7 +155,11 @@ inference, API compatibility, latency):
 uv run python tools/verify_server.py all
 ```
 
-## Trying the PoC (development snapshot)
+## Trying the PoC (historical development snapshot)
+
+The `poc/` scripts are the frozen v0.1–v0.3 research record; the
+supported conversion path is `eeane compile` above. They remain runnable
+for benchmarking studies:
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git
