@@ -405,7 +405,7 @@ def _print_effective_config(loaded: LoadedConfig) -> None:
     for entry in config.models:
         print(f"  - id: {entry.id}")
         print(f"    kind: {entry.kind}")
-        print(f"    model_dir: {entry.model_dir}")
+        print(f"    tokenizer: {entry.tokenizer}")
         print(f"    buckets: {', '.join(str(bucket) for bucket in entry.buckets)}")
         if entry.kind == "embedding":
             print(f"    normalize: {entry.normalize}")

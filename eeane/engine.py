@@ -20,7 +20,6 @@ from typing import Any, Protocol
 
 import coremltools as ct
 import numpy as np
-from transformers import AutoTokenizer
 
 from eeane import runtime
 from eeane.config import EeaneConfig
@@ -29,12 +28,10 @@ from eeane.config import EeaneConfig
 # empty request; non-empty results take their width from the model output.
 EMBEDDING_DIM = 768
 
-# Conversion commands quoted in the "missing artifact" error, so the
-# operator can regenerate a missing .mlmodelc without reading the docs.
-_CONVERT_COMMAND = {
-    "embedding": "uv run python poc/convert_embedding.py --seq-len {seq_len} --batch 1",
-    "reranker": "uv run python poc/convert_reranker.py --seq-len {seq_len} --batch 1",
-}
+# Conversion command quoted in the "missing artifact" errors, so the
+# operator can regenerate what is missing without reading the docs
+# (v0.6実装計画.md §4.1: `eeane compile` replaced the poc scripts).
+_COMPILE_COMMAND = "eeane compile <model> --buckets {buckets}"
 
 
 @dataclass
@@ -141,13 +138,14 @@ def _as_row(output: Any, name: str) -> np.ndarray:
     return row
 
 
-def _collect_missing(kind: str, model_dir: Path, compiled: dict[int, Path]) -> list[str]:
+def _collect_missing(kind: str, tokenizer_path: Path, compiled: dict[int, Path]) -> list[str]:
     """Describe the missing artifacts of one model kind.
 
     Args:
-        kind: Either ``"embedding"`` or ``"reranker"`` (selects the
-            conversion command quoted in the message).
-        model_dir: HuggingFace-format directory the tokenizer loads from.
+        kind: Either ``"embedding"`` or ``"reranker"`` (used in the
+            message only).
+        tokenizer_path: Frozen ``tokenizer.json`` the model is served
+            with.
         compiled: Mapping from sequence-length bucket to ``.mlmodelc``
             path.
 
@@ -155,15 +153,18 @@ def _collect_missing(kind: str, model_dir: Path, compiled: dict[int, Path]) -> l
         One human-readable line per missing path (empty if all exist).
     """
     problems: list[str] = []
-    if not model_dir.is_dir():
+    if not tokenizer_path.is_file():
+        # Quote every bucket: the tokenizer is written by the same
+        # `eeane compile` run that produces the artifacts.
+        all_buckets = ",".join(str(bucket) for bucket in sorted(compiled))
+        command = _COMPILE_COMMAND.format(buckets=all_buckets)
         problems.append(
-            f"missing {kind} model directory {model_dir}; place the HuggingFace-format "
-            f"model there (see README, 'Place the models in HF distribution form')"
+            f"missing {kind} tokenizer file {tokenizer_path}; generate it with: {command}"
         )
     # Sorted so the reported order is deterministic across runs.
     for seq_len, path in sorted(compiled.items()):
         if not path.exists():
-            command = _CONVERT_COMMAND[kind].format(seq_len=seq_len)
+            command = _COMPILE_COMMAND.format(buckets=seq_len)
             problems.append(f"missing Core ML artifact {path}; generate it with: {command}")
     return problems
 
@@ -193,10 +194,10 @@ class CoreMLEngine:
     def __init__(
         self,
         *,
-        embedding_model_dir: Path,
+        embedding_tokenizer: Path,
         embedding_compiled: dict[int, Path],
         embedding_output_name: str,
-        reranker_model_dir: Path | None = None,
+        reranker_tokenizer: Path | None = None,
         reranker_compiled: dict[int, Path] | None = None,
         reranker_output_name: str | None = None,
     ) -> None:
@@ -208,15 +209,14 @@ class CoreMLEngine:
         raises (the HTTP layer answers 503 before reaching it).
 
         Args:
-            embedding_model_dir: HuggingFace-format embedding model
-                directory (tokenizer source).
+            embedding_tokenizer: Frozen ``tokenizer.json`` of the
+                embedding model.
             embedding_compiled: Bucket -> ``.mlmodelc`` path for the
                 embedding model.
             embedding_output_name: Output tensor name chosen when the
                 embedding model was converted.
-            reranker_model_dir: HuggingFace-format reranker model
-                directory (tokenizer source), or ``None`` when no reranker
-                is configured.
+            reranker_tokenizer: Frozen ``tokenizer.json`` of the reranker
+                model, or ``None`` when no reranker is configured.
             reranker_compiled: Bucket -> ``.mlmodelc`` path for the
                 reranker model, or ``None`` when no reranker is
                 configured.
@@ -226,8 +226,9 @@ class CoreMLEngine:
 
         Raises:
             ValueError: If the ``reranker_*`` arguments are only partially
-                given, or map no bucket at all.
-            RuntimeError: If any model directory or compiled artifact is
+                given, map no bucket at all, or a frozen tokenizer file
+                carries no padding section.
+            RuntimeError: If any tokenizer file or compiled artifact is
                 missing. The message lists every problem and the command
                 that produces each missing artifact.
         """
@@ -235,22 +236,22 @@ class CoreMLEngine:
         # they are only meaningful all together.
         provided = [
             part is not None
-            for part in (reranker_model_dir, reranker_compiled, reranker_output_name)
+            for part in (reranker_tokenizer, reranker_compiled, reranker_output_name)
         ]
         if any(provided) and not all(provided):
             raise ValueError(
-                "incomplete reranker configuration: pass reranker_model_dir, "
+                "incomplete reranker configuration: pass reranker_tokenizer, "
                 "reranker_compiled and reranker_output_name together, or none of them"
             )
         self._has_reranker = all(provided)
         if self._has_reranker and not reranker_compiled:
             raise ValueError("reranker_compiled must map at least one bucket to an artifact")
 
-        problems = _collect_missing("embedding", embedding_model_dir, embedding_compiled)
+        problems = _collect_missing("embedding", embedding_tokenizer, embedding_compiled)
         # The reranker is only checked when it is configured (the "all or
         # none" rule above makes both values non-None together).
-        if reranker_model_dir is not None and reranker_compiled is not None:
-            problems += _collect_missing("reranker", reranker_model_dir, reranker_compiled)
+        if reranker_tokenizer is not None and reranker_compiled is not None:
+            problems += _collect_missing("reranker", reranker_tokenizer, reranker_compiled)
         if problems:
             raise RuntimeError(
                 "eeANE cannot start, the following model artifacts are missing:\n  - "
@@ -264,14 +265,16 @@ class CoreMLEngine:
         self._embedding_output_name = embedding_output_name
         self._reranker_output_name = reranker_output_name
 
-        self._embedding_tokenizer = AutoTokenizer.from_pretrained(embedding_model_dir)
+        self._embedding_tokenizer = runtime.load_frozen_tokenizer(embedding_tokenizer)
         self._embedding_models = {
             seq_len: _load_compiled(path) for seq_len, path in sorted(embedding_compiled.items())
         }
         # Skip the reranker tokenizer/model load entirely when the server
         # is configured as embedding-only.
         self._reranker_tokenizer = (
-            AutoTokenizer.from_pretrained(reranker_model_dir) if self._has_reranker else None
+            runtime.load_frozen_tokenizer(reranker_tokenizer)
+            if reranker_tokenizer is not None and self._has_reranker
+            else None
         )
         self._reranker_models = (
             {seq_len: _load_compiled(path) for seq_len, path in sorted(reranker_compiled.items())}
@@ -281,11 +284,12 @@ class CoreMLEngine:
         # One lock for both models: the ANE serializes predictions anyway
         # and switching between the two models costs nothing (v0.3 TB).
         self._lock = threading.Lock()
-        # HuggingFace fast tokenizers are NOT thread-safe: every call
-        # mutates the Rust tokenizer's padding/truncation state, so two
-        # endpoint threads encoding at once raise "RuntimeError: Already
-        # borrowed". Encoding is sub-millisecond, so guarding it with its
-        # own lock costs nothing and keeps it off the predict lock.
+        # Fast tokenizers are NOT thread-safe: eeane.runtime sets the
+        # per-bucket padding/truncation state on the Rust tokenizer before
+        # every encode, so two endpoint threads encoding at once raise
+        # "RuntimeError: Already borrowed". Encoding is sub-millisecond,
+        # so guarding it with its own lock costs nothing and keeps it off
+        # the predict lock.
         self._tokenizer_lock = threading.Lock()
 
     @classmethod
@@ -306,10 +310,10 @@ class CoreMLEngine:
         # output_name is always derived during config validation; the
         # fallbacks only guard against a hand-built ModelEntry.
         return cls(
-            embedding_model_dir=embedding.model_dir,
+            embedding_tokenizer=embedding.tokenizer,
             embedding_compiled=dict(embedding.artifacts),
             embedding_output_name=embedding.output_name or "embedding",
-            reranker_model_dir=None if reranker is None else reranker.model_dir,
+            reranker_tokenizer=None if reranker is None else reranker.tokenizer,
             reranker_compiled=None if reranker is None else dict(reranker.artifacts),
             reranker_output_name=None if reranker is None else (reranker.output_name or "logits"),
         )

@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
+import ast
 from pathlib import Path
 
 import pytest
@@ -161,49 +160,104 @@ def test_compile_cli_stub_exits_2_with_not_implemented_message(
 
 # --- runtime/torch import isolation ------------------------------------
 
-
-@pytest.mark.xfail(
-    reason=(
-        "Not yet satisfiable within T2's scope: eeane/runtime.py:15 and "
-        "eeane/engine.py:23 still do `from transformers import ...` "
-        "(pre-existing v0.5 code; T2 must not change runtime/engine "
-        "behaviour per its brief), and plain `import transformers` alone "
-        "already imports torch as a side effect (verified: `python -c "
-        "'import transformers; import sys; print(\"torch\" in sys.modules)'` "
-        "-> True). Separately, `import coremltools` (a genuine runtime "
-        "dependency) *also* try-imports torch and transformers itself, at "
-        "coremltools/_deps/__init__.py -- to probe optional converter "
-        "frontends -- independent of anything eeANE does. So this "
-        "assertion cannot pass until T6 removes the direct transformers "
-        "imports from runtime.py/engine.py (開発資料/v0.6実装計画.md §4.6, "
-        "§5 T6), and even then coremltools's own probing means a strict "
-        "'torch not in sys.modules' check is not a meaningful CI-safe "
-        "signal for R5; see this task's final report for the recommended "
-        "follow-up (an AST-based direct-import check, plus T7's real "
-        "clean-venv `eeane serve` smoke test)."
-    ),
-    strict=True,
+# Modules that must stay importable with the runtime dependency set only
+# (no [compile] extra): everything `eeane serve` / `eeane check-config`
+# loads. eeane.compiler is deliberately absent -- it is only imported
+# from inside eeane.cli._cmd_compile.
+_RUNTIME_MODULE_FILES = (
+    "__init__.py",
+    "__main__.py",
+    "cli.py",
+    "config.py",
+    "engine.py",
+    "runtime.py",
+    "schemas.py",
+    "server.py",
 )
-def test_runtime_modules_do_not_import_torch() -> None:
-    """Importing every runtime-path module must never pull torch into sys.modules.
 
-    Run in a subprocess: within the pytest process itself other tests
-    (or ``eeane.compiler``'s own dependencies) may already have imported
-    torch, which would make an in-process ``sys.modules`` check
-    meaningless (開発資料/v0.6実装計画.md §4.7 担保テスト).
+# Top-level packages that only the [compile] extra provides.
+_COMPILE_ONLY_PACKAGES = ("torch", "transformers")
+
+
+def _is_compile_only(module_name: str) -> bool:
+    """Tell whether an imported module name comes from the [compile] extra.
+
+    Args:
+        module_name: Dotted module name as written in the import
+            statement.
+
+    Returns:
+        ``True`` for a [compile]-only package or any of its submodules.
     """
-    script = (
-        "import eeane.config, eeane.schemas, eeane.runtime, eeane.engine, "
-        "eeane.server, eeane.cli\n"
-        "import sys\n"
-        "assert 'torch' not in sys.modules, sorted(sys.modules)\n"
+    return any(
+        module_name == package or module_name.startswith(f"{package}.")
+        for package in _COMPILE_ONLY_PACKAGES
     )
 
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=60,
+
+def _compile_only_imports(source: str, filename: str) -> list[str]:
+    """Find [compile]-only imports anywhere in a module's source.
+
+    Uses ``ast.walk``, so imports nested inside functions/methods (the
+    usual way an unwanted dependency sneaks back in) are reported too.
+    Relative imports (``level > 0``) are skipped: they can only refer to
+    ``eeane`` itself.
+
+    Args:
+        source: Python source code.
+        filename: Name used in the returned messages.
+
+    Returns:
+        One ``"<filename>:<line>: <module>"`` string per offending
+        import.
+    """
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(source, filename=filename)):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module] if node.level == 0 and node.module else []
+        else:
+            continue
+        offenders += [
+            f"{filename}:{node.lineno}: {name}" for name in names if _is_compile_only(name)
+        ]
+    return offenders
+
+
+def test_runtime_modules_do_not_import_torch_or_transformers() -> None:
+    """No runtime-path module may import torch/transformers, at module or function level.
+
+    Checked with ``ast`` rather than by inspecting ``sys.modules`` after
+    an import: ``coremltools`` (a genuine runtime dependency) try-imports
+    torch and transformers itself, in ``coremltools/_deps/__init__.py``,
+    to probe its optional converter frontends. A ``sys.modules`` check
+    therefore can never pass, no matter what eeANE does, while what R5
+    actually requires is that *eeANE's own* runtime code never reaches
+    for the [compile] extra (開発資料/v0.6実装計画.md §4.7 担保テスト).
+    """
+    package_dir = Path(cli.__file__).resolve().parent
+
+    offenders: list[str] = []
+    for filename in _RUNTIME_MODULE_FILES:
+        path = package_dir / filename
+        assert path.is_file(), f"runtime module {path} is missing (renamed?)"
+        offenders += _compile_only_imports(path.read_text(encoding="utf-8"), filename)
+
+    assert offenders == []
+
+
+def test_compile_only_import_detector_flags_module_and_function_level_imports() -> None:
+    """The detector itself must catch both import forms, including inside a function."""
+    source = (
+        "import numpy\n"
+        "from transformers import AutoTokenizer\n"
+        "from . import runtime\n"
+        "def load():\n"
+        "    import torch.nn\n"
+        "    return torch.nn, AutoTokenizer, numpy, runtime\n"
     )
 
-    assert result.returncode == 0, result.stderr
+    offenders = _compile_only_imports(source, "fake.py")
+
+    assert offenders == ["fake.py:2: transformers", "fake.py:5: torch.nn"]

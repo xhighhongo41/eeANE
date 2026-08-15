@@ -1,8 +1,9 @@
 """Configuration schema, TOML loader, and built-in defaults for eeANE.
 
-Replaces the hard-coded ``eeane.settings`` constants (v0.4) with a TOML
-config file plus CLI/environment overrides, validated via pydantic v2. See
-開発資料/v0.5実装計画.md §4.1-§4.2 for the authoritative design.
+A TOML config file plus CLI/environment overrides, validated via pydantic
+v2. See 開発資料/v0.5実装計画.md §4.1-§4.2 for the authoritative design,
+and 開発資料/v0.6実装計画.md §4.6 for the v0.6 change from a
+HuggingFace model directory to a frozen ``tokenizer.json`` per model.
 
 Precedence (lowest to highest): built-in default < config file <
 ``EEANE_API_KEY`` environment variable (``api_key`` only) < CLI overrides.
@@ -70,7 +71,10 @@ class ModelEntry(BaseModel):
     Attributes:
         id: Model identifier reported in API responses. Must be non-empty.
         kind: Either ``"embedding"`` or ``"reranker"``.
-        model_dir: HuggingFace-format model directory (tokenizer source).
+        tokenizer: Frozen ``tokenizer.json`` file written by ``eeane
+            compile`` (v0.6実装計画.md §4.6). Pointing this at a
+            HuggingFace-distributed ``tokenizer.json`` is rejected at
+            engine startup: it carries no padding section.
         artifacts: Map of fixed sequence-length bucket to compiled Core ML
             artifact path (``.mlmodelc``). TOML tables always have string
             keys, so this is coerced to ``int`` explicitly rather than
@@ -87,7 +91,7 @@ class ModelEntry(BaseModel):
 
     id: str = Field(min_length=1)
     kind: Literal["embedding", "reranker"]
-    model_dir: Path
+    tokenizer: Path
     artifacts: dict[int, Path]
     normalize: bool = True
     output_name: str | None = None
@@ -267,10 +271,11 @@ class LoadedConfig:
 def default_config() -> EeaneConfig:
     """Build eeANE's built-in default configuration.
 
-    Reproduces the v0.4 hard-coded ``eeane.settings`` values (paths
-    resolved relative to the repository root) as an ``EeaneConfig``: one
-    embedding model (``ruri-v3-310m``, buckets 128/512/1024) and one
-    reranker model (``ruri-v3-reranker-310m``, buckets 512/1024).
+    Describes the development repository layout (paths resolved relative
+    to the repository root): one embedding model (``ruri-v3-310m``,
+    buckets 128/512/1024) and one reranker model
+    (``ruri-v3-reranker-310m``, buckets 512/1024), each served from the
+    artifacts and the frozen tokenizer under ``models/compiled/``.
 
     Returns:
         The built-in default configuration.
@@ -280,7 +285,7 @@ def default_config() -> EeaneConfig:
     embedding = ModelEntry(
         id="ruri-v3-310m",
         kind="embedding",
-        model_dir=REPO_ROOT / "models" / "ruri-v3-310m",
+        tokenizer=compiled_root / "ruri-v3-310m" / "tokenizer.json",
         artifacts={
             128: compiled_root / "ruri-v3-310m" / "s128_b1_eager_macos13.mlmodelc",
             512: compiled_root / "ruri-v3-310m" / "s512_b1_eager_macos13.mlmodelc",
@@ -291,7 +296,7 @@ def default_config() -> EeaneConfig:
     reranker = ModelEntry(
         id="ruri-v3-reranker-310m",
         kind="reranker",
-        model_dir=REPO_ROOT / "models" / "ruri-v3-reranker-310m",
+        tokenizer=compiled_root / "ruri-v3-reranker-310m" / "tokenizer.json",
         artifacts={
             512: compiled_root / "ruri-v3-reranker-310m" / "s512_b1_eager_macos13.mlmodelc",
             1024: compiled_root / "ruri-v3-reranker-310m" / "s1024_b1_eager_macos13.mlmodelc",
@@ -315,7 +320,7 @@ def load_config(
     3. ``~/.config/eeane/eeane.toml``.
     4. None of the above: use :func:`default_config`.
 
-    When a config file is used, relative ``model_dir``/``artifacts``
+    When a config file is used, relative ``tokenizer``/``artifacts``
     paths are resolved against the config file's parent directory before
     pydantic validation runs.
 
@@ -436,7 +441,7 @@ def _load_from_file(path: Path) -> EeaneConfig:
 
 
 def _resolve_relative_paths(raw: dict[str, Any], *, base_dir: Path) -> None:
-    """Absolutize relative model_dir/artifacts paths in-place, before validation.
+    """Absolutize relative tokenizer/artifacts paths in-place, before validation.
 
     Args:
         raw: Dict as parsed by ``tomllib.load`` (mutated in place).
@@ -451,9 +456,9 @@ def _resolve_relative_paths(raw: dict[str, Any], *, base_dir: Path) -> None:
         if not isinstance(entry, dict):
             continue
 
-        model_dir = entry.get("model_dir")
-        if isinstance(model_dir, str):
-            entry["model_dir"] = _resolve_one_path(base_dir, model_dir)
+        tokenizer = entry.get("tokenizer")
+        if isinstance(tokenizer, str):
+            entry["tokenizer"] = _resolve_one_path(base_dir, tokenizer)
 
         artifacts = entry.get("artifacts")
         if isinstance(artifacts, dict):
