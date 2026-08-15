@@ -257,7 +257,9 @@ class XlmRobertaBackend:
             pooling=pooling,
         )
 
-    def apply_patches(self, loaded: LoadedModel, mask_fill_value: float | None = None) -> None:
+    def apply_patches(
+        self, loaded: LoadedModel, mask_fill_value: float | None = None
+    ) -> dict[str, Any]:
         """Do nothing: this architecture converts without any rewrite.
 
         Its attention is a plain rank-4 implementation without rotary
@@ -270,6 +272,9 @@ class XlmRobertaBackend:
             loaded: Handle returned by :meth:`load`.
             mask_fill_value: Not supported by this backend.
 
+        Returns:
+            Always an empty dict: no patch is ever applied.
+
         Raises:
             ValueError: If ``mask_fill_value`` is given.
         """
@@ -278,6 +283,7 @@ class XlmRobertaBackend:
                 f"{self.name} does not implement a mask fill patch "
                 f"(requested fill value: {mask_fill_value})"
             )
+        return {}
 
     def wrap(self, loaded: LoadedModel) -> torch.nn.Module:
         """Wrap the loaded model into the traceable module for its kind.

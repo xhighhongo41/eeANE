@@ -37,7 +37,8 @@ Members to implement:
     :class:`LoadedModel`; see the rules below.
 ``apply_patches(loaded, mask_fill_value=None)``
     Apply whatever graph rewrites the conversion of this architecture
-    requires, in place. A backend that needs none implements a no-op. The
+    requires, in place, and return a JSON-serializable record of what was
+    actually applied (an empty dict for a backend that needs none). The
     optional finite attention-mask fill value is a remedy for masks that
     become ``-inf`` (and thus NaN-prone) once the graph is cast to FP16;
     backends that cannot apply it may ignore it or raise.
@@ -69,7 +70,7 @@ Members to implement:
 The pipeline drives them in this order::
 
     loaded = backend.load(model_dir, kind, attn=attn)   # once per run
-    backend.apply_patches(loaded)
+    patches = backend.apply_patches(loaded)
     for seq_len in buckets:                             # once per bucket
         wrapper = backend.wrap(loaded)
         example = backend.tokenize(
@@ -218,12 +219,19 @@ class CompileBackend(Protocol):
         """
         ...
 
-    def apply_patches(self, loaded: LoadedModel, mask_fill_value: float | None = None) -> None:
+    def apply_patches(
+        self, loaded: LoadedModel, mask_fill_value: float | None = None
+    ) -> dict[str, Any]:
         """Apply the graph rewrites this architecture needs, in place.
 
         Args:
             loaded: Handle returned by :meth:`load`.
             mask_fill_value: Optional finite attention-mask fill value.
+
+        Returns:
+            A JSON-serializable record of the patches actually applied
+            (an empty dict when the backend needs none), recorded verbatim
+            in the compiled variant's metadata.
 
         Raises:
             ValueError: If the loaded model contradicts an assumption a

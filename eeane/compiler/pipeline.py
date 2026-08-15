@@ -1,26 +1,29 @@
-"""``eeane compile`` driver (v0.6実装計画.md §4.1, §4.3, §4.4).
+"""``eeane compile`` driver.
 
 One invocation compiles one model into one or more sequence-length
 buckets: the source is resolved (local directory or Hub id), a backend and
 model kind are dispatched from ``config.json``, the tokenizer is frozen and
 verified, and then -- with the PyTorch model loaded and patched exactly
 once -- every bucket is traced, converted, compiled to ``.mlmodelc`` and
-described by a metadata JSON file.
+described by a metadata JSON file. Once every bucket is done, the
+per-bucket self-checks are aggregated into the model-level
+``model_info.json`` (``recommended_buckets``, ``calibration``,
+``embedding_dim``), which is what :mod:`eeane.config` reads back to
+auto-resolve a ``[[models]]`` entry that only names an ``id``.
 
 Everything is written under the cache root (``--out-dir``, default
-``~/.cache/eeane``); the input model directory is strictly read-only
-(v0.6実装計画.md §2-11).
+``~/.cache/eeane``); the input model directory is strictly read-only.
 
 The decisions *about* the outputs (cache layout, artifact naming, bucket
-defaults, reuse of existing artifacts, the generated ``[[models]]``
-snippet) live in :mod:`eeane.compiler.artifacts`; the Core ML steps
-themselves live in :mod:`eeane.compiler.conversion`.
+defaults, reuse of existing artifacts, the self-check aggregation, the
+generated ``[[models]]`` snippet) live in :mod:`eeane.compiler.artifacts`;
+the Core ML steps themselves live in :mod:`eeane.compiler.conversion`.
 
 The self-check (accuracy sanity, ANE placement, latency) is not part of
-this module either: :data:`SelfcheckFn` is the hook v0.6 T5 plugs
-``eeane.compiler.selfcheck`` into. Until then -- and whenever
-``--skip-selfcheck`` is given -- every variant records
-``selfcheck: {"status": "skipped", ...}``.
+this module either: :data:`SelfcheckFn` is the hook
+:mod:`eeane.compiler.selfcheck` plugs into. When it is unavailable --
+and whenever ``--skip-selfcheck`` is given -- every variant records
+``selfcheck: {"status": "skipped", ...}`` instead.
 
 Progress messages go to stderr so that stdout carries only the
 ``[[models]]`` TOML snippet, which stays pipeable into a config file.
@@ -50,6 +53,7 @@ from eeane.compiler.artifacts import (
     TOKENIZER_FILENAME,
     CompileError,
     VariantPlan,
+    aggregate_calibration,
     build_config_snippet,
     discover_variants,
     ensure_writable_directory,
@@ -92,9 +96,9 @@ class SelfcheckFailedError(CompileError):
 class SelfcheckContext:
     """Everything a self-check implementation needs for one variant.
 
-    This is the stable hand-off between the pipeline and v0.6 T5's
-    ``eeane.compiler.selfcheck``: the pipeline converts and compiles, the
-    self-check measures the compiled artifact and returns a JSON-
+    This is the stable hand-off between the pipeline and
+    :mod:`eeane.compiler.selfcheck`: the pipeline converts and compiles,
+    the self-check measures the compiled artifact and returns a JSON-
     serializable dict that is stored under the metadata's ``selfcheck``
     key.
 
@@ -122,7 +126,7 @@ class SelfcheckContext:
 
 # A self-check implementation: given one compiled variant, return a
 # JSON-serializable report. A report whose ``status`` is ``"failed"``
-# fails the compile (v0.6実装計画.md §4.5).
+# fails the compile.
 SelfcheckFn = Callable[[SelfcheckContext], dict[str, Any]]
 
 
@@ -297,26 +301,46 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
 
     # The tokenizer is frozen and verified on every run: it costs seconds
     # and it is what guarantees the served artifacts and the tokenizer
-    # agree (v0.6実装計画.md §4.6).
+    # agree.
     freeze_info, freeze_report = _freeze_and_verify(context, cache_buckets)
 
     plans = _plan_variants(context, buckets)
-    _convert_variants(context, plans)
+    run_reports = _convert_variants(context, plans)
 
     cache_artifacts = dict(existing)
     cache_artifacts.update({plan.seq_len: plan.mlmodelc_path for plan in plans})
 
-    write_json_record(
-        context.model_root / MODEL_INFO_FILENAME,
-        _build_model_info(context, cache_artifacts, freeze_info, freeze_report),
+    # Aggregated across the whole cache, not just this invocation: adding
+    # one bucket must re-derive recommended_buckets/embedding_dim from
+    # every same-family bucket, not overwrite them with this run's alone.
+    calibration, recommended_buckets, embedding_dim = aggregate_calibration(
+        context.kind, cache_artifacts, run_reports
     )
 
+    write_json_record(
+        context.model_root / MODEL_INFO_FILENAME,
+        _build_model_info(
+            context,
+            cache_artifacts,
+            freeze_info,
+            freeze_report,
+            calibration,
+            recommended_buckets,
+            embedding_dim,
+        ),
+    )
+
+    # A non-default --out-dir must be told to the server too, or it will
+    # resolve this id against its own default cache root and find nothing.
+    cache_root_hint = out_root if out_root != resolve_out_root(None) else None
     snippet = build_config_snippet(
         model_id=context.model_id,
         kind=context.kind,
         tokenizer_path=context.tokenizer_path,
         artifacts=cache_artifacts,
+        cache_root_hint=cache_root_hint,
     )
+    _progress(_calibration_summary(cache_artifacts, recommended_buckets, calibration))
     _progress("[6/6] Done.")
     if args.emit_config is not None:
         write_config_snippet(args.emit_config, snippet)
@@ -324,6 +348,36 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     _progress("      add the following to your eeane.toml:")
     print(snippet, end="")
     return 0
+
+
+def _calibration_summary(
+    cache_artifacts: Mapping[int, Path],
+    recommended_buckets: Sequence[int],
+    calibration: Mapping[str, Any],
+) -> str:
+    """Build the one-line calibration summary printed at the end of a run.
+
+    Args:
+        cache_artifacts: Every same-family bucket now present in the cache.
+        recommended_buckets: Buckets :func:`aggregate_calibration`
+            recommends loading, as recorded in ``model_info.json``.
+        calibration: The ``calibration`` record :func:`aggregate_calibration`
+            built, consulted for the excluded buckets' recorded status.
+
+    Returns:
+        A progress line naming the recommended buckets, plus the excluded
+        ones and their reason when the cache holds any.
+    """
+    recommended = ", ".join(str(bucket) for bucket in recommended_buckets)
+    line = f"      calibration : recommended buckets: {recommended}"
+    dropped = sorted(set(cache_artifacts) - set(recommended_buckets))
+    if dropped:
+        buckets = calibration.get("buckets", {})
+        reasons = ", ".join(
+            f"{bucket} [{buckets.get(str(bucket), {}).get('status')}]" for bucket in dropped
+        )
+        line += f" (dropped: {reasons})"
+    return line
 
 
 def _apply_max_seq_len(
@@ -381,12 +435,22 @@ def _apply_max_seq_len(
     return kept
 
 
-def _convert_variants(context: _CompileContext, plans: Sequence[VariantPlan]) -> None:
+def _convert_variants(
+    context: _CompileContext, plans: Sequence[VariantPlan]
+) -> dict[int, dict[str, Any]]:
     """Convert every planned variant, loading the model at most once.
 
     Args:
         context: Per-invocation state.
         plans: Variant plans in ascending bucket order.
+
+    Returns:
+        This invocation's own self-check reports, keyed by bucket --
+        empty for a bucket that was skipped (an up-to-date artifact was
+        reused, so nothing ran) and for the run as a whole when nothing
+        needed conversion. Fed into :func:`eeane.compiler.artifacts.
+        aggregate_calibration` together with the buckets read back from
+        disk.
 
     Raises:
         CompileError: If loading or any conversion fails.
@@ -405,27 +469,36 @@ def _convert_variants(context: _CompileContext, plans: Sequence[VariantPlan]) ->
             )
     if not pending:
         _progress("      nothing to convert; the model is not loaded")
-        return
+        return {}
 
     _progress(f"      loading the model in FP32 (attn={context.args.attn}) and applying patches")
     step = time.perf_counter()
     try:
         loaded = context.backend.load(context.model_dir, context.kind, attn=context.args.attn)
-        context.backend.apply_patches(loaded)
+        patches = context.backend.apply_patches(loaded)
     except Exception as exc:
         raise CompileError(f"failed to load the model from '{context.model_dir}': {exc}") from exc
+    if not isinstance(patches, dict):
+        raise CompileError(
+            f"{context.backend.name}.apply_patches() returned "
+            f"{type(patches).__name__}, expected a dict"
+        )
     load_seconds = time.perf_counter() - step
     _progress(f"      loaded in {load_seconds:.1f}s")
 
+    run_reports: dict[int, dict[str, Any]] = {}
     try:
         for plan in pending:
-            _convert_variant(context, plan, loaded, load_seconds)
+            run_reports[plan.seq_len] = _convert_variant(
+                context, plan, loaded, load_seconds, patches
+            )
     finally:
         # ~1.2 GB of FP32 weights for a 310M model: dropping the handle
         # releases the model and its tokenizer as soon as the last bucket
         # is done (or the first one failed).
         del loaded
         gc.collect()
+    return run_reports
 
 
 def _convert_variant(
@@ -433,7 +506,8 @@ def _convert_variant(
     plan: VariantPlan,
     loaded: Any,
     load_seconds: float,
-) -> None:
+    patches: Mapping[str, Any],
+) -> dict[str, Any]:
     """Trace, convert, compile and describe one bucket.
 
     Args:
@@ -443,6 +517,13 @@ def _convert_variant(
             ``LoadedModel``).
         load_seconds: Shared model-loading time, recorded in the metadata
             of every variant of this run.
+        patches: This run's own ``backend.apply_patches()`` return value,
+            recorded verbatim in the variant's metadata.
+
+    Returns:
+        This variant's self-check report (possibly ``status="skipped"``),
+        so the caller can feed it into the cache-wide calibration without
+        reading the metadata file straight back.
 
     Raises:
         CompileError: If any conversion step fails.
@@ -516,7 +597,8 @@ def _convert_variant(
     selfcheck = _run_selfcheck(context, plan)
     timings["total"] = time.perf_counter() - started + load_seconds
     write_json_record(
-        plan.metadata_path, _build_metadata(context, plan, timings, artifacts, selfcheck)
+        plan.metadata_path,
+        _build_metadata(context, plan, timings, artifacts, patches, selfcheck),
     )
     _progress(
         f"      s{plan.seq_len}: done in {timings['total']:.1f}s -> {plan.mlmodelc_path.name}"
@@ -526,6 +608,7 @@ def _convert_variant(
         raise SelfcheckFailedError(
             f"the self-check of bucket {plan.seq_len} failed; see {plan.metadata_path}"
         )
+    return selfcheck
 
 
 def _plan_variants(context: _CompileContext, buckets: Sequence[int]) -> list[VariantPlan]:
@@ -583,7 +666,7 @@ def _freeze_and_verify(
     Raises:
         CompileError: If freezing failed for an unexpected reason.
         TokenizerFreezeError: If the frozen tokenizer disagrees with
-            ``AutoTokenizer`` (the compile gate, §4.10 C2).
+            ``AutoTokenizer`` (the compile gate).
     """
     _progress(f"[2/6] Freezing the tokenizer to {context.tokenizer_path}")
     try:
@@ -658,6 +741,7 @@ def _build_metadata(
     plan: VariantPlan,
     timings: Mapping[str, float],
     artifacts: Mapping[str, str],
+    patches: Mapping[str, Any],
     selfcheck: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Assemble one variant's metadata record.
@@ -667,10 +751,14 @@ def _build_metadata(
         plan: The variant the record describes.
         timings: Per-step durations in seconds.
         artifacts: Produced artifact paths.
+        patches: The backend's own ``apply_patches()`` return value for
+            this run (empty for an architecture that needs none), so this
+            records what was actually applied rather than an assumption
+            tied to one architecture.
         selfcheck: Self-check report (possibly ``status="skipped"``).
 
     Returns:
-        A JSON-serializable metadata record (v0.6実装計画.md §4.4).
+        A JSON-serializable metadata record.
     """
     return {
         "format_version": METADATA_FORMAT_VERSION,
@@ -684,13 +772,7 @@ def _build_metadata(
         },
         "args": dict(context.recorded_args),
         "versions": dict(context.versions),
-        # The two rewrites are mandatory constituents of the conversion
-        # and always applied; mask_fill is not exposed by the v0.6 CLI.
-        "patches": {
-            "rotate_half_static": True,
-            "eager_attention_rank4": True,
-            "mask_fill_value": False,
-        },
+        "patches": dict(patches),
         "timings_sec": {key: round(value, 3) for key, value in timings.items()},
         "artifacts": dict(artifacts),
         "selfcheck": dict(selfcheck),
@@ -702,6 +784,9 @@ def _build_model_info(
     artifacts: Mapping[int, Path],
     freeze_info: Mapping[str, Any],
     freeze_report: Mapping[str, Any],
+    calibration: Mapping[str, Any],
+    recommended_buckets: Sequence[int],
+    embedding_dim: int | None,
 ) -> dict[str, Any]:
     """Assemble the model-level ``model_info.json`` record.
 
@@ -712,10 +797,17 @@ def _build_model_info(
             kept from earlier runs).
         freeze_info: Result of ``freeze_tokenizer``.
         freeze_report: Result of ``verify_frozen_tokenizer``.
+        calibration: Result of :func:`eeane.compiler.artifacts.
+            aggregate_calibration`'s first element: the cache-wide
+            self-check summary.
+        recommended_buckets: That call's second element: the ascending
+            buckets ``eeane.config`` should load by default.
+        embedding_dim: That call's third element: the shared embedding
+            width, or ``None`` for a reranker or an unmeasured cache.
 
     Returns:
-        A JSON-serializable summary; the input of v0.7's cache
-        auto-resolution, hence the ``format_version``.
+        A JSON-serializable summary; the input ``eeane.config``'s cache
+        auto-resolution reads, hence the ``format_version``.
     """
     return {
         "format_version": MODEL_INFO_FORMAT_VERSION,
@@ -736,6 +828,9 @@ def _build_model_info(
             "n_comparisons": freeze_report.get("n_comparisons"),
         },
         "artifacts": {str(seq_len): path.name for seq_len, path in sorted(artifacts.items())},
+        "embedding_dim": embedding_dim,
+        "recommended_buckets": list(recommended_buckets),
+        "calibration": dict(calibration),
         "eeane_version": __version__,
     }
 

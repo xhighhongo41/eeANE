@@ -1,4 +1,4 @@
-"""ModernBERT compile backend (v0.6実装計画.md §4.2, ported from poc/).
+"""ModernBERT compile backend, ported from poc/.
 
 This module is the eeANE-side home of the conversion logic proven by the
 PoC scripts (``poc/convert_common.py``, ``poc/convert_embedding.py``,
@@ -8,7 +8,7 @@ the single source of truth for the ModernBERT patches, the wrappers, the
 fixed trace/sanity fixtures and the FP32 reference computations.
 
 The two monkeypatches are mandatory parts of the conversion, not optional
-tweaks (v0.6実装計画.md §2-1):
+tweaks:
 
 * :func:`patch_rotate_half` makes the model convertible at all under
   coremltools 9.0 + numpy 2.x.
@@ -145,7 +145,7 @@ SANITY_SPECS: dict[str, SanitySpec] = {
 # Filler rows used to pad the last sanity batch when the number of sanity
 # inputs is not a multiple of B. The empty strings encode to special tokens
 # only, so the row still has a non-empty attention mask (a fully masked row
-# would risk NaN, v0.3実装計画.md §4.2).
+# would risk NaN).
 BATCH_PADDING_TEXT = ""
 BATCH_PADDING_PAIR: tuple[str, str] = ("", "")
 
@@ -161,10 +161,10 @@ def patch_rotate_half() -> None:
     The upstream implementation slices with ``x.shape[-1] // 2``, which
     traces to ``aten::size -> floor_divide -> aten::Int``. coremltools 9.0
     cannot convert that ``aten::Int`` under numpy 2.x and raises
-    "only 0-dimensional arrays can be converted to Python scalars"
-    (v0.1実装計画.md §4.8 C1). ``torch.chunk`` with a constant chunk count
-    yields the identical result without any dynamic shape arithmetic; this
-    is exact because RoPE head dimensions are always even (enforced by
+    "only 0-dimensional arrays can be converted to Python scalars".
+    ``torch.chunk`` with a constant chunk count yields the identical result
+    without any dynamic shape arithmetic; this is exact because RoPE head
+    dimensions are always even (enforced by
     :meth:`ModernBertBackend.apply_patches`).
     """
 
@@ -356,7 +356,9 @@ class ModernBertBackend:
             pooling=EMBEDDING_POOLING if kind == KIND_EMBEDDING else None,
         )
 
-    def apply_patches(self, loaded: LoadedModel, mask_fill_value: float | None = None) -> None:
+    def apply_patches(
+        self, loaded: LoadedModel, mask_fill_value: float | None = None
+    ) -> dict[str, Any]:
         """Apply the mandatory (and optional) ModernBERT graph patches.
 
         ``patch_rotate_half`` and ``patch_eager_attention_rank4`` are
@@ -373,6 +375,12 @@ class ModernBertBackend:
                 given, :func:`patch_mask_fill_value` is applied to the
                 backbone of the loaded model.
 
+        Returns:
+            ``{"rotate_half_static": True, "eager_attention_rank4": True}``,
+            plus ``"mask_fill_value": mask_fill_value`` when one was given:
+            the two rewrites are always applied by this backend, the mask
+            fill only when requested.
+
         Raises:
             ValueError: If the RoPE head dimension is odd (which would make
                 the ``chunk``-based ``rotate_half`` rewrite inexact), or if
@@ -386,8 +394,11 @@ class ModernBertBackend:
             )
         patch_rotate_half()
         patch_eager_attention_rank4()
+        applied: dict[str, Any] = {"rotate_half_static": True, "eager_attention_rank4": True}
         if mask_fill_value is not None:
             patch_mask_fill_value(_resolve_backbone(loaded.model), mask_fill_value)
+            applied["mask_fill_value"] = mask_fill_value
+        return applied
 
     def wrap(self, loaded: LoadedModel) -> torch.nn.Module:
         """Wrap the loaded model into the traceable module for its kind.

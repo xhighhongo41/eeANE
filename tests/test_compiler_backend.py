@@ -360,6 +360,33 @@ def test_apply_patches_rejects_odd_rope_head_dim() -> None:
         backend.apply_patches(_loaded(model))
 
 
+def test_apply_patches_returns_the_applied_patch_record() -> None:
+    """The two mandatory rewrites must be reported, without a mask fill entry."""
+    backend = mb.ModernBertBackend()
+    model = SimpleNamespace(config=SimpleNamespace(hidden_size=32, num_attention_heads=4))
+
+    applied = backend.apply_patches(_loaded(model))
+
+    assert applied == {"rotate_half_static": True, "eager_attention_rank4": True}
+
+
+def test_apply_patches_records_the_mask_fill_value_when_given() -> None:
+    """A given mask_fill_value must be recorded verbatim in the returned record."""
+    backend = mb.ModernBertBackend()
+    model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=32, num_attention_heads=4, local_attention=8),
+        _update_attention_mask=lambda *args, **kwargs: None,
+    )
+
+    applied = backend.apply_patches(_loaded(model), mask_fill_value=-30000.0)
+
+    assert applied == {
+        "rotate_half_static": True,
+        "eager_attention_rank4": True,
+        "mask_fill_value": -30000.0,
+    }
+
+
 # --- effective maximum sequence length ---------------------------------------
 
 

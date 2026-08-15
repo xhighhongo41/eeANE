@@ -1,4 +1,4 @@
-"""Tests for eeane.compiler.selfcheck (v0.6 T5, 開発資料/v0.6実装計画.md §4.5).
+"""Tests for eeane.compiler.selfcheck.
 
 Two layers, like the other compile-pipeline test modules:
 
@@ -375,6 +375,7 @@ def test_run_selfcheck_embedding_passed(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert report["status"] == selfcheck.STATUS_PASSED
     assert report["sanity"]["passed"] is True
     assert report["sanity"]["cosine_min"] == pytest.approx(1.0)
+    assert report["sanity"]["embedding_dim"] == reference.shape[1]
     assert report["compute_plan"]["ne_placement_pct"] == pytest.approx(95.0)
     assert report["latency"]["n"] == selfcheck.LATENCY_TIMED_PREDICTS
     assert report["machine"]["platform"]
@@ -523,6 +524,7 @@ def test_run_selfcheck_reranker_passed(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert report["sanity"]["ordering_ok_coreml"] is True
     assert report["sanity"]["ordering_ok_fp32"] is True
     assert report["sanity"]["sigmoid_max_abs_diff"] == pytest.approx(0.0)
+    assert "embedding_dim" not in report["sanity"]  # embedding-only field
     json.dumps(report)
 
 
@@ -612,6 +614,7 @@ def test_e2e_real_selfcheck_records_every_section(
 
     assert report["status"] in {selfcheck.STATUS_PASSED, selfcheck.STATUS_WARNED}
     assert report["sanity"]["passed"] is True
+    assert report["sanity"]["embedding_dim"] > 0
     assert set(report) >= {"status", "sanity", "compute_plan", "latency", "machine"}
     assert report["latency"]["n"] == selfcheck.LATENCY_TIMED_PREDICTS
     assert report["machine"]["platform"]

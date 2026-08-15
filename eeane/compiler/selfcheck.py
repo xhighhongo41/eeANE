@@ -1,4 +1,4 @@
-"""Post-compile self-check: accuracy sanity, ANE placement, latency (v0.6実装計画.md §4.5).
+"""Post-compile self-check: accuracy sanity, ANE placement, latency.
 
 Plugs into :data:`eeane.compiler.pipeline.SelfcheckFn`: it is handed one
 just-compiled ``.mlmodelc`` (as a :class:`~eeane.compiler.pipeline.
@@ -52,14 +52,13 @@ if TYPE_CHECKING:
     from eeane.compiler.pipeline import SelfcheckContext
 
 # Statuses this module can produce. "skipped" is the pipeline's own status
-# for when no self-check ran at all (v0.6実装計画.md §4.5); it is never
-# returned from here.
+# for when no self-check ran at all; it is never returned from here.
 STATUS_PASSED = "passed"
 STATUS_WARNED = "warned"
 STATUS_FAILED = "failed"
 
 # --- accuracy sanity thresholds, ported verbatim from
-# poc/convert_embedding.py / poc/convert_reranker.py (§2-4) ---
+# poc/convert_embedding.py / poc/convert_reranker.py ---
 
 # Minimum cosine similarity against the PyTorch FP32 baseline (embedding).
 SANITY_COSINE_THRESHOLD = 0.99
@@ -75,13 +74,13 @@ BATCH_CONSISTENCY_COSINE_THRESHOLD = 0.99999
 # holding the same pair (reranker batch consistency check, R1).
 BATCH_CONSISTENCY_LOGIT_TOLERANCE = 0.01
 
-# --- NE placement (§2-5) ---
+# --- NE placement ---
 
 # Below this NE-placement percentage the report is downgraded to "warned"
 # (never "failed": the goal is data collection on unverified machines).
 NE_PLACEMENT_WARN_THRESHOLD = 90.0
 
-# --- warm latency (§4.5 step 3, a simplified measurement) ---
+# --- warm latency (a simplified measurement) ---
 
 LATENCY_WARMUP_PREDICTS = 3
 LATENCY_TIMED_PREDICTS = 20
@@ -203,6 +202,7 @@ def _sanity_embedding(
     sanity = {
         "output_key": output_key,
         "batch_size": context.batch_size,
+        "embedding_dim": int(coreml_emb.shape[1]),
         "cosine_per_text": [float(c) for c in cosines],
         "cosine_min": float(cosines.min()),
         "cosine_mean": float(cosines.mean()),
@@ -507,8 +507,8 @@ def _cosine_rowwise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 def _compute_plan_report(mlmodelc_path: Any) -> dict[str, Any]:
     """Summarize per-op compute device placement via MLComputePlan.
 
-    Ported from ``poc/benchmark_latency.py``'s ``compute_plan_report``
-    (§2-5): always measured against ``CPU_AND_NE``, matching the sanity
+    Ported from ``poc/benchmark_latency.py``'s ``compute_plan_report``:
+    always measured against ``CPU_AND_NE``, matching the sanity
     check's own compute unit selection. If the API is unavailable or
     raises at runtime, the failure is recorded rather than propagated so
     that a self-check never fails because of this best-effort report.
@@ -591,7 +591,7 @@ def _collect_program_operations(block: Any) -> list[Any]:
 def _measure_latency(
     compiled: ct.models.CompiledMLModel, batch: dict[str, np.ndarray]
 ) -> dict[str, Any]:
-    """Measure warm predict() latency on one fixed batch (informational only, §4.5 step 3).
+    """Measure warm predict() latency on one fixed batch (informational only).
 
     A simplified measurement compared to ``poc/benchmark_latency.py``
     (which remains the tool for real benchmarking): one batch, no cold
@@ -627,10 +627,7 @@ def _measure_latency(
 
 
 def _machine_info() -> dict[str, str]:
-    """Collect the machine info recorded in every report (§4.5 compatibility summary).
-
-    Args:
-        None.
+    """Collect the machine info recorded in every report.
 
     Returns:
         Dict with the OS ``platform.platform()`` string and the CPU brand
@@ -658,7 +655,7 @@ def _cpu_brand() -> str:
 
 
 def _print_summary(context: SelfcheckContext, report: dict[str, Any]) -> None:
-    """Print the self-check compatibility summary to stderr (§4.5).
+    """Print the self-check compatibility summary to stderr.
 
     One block per compiled bucket, in the pipeline's own progress style,
     meant to be pasted verbatim into a "works on my machine" report (the

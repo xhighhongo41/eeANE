@@ -1,4 +1,4 @@
-"""Tests for the compile pipeline (v0.6 T4, 開発資料/v0.6実装計画.md §4.1/§4.3/§4.4).
+"""Tests for the compile pipeline.
 
 Covers ``eeane.compiler.pipeline`` (the driver) together with
 ``eeane.compiler.artifacts`` (the layout/naming/record decisions it
@@ -6,16 +6,19 @@ drives), in two layers:
 
 * Unit tests for the pure decisions (cache naming, output-root
   resolution, bucket defaults, variant naming, config snippet,
-  idempotent-skip) -- these run anywhere, including CI.
+  calibration aggregation, idempotent-skip) -- these run anywhere,
+  including CI.
 * One end-to-end run over a *synthetic* randomly initialised ModernBERT
   (trace -> convert -> ``xcrun coremlcompiler`` -> metadata -> snippet).
   It is skipped unless the local development model directories are present
   (the established local-only marker) and ``xcrun`` is available, so CI
-  stays green and fast. Converting the real 310M models is v0.6 T7's job.
+  stays green and fast. Converting the real, deployed-sized models happens
+  outside this test suite.
 """
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -24,8 +27,10 @@ import time
 import tomllib
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
@@ -35,7 +40,7 @@ from transformers.models.modernbert import modeling_modernbert
 from eeane import __version__, cli
 from eeane.compiler import artifacts, pipeline
 from eeane.compiler.backends import modernbert as mb
-from eeane.config import ModelEntry
+from eeane.config import ModelEntry, load_config
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -213,14 +218,50 @@ def test_variant_stem_appends_fp32_only_for_fp32() -> None:
 
 
 def _parse_snippet(snippet: str) -> dict[str, Any]:
-    """Parse a generated snippet and return its single ``[[models]]`` entry."""
+    """Parse a generated snippet's active (non-comment) ``[[models]]`` entry."""
     parsed = tomllib.loads(snippet)
     assert len(parsed["models"]) == 1
     return parsed["models"][0]
 
 
-def test_config_snippet_parses_as_toml_and_lists_every_bucket(tmp_path: Path) -> None:
-    """The snippet must be valid TOML naming every compiled bucket, with absolute paths."""
+def _commented_value(snippet: str, key: str) -> Any:
+    """TOML-parse the value of a commented-out ``# key = ...`` line.
+
+    The minimal snippet activates only ``id``/``normalize``; every other
+    field is written as a ready-to-uncomment comment (a TOML parser skips
+    it). This is how a test checks what that comment *would* set without
+    actually enabling it.
+    """
+    prefix = f"# {key} = "
+    for line in snippet.splitlines():
+        if line.startswith(prefix):
+            return tomllib.loads(f"{key} = {line[len(prefix) :]}")[key]
+    raise AssertionError(f"no commented '{key} = ...' line in snippet:\n{snippet}")
+
+
+def _commented_buckets(snippet: str) -> list[str]:
+    """Return the bucket keys named in a snippet's commented artifacts block."""
+    return [
+        line[2:].split(" = ", 1)[0]
+        for line in snippet.splitlines()
+        if line.startswith("# ") and line[2:].split(" = ", 1)[0].isdigit()
+    ]
+
+
+def test_config_snippet_minimal_form_only_sets_id_and_normalize(tmp_path: Path) -> None:
+    """The active (uncommented) part of an embedding snippet must be id + normalize."""
+    snippet = artifacts.build_config_snippet(
+        model_id="cl-nagoya/ruri-v3-310m",
+        kind="embedding",
+        tokenizer_path=tmp_path / "tokenizer.json",
+        artifacts={512: tmp_path / "s512.mlmodelc", 128: tmp_path / "s128.mlmodelc"},
+    )
+
+    assert _parse_snippet(snippet) == {"id": "cl-nagoya/ruri-v3-310m", "normalize": True}
+
+
+def test_config_snippet_comments_name_every_bucket_with_absolute_paths(tmp_path: Path) -> None:
+    """The commented-out explicit form must still name every bucket, absolutely."""
     compiled_artifacts = {512: tmp_path / "s512.mlmodelc", 128: tmp_path / "s128.mlmodelc"}
 
     snippet = artifacts.build_config_snippet(
@@ -230,17 +271,16 @@ def test_config_snippet_parses_as_toml_and_lists_every_bucket(tmp_path: Path) ->
         artifacts=compiled_artifacts,
     )
 
-    entry = _parse_snippet(snippet)
-    assert entry["id"] == "cl-nagoya/ruri-v3-310m"
-    assert entry["kind"] == "embedding"
-    assert entry["normalize"] is True
-    assert Path(entry["tokenizer"]).is_absolute()
-    assert sorted(entry["artifacts"]) == ["128", "512"]
-    assert all(Path(value).is_absolute() for value in entry["artifacts"].values())
+    assert _commented_value(snippet, "kind") == "embedding"
+    assert Path(_commented_value(snippet, "tokenizer")).is_absolute()
+    for bucket, path in compiled_artifacts.items():
+        commented_path = Path(_commented_value(snippet, str(bucket)))
+        assert commented_path.is_absolute()
+        assert commented_path == path.resolve()
 
 
-def test_config_snippet_is_accepted_by_the_config_schema(tmp_path: Path) -> None:
-    """The snippet must validate against the runtime's own ModelEntry schema."""
+def test_config_snippet_is_accepted_by_the_config_schema_once_pinned(tmp_path: Path) -> None:
+    """Uncommenting the minimal snippet's hints must build a valid ModelEntry."""
     snippet = artifacts.build_config_snippet(
         model_id="ruri-v3-310m",
         kind="embedding",
@@ -248,14 +288,19 @@ def test_config_snippet_is_accepted_by_the_config_schema(tmp_path: Path) -> None
         artifacts={128: tmp_path / "s128.mlmodelc"},
     )
 
-    entry = ModelEntry(**_parse_snippet(snippet))
+    entry = ModelEntry(
+        **_parse_snippet(snippet),
+        kind=_commented_value(snippet, "kind"),
+        tokenizer=_commented_value(snippet, "tokenizer"),
+        artifacts={128: _commented_value(snippet, "128")},
+    )
 
     assert entry.buckets == (128,)
     assert entry.output_name == "embedding"
 
 
 def test_config_snippet_omits_normalize_for_a_reranker(tmp_path: Path) -> None:
-    """`normalize` is embedding-only; setting it on a reranker is a config error."""
+    """`normalize` is embedding-only; a reranker's active entry must not carry it."""
     snippet = artifacts.build_config_snippet(
         model_id="ruri-v3-reranker-310m",
         kind="reranker",
@@ -264,8 +309,8 @@ def test_config_snippet_omits_normalize_for_a_reranker(tmp_path: Path) -> None:
     )
 
     entry = _parse_snippet(snippet)
-    assert "normalize" not in entry
-    assert ModelEntry(**entry).kind == "reranker"
+    assert entry == {"id": "ruri-v3-reranker-310m"}
+    assert _commented_value(snippet, "kind") == "reranker"
 
 
 def test_config_snippet_absolutizes_relative_paths() -> None:
@@ -277,9 +322,8 @@ def test_config_snippet_absolutizes_relative_paths() -> None:
         artifacts={128: Path("cache/s128.mlmodelc")},
     )
 
-    entry = _parse_snippet(snippet)
-    assert Path(entry["tokenizer"]).is_absolute()
-    assert Path(entry["artifacts"]["128"]).is_absolute()
+    assert Path(_commented_value(snippet, "tokenizer")).is_absolute()
+    assert Path(_commented_value(snippet, "128")).is_absolute()
 
 
 def test_config_snippet_escapes_special_characters_in_paths(tmp_path: Path) -> None:
@@ -293,10 +337,98 @@ def test_config_snippet_escapes_special_characters_in_paths(tmp_path: Path) -> N
         artifacts={128: tmp_path / "a b" / "s128.mlmodelc"},
     )
 
-    entry = _parse_snippet(snippet)
-    assert entry["tokenizer"] == str(weird.resolve())
-    assert entry["artifacts"]["128"] == str((tmp_path / "a b" / "s128.mlmodelc").resolve())
-    assert entry["id"] == 'odd "id"'
+    assert _parse_snippet(snippet)["id"] == 'odd "id"'
+    assert _commented_value(snippet, "tokenizer") == str(weird.resolve())
+    assert _commented_value(snippet, "128") == str((tmp_path / "a b" / "s128.mlmodelc").resolve())
+
+
+def test_config_snippet_adds_a_cache_root_hint_for_a_non_default_out_dir(tmp_path: Path) -> None:
+    """A non-default cache root must be echoed as a commented [server] reminder."""
+    non_default_root = tmp_path / "elsewhere"
+
+    snippet = artifacts.build_config_snippet(
+        model_id="local",
+        kind="embedding",
+        tokenizer_path=tmp_path / "tokenizer.json",
+        artifacts={128: tmp_path / "s128.mlmodelc"},
+        cache_root_hint=non_default_root,
+    )
+
+    lines = snippet.splitlines()
+    assert "# [server]" in lines
+    assert f"# cache_root = {artifacts._toml_string(str(non_default_root.resolve()))}" in lines
+    # The reminder must stay a comment: the server config is the user's own.
+    assert "server" not in tomllib.loads(snippet)
+
+
+def test_config_snippet_omits_the_cache_root_hint_by_default(tmp_path: Path) -> None:
+    """The default cache root needs no reminder: eeANE resolves it on its own."""
+    snippet = artifacts.build_config_snippet(
+        model_id="local",
+        kind="embedding",
+        tokenizer_path=tmp_path / "tokenizer.json",
+        artifacts={128: tmp_path / "s128.mlmodelc"},
+    )
+
+    assert "cache_root" not in snippet
+    assert "[server]" not in snippet
+
+
+def test_minimal_snippet_resolves_through_the_real_cache_and_config_loader(
+    tmp_path: Path,
+) -> None:
+    """The minimal snippet plus a real model_info.json must resolve via eeane.config.
+
+    ``eeane.config``'s cache-based resolution is a prerequisite of this
+    task; a real round trip through it is the strongest proof that the
+    minimal snippet and the model_info.json schema (format_version 2)
+    actually agree with each other.
+    """
+    cache_root = tmp_path / "eeane"
+    model_root = cache_root / artifacts.CACHE_SUBDIR / "ruri-v3-310m"
+    model_root.mkdir(parents=True)
+    tokenizer_path = model_root / artifacts.TOKENIZER_FILENAME
+    tokenizer_path.write_text("{}", encoding="utf-8")
+    mlmodelc_path = model_root / "s128_b1_eager_macos13.mlmodelc"
+    mlmodelc_path.mkdir()
+    (model_root / artifacts.MODEL_INFO_FILENAME).write_text(
+        json.dumps(
+            {
+                "format_version": 2,
+                "id": "ruri-v3-310m",
+                "kind": "embedding",
+                "output_name": "embedding",
+                "buckets": [128],
+                "tokenizer": artifacts.TOKENIZER_FILENAME,
+                "artifacts": {"128": mlmodelc_path.name},
+                "embedding_dim": 768,
+                "recommended_buckets": [128],
+                "calibration": {"machine": None, "buckets": {}},
+                "eeane_version": __version__,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snippet = artifacts.build_config_snippet(
+        model_id="ruri-v3-310m",
+        kind="embedding",
+        tokenizer_path=tokenizer_path,
+        artifacts={128: mlmodelc_path},
+    )
+    config_path = tmp_path / "eeane.toml"
+    config_path.write_text(snippet, encoding="utf-8")
+
+    loaded = load_config(explicit_path=config_path, env={"XDG_CACHE_HOME": str(tmp_path)})
+
+    entry = loaded.config.models[0]
+    assert entry.id == "ruri-v3-310m"
+    assert entry.kind == "embedding"
+    assert entry.output_name == "embedding"
+    assert entry.tokenizer == tokenizer_path
+    assert entry.artifacts == {128: mlmodelc_path}
+    assert entry.embedding_dim == 768
+    assert entry.excluded_buckets == ()
 
 
 def test_write_config_snippet_creates_parent_directories(tmp_path: Path) -> None:
@@ -369,11 +501,343 @@ def test_needs_conversion_when_the_metadata_is_missing_or_corrupt(tmp_path: Path
 
 
 def test_needs_conversion_when_the_recorded_selfcheck_failed(tmp_path: Path) -> None:
-    """A variant whose self-check failed must be retried, not skipped (§4.5)."""
+    """A variant whose self-check failed must be retried, not skipped."""
     versions = _versions()
     mlmodelc_path, metadata_path = _write_variant(tmp_path, versions, selfcheck_status="failed")
 
     assert artifacts.needs_conversion(mlmodelc_path, metadata_path, versions) is True
+
+
+# --- calibration aggregation --------------------------------------------------
+
+
+def _write_selfcheck(mlmodelc_path: Path, selfcheck: dict[str, Any] | None) -> None:
+    """Write a variant metadata file exposing only its ``selfcheck`` block.
+
+    Args:
+        mlmodelc_path: The (not necessarily existing) artifact path whose
+            sibling ``.json`` metadata file is written.
+        selfcheck: Value to store under the ``selfcheck`` key, or ``None``
+            to omit the key entirely (an old or foreign record).
+    """
+    metadata_path = mlmodelc_path.with_suffix(".json")
+    payload: dict[str, Any] = {"variant": {"seq_len": 0}}
+    if selfcheck is not None:
+        payload["selfcheck"] = selfcheck
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_aggregate_calibration_recommends_every_status_but_failed(tmp_path: Path) -> None:
+    """Only a "failed" bucket must be excluded from recommended_buckets."""
+    cache_artifacts = {
+        128: tmp_path / "s128.mlmodelc",
+        512: tmp_path / "s512.mlmodelc",
+        1024: tmp_path / "s1024.mlmodelc",
+        2048: tmp_path / "s2048.mlmodelc",
+    }
+    _write_selfcheck(cache_artifacts[128], {"status": "passed", "machine": {"cpu": "m1"}})
+    _write_selfcheck(cache_artifacts[512], {"status": "warned"})
+    _write_selfcheck(cache_artifacts[1024], {"status": "skipped", "reason": "no hook"})
+    _write_selfcheck(cache_artifacts[2048], {"status": "failed", "error": "boom"})
+
+    calibration, recommended, embedding_dim = artifacts.aggregate_calibration(
+        "reranker", cache_artifacts, {}
+    )
+
+    assert recommended == [128, 512, 1024]
+    assert embedding_dim is None
+    assert calibration["buckets"]["128"]["status"] == "passed"
+    assert calibration["buckets"]["128"]["measured"] is True
+    assert calibration["buckets"]["512"]["status"] == "warned"
+    assert calibration["buckets"]["1024"]["measured"] is False
+    assert calibration["buckets"]["1024"]["status"] is None
+    assert calibration["buckets"]["2048"]["status"] == "failed"
+    assert calibration["buckets"]["2048"]["measured"] is True
+
+
+def test_aggregate_calibration_fills_measured_fields(tmp_path: Path) -> None:
+    """A measured bucket's sanity/compute_plan/latency values must be copied through."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc"}
+    _write_selfcheck(
+        cache_artifacts[128],
+        {
+            "status": "passed",
+            "sanity": {"passed": True},
+            "compute_plan": {"ne_placement_pct": 97.5},
+            "latency": {"median_ms": 3.1, "p95_ms": 4.2},
+        },
+    )
+
+    calibration, recommended, _ = artifacts.aggregate_calibration("embedding", cache_artifacts, {})
+
+    assert recommended == [128]
+    assert calibration["buckets"]["128"] == {
+        "status": "passed",
+        "sanity_passed": True,
+        "ne_placement_pct": 97.5,
+        "latency_median_ms": 3.1,
+        "latency_p95_ms": 4.2,
+        "measured": True,
+    }
+
+
+def test_aggregate_calibration_treats_unreadable_metadata_as_unmeasured(tmp_path: Path) -> None:
+    """Missing or corrupt metadata must degrade to measured=False, not raise."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc", 512: tmp_path / "s512.mlmodelc"}
+    cache_artifacts[512].with_suffix(".json").write_text("{not json", encoding="utf-8")
+    # 128's metadata is never written at all.
+
+    calibration, recommended, embedding_dim = artifacts.aggregate_calibration(
+        "embedding", cache_artifacts, {}
+    )
+
+    assert recommended == [128, 512]
+    assert embedding_dim is None
+    for bucket in ("128", "512"):
+        assert calibration["buckets"][bucket] == {
+            "status": None,
+            "sanity_passed": None,
+            "ne_placement_pct": None,
+            "latency_median_ms": None,
+            "latency_p95_ms": None,
+            "measured": False,
+        }
+
+
+def test_aggregate_calibration_prefers_this_runs_own_machine(tmp_path: Path) -> None:
+    """A run's own machine block must win over one read back from an earlier run."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc", 512: tmp_path / "s512.mlmodelc"}
+    _write_selfcheck(cache_artifacts[128], {"status": "passed", "machine": {"cpu": "earlier-run"}})
+    run_reports = {512: {"status": "passed", "machine": {"cpu": "this-run"}}}
+
+    calibration, _, _ = artifacts.aggregate_calibration("reranker", cache_artifacts, run_reports)
+
+    assert calibration["machine"] == {"cpu": "this-run"}
+
+
+def test_aggregate_calibration_falls_back_to_an_existing_machine(tmp_path: Path) -> None:
+    """Without a machine block of its own, the run must fall back to a recorded one."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc", 512: tmp_path / "s512.mlmodelc"}
+    _write_selfcheck(cache_artifacts[128], {"status": "skipped"})
+    _write_selfcheck(cache_artifacts[512], {"status": "passed", "machine": {"cpu": "earlier-run"}})
+    run_reports = {128: {"status": "skipped", "reason": "no hook"}}
+
+    calibration, _, _ = artifacts.aggregate_calibration("reranker", cache_artifacts, run_reports)
+
+    assert calibration["machine"] == {"cpu": "earlier-run"}
+
+
+def test_aggregate_calibration_machine_is_none_when_nothing_was_ever_measured(
+    tmp_path: Path,
+) -> None:
+    """A cache where every self-check was always skipped must report machine=None."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc"}
+    _write_selfcheck(cache_artifacts[128], {"status": "skipped"})
+
+    calibration, _, _ = artifacts.aggregate_calibration("reranker", cache_artifacts, {})
+
+    assert calibration["machine"] is None
+
+
+def test_aggregate_calibration_adopts_the_consistent_embedding_dim(tmp_path: Path) -> None:
+    """The shared embedding_dim across every measured bucket must be adopted."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc", 512: tmp_path / "s512.mlmodelc"}
+    _write_selfcheck(cache_artifacts[128], {"status": "passed", "sanity": {"embedding_dim": 768}})
+    _write_selfcheck(cache_artifacts[512], {"status": "warned", "sanity": {"embedding_dim": 768}})
+
+    _, _, embedding_dim = artifacts.aggregate_calibration("embedding", cache_artifacts, {})
+
+    assert embedding_dim == 768
+
+
+def test_aggregate_calibration_rejects_an_inconsistent_embedding_dim(tmp_path: Path) -> None:
+    """Disagreeing embedding_dim values across buckets must be reported as a corrupt cache."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc", 512: tmp_path / "s512.mlmodelc"}
+    _write_selfcheck(cache_artifacts[128], {"status": "passed", "sanity": {"embedding_dim": 768}})
+    _write_selfcheck(cache_artifacts[512], {"status": "passed", "sanity": {"embedding_dim": 1024}})
+
+    with pytest.raises(artifacts.CompileError, match="embedding_dim"):
+        artifacts.aggregate_calibration("embedding", cache_artifacts, {})
+
+
+def test_aggregate_calibration_embedding_dim_is_none_without_any_measurement(
+    tmp_path: Path,
+) -> None:
+    """No cached bucket recording embedding_dim must leave it None, not raise."""
+    cache_artifacts = {128: tmp_path / "s128.mlmodelc"}
+    _write_selfcheck(cache_artifacts[128], {"status": "skipped"})
+
+    _, _, embedding_dim = artifacts.aggregate_calibration("embedding", cache_artifacts, {})
+
+    assert embedding_dim is None
+
+
+def test_aggregate_calibration_embedding_dim_is_always_none_for_a_reranker(
+    tmp_path: Path,
+) -> None:
+    """A reranker never records embedding_dim, even if a sanity block carries one."""
+    cache_artifacts = {512: tmp_path / "s512.mlmodelc"}
+    _write_selfcheck(cache_artifacts[512], {"status": "passed", "sanity": {"embedding_dim": 768}})
+
+    _, _, embedding_dim = artifacts.aggregate_calibration("reranker", cache_artifacts, {})
+
+    assert embedding_dim is None
+
+
+# --- patches recording --------------------------------------------------------
+
+
+def _stub_compile_context(tmp_path: Path) -> pipeline._CompileContext:
+    """Build a minimal ``_CompileContext`` for a ``_build_metadata`` unit test."""
+    return pipeline._CompileContext(
+        args=argparse.Namespace(source="stub-source"),
+        model_dir=tmp_path,
+        model_id="stub-model",
+        kind="embedding",
+        output_name="embedding",
+        batch_size=1,
+        model_root=tmp_path,
+        tokenizer_path=tmp_path / "tokenizer.json",
+        versions={"eeane": "0.0"},
+        recorded_args={},
+        backend=None,
+        selfcheck_fn=None,
+    )
+
+
+def test_build_metadata_records_the_actual_apply_patches_return_value(tmp_path: Path) -> None:
+    """The metadata's ``patches`` key must be the backend's own return value, verbatim.
+
+    Regression test: the metadata used to hardcode ModernBERT-specific
+    patch names for every backend; a backend that applies something else
+    entirely (or nothing) must be described accurately, not assumed.
+    """
+    context = _stub_compile_context(tmp_path)
+    plan = artifacts.VariantPlan(
+        seq_len=128,
+        stem="s128_b1_eager_macos13",
+        mlpackage_path=tmp_path / "s128.mlpackage",
+        mlmodelc_path=tmp_path / "s128.mlmodelc",
+        metadata_path=tmp_path / "s128.json",
+        convert=True,
+    )
+    patches = {"no_op": True, "note": "a backend that applies nothing still reports honestly"}
+
+    metadata = pipeline._build_metadata(
+        context, plan, {"load": 0.0}, {"mlmodelc": "x"}, patches, {"status": "skipped"}
+    )
+
+    assert metadata["patches"] == patches
+    assert metadata["patches"] is not patches  # a defensive copy, not the same object
+
+
+class _StubBackend:
+    """Minimal compile backend stub driving ``_convert_variants`` without torch."""
+
+    name = "Stub"
+
+    def __init__(self, patches: dict[str, Any]) -> None:
+        """Store the fixed record :meth:`apply_patches` must hand back."""
+        self._patches = patches
+
+    def load(self, model_dir: Path, kind: str, attn: str = "eager") -> Any:
+        """Return an opaque handle; nothing downstream inspects it here."""
+        return SimpleNamespace(kind=kind)
+
+    def apply_patches(self, loaded: Any, mask_fill_value: float | None = None) -> dict[str, Any]:
+        """Return the fixed patch record this stub was built with."""
+        return dict(self._patches)
+
+    def wrap(self, loaded: Any) -> str:
+        """Return an opaque wrapper; ``conversion.trace_model`` is stubbed too."""
+        return "wrapped"
+
+    def trace_example(self, kind: str) -> str:
+        """Return a fixed placeholder trace example."""
+        return "example"
+
+    def tokenize(self, loaded: Any, inputs: list[Any], seq_len: int) -> dict[str, np.ndarray]:
+        """Return fixed-shape zero/one arrays; no real tokenizer is involved."""
+        n = len(inputs)
+        return {
+            "input_ids": np.zeros((n, seq_len), dtype=np.int32),
+            "attention_mask": np.ones((n, seq_len), dtype=np.int32),
+        }
+
+
+def _install_stub_conversion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub trace/convert/compile so a variant needs neither torch nor xcrun."""
+
+    def _fake_convert_model(
+        traced: Any, seq_len: int, precision: str, target: str, output_name: str, *, batch_size: int
+    ) -> Any:
+        class _FakeMLModel:
+            def save(self, path: str) -> None:
+                Path(path).mkdir(parents=True, exist_ok=True)
+
+        return _FakeMLModel()
+
+    def _fake_compile_model(mlpackage_path: Path, mlmodelc_path: Path) -> None:
+        mlmodelc_path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(pipeline.conversion, "trace_model", lambda wrapper, example: "traced")
+    monkeypatch.setattr(pipeline.conversion, "convert_model", _fake_convert_model)
+    monkeypatch.setattr(pipeline.conversion, "compile_model", _fake_compile_model)
+
+
+def test_convert_variants_records_the_backends_own_patches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stub backend's apply_patches() return value must reach the variant's metadata.
+
+    Drives ``_convert_variants`` (not the whole pipeline) with a stub
+    backend and stubbed conversion steps, so this needs neither torch
+    weights nor ``xcrun``: the point is that the pipeline records exactly
+    what the backend reports, not an assumption tied to one architecture.
+    """
+    _install_stub_conversion(monkeypatch)
+    patches = {"some_rewrite": True, "detail": 42}
+    context = pipeline._CompileContext(
+        args=argparse.Namespace(
+            source="stub-source",
+            attn="eager",
+            precision="fp16",
+            target="macos13",
+            keep_mlpackage=False,
+            skip_selfcheck=False,
+        ),
+        model_dir=tmp_path,
+        model_id="stub-model",
+        kind="embedding",
+        output_name="embedding",
+        batch_size=1,
+        model_root=tmp_path,
+        tokenizer_path=tmp_path / "tokenizer.json",
+        versions={"eeane": "0.0"},
+        recorded_args={},
+        backend=_StubBackend(patches),
+        selfcheck_fn=None,
+    )
+    plan = artifacts.VariantPlan(
+        seq_len=8,
+        stem="s8_b1_eager_macos13",
+        mlpackage_path=tmp_path / "s8.mlpackage",
+        mlmodelc_path=tmp_path / "s8.mlmodelc",
+        metadata_path=tmp_path / "s8.json",
+        convert=True,
+    )
+
+    run_reports = pipeline._convert_variants(context, [plan])
+
+    assert plan.mlmodelc_path.is_dir()
+    assert run_reports == {
+        8: {
+            "status": artifacts.SELFCHECK_STATUS_SKIPPED,
+            "reason": pipeline.SELFCHECK_REASON_UNAVAILABLE,
+        }
+    }
+    metadata = json.loads(plan.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["patches"] == patches
 
 
 # --- tokenizer verification inputs -------------------------------------------
@@ -694,6 +1158,7 @@ def compiled(synthetic_model_dir: Path, tmp_path_factory: pytest.TempPathFactory
         "elapsed": elapsed,
         "stdout": stdout.getvalue(),
         "model_dir": synthetic_model_dir,
+        "out_dir": out_dir,
         "model_root": out_dir / "compiled" / synthetic_model_dir.name,
         "emit_config": emit_config,
         "mtimes_before": before,
@@ -722,8 +1187,9 @@ def test_e2e_writes_variant_metadata(compiled: dict[str, Any]) -> None:
     assert Path(metadata["source"]["resolved"]) == compiled["model_dir"].resolve()
     assert metadata["args"]["buckets"] == [E2E_SEQ_LEN]
     assert metadata["versions"]["eeane"] == __version__
-    assert metadata["patches"]["rotate_half_static"] is True
-    assert metadata["patches"]["eager_attention_rank4"] is True
+    # Recorded verbatim from ModernBertBackend.apply_patches()'s return
+    # value: the two mandatory rewrites, no mask fill (never requested).
+    assert metadata["patches"] == {"rotate_half_static": True, "eager_attention_rank4": True}
     assert {"load", "trace", "convert", "compile", "total"} <= set(metadata["timings_sec"])
     assert Path(metadata["artifacts"]["mlmodelc"]).is_dir()
     assert "mlpackage" not in metadata["artifacts"]
@@ -745,6 +1211,21 @@ def test_e2e_writes_model_info(compiled: dict[str, Any]) -> None:
     assert info["eeane_version"] == __version__
     assert info["tokenizer_freeze"]["verified"] is True
     assert info["tokenizer_freeze"]["buckets"] == [E2E_SEQ_LEN]
+    # No self-check hook was given: the one bucket is unmeasured, but still
+    # recommended (only a "failed" status excludes a bucket).
+    assert info["recommended_buckets"] == [E2E_SEQ_LEN]
+    assert info["embedding_dim"] is None
+    assert info["calibration"]["machine"] is None
+    assert info["calibration"]["buckets"] == {
+        str(E2E_SEQ_LEN): {
+            "status": None,
+            "sanity_passed": None,
+            "ne_placement_pct": None,
+            "latency_median_ms": None,
+            "latency_p95_ms": None,
+            "measured": False,
+        }
+    }
 
 
 def test_e2e_prints_and_emits_a_usable_config_snippet(compiled: dict[str, Any]) -> None:
@@ -755,16 +1236,22 @@ def test_e2e_prints_and_emits_a_usable_config_snippet(compiled: dict[str, Any]) 
     assert "[[models]]" in stdout
     assert emitted in stdout
 
-    entry = ModelEntry(**_parse_snippet(emitted))
-    assert entry.id == compiled["model_dir"].name
-    assert entry.tokenizer == compiled["model_root"] / artifacts.TOKENIZER_FILENAME
-    assert entry.artifacts[E2E_SEQ_LEN] == compiled["model_root"] / f"{E2E_STEM}.mlmodelc"
-    assert entry.tokenizer.is_file()
-    assert entry.artifacts[E2E_SEQ_LEN].is_dir()
+    assert _parse_snippet(emitted) == {"id": compiled["model_dir"].name, "normalize": True}
+    tokenizer_path = Path(_commented_value(emitted, "tokenizer"))
+    artifact_path = Path(_commented_value(emitted, str(E2E_SEQ_LEN)))
+    assert tokenizer_path == compiled["model_root"] / artifacts.TOKENIZER_FILENAME
+    assert artifact_path == compiled["model_root"] / f"{E2E_STEM}.mlmodelc"
+    assert tokenizer_path.is_file()
+    assert artifact_path.is_dir()
+
+    # --out-dir here is a pytest tmp directory, never the default cache
+    # root, so the reminder to point the server at it must be present.
+    expected_root = artifacts.resolve_out_root(compiled["out_dir"])
+    assert f"# cache_root = {artifacts._toml_string(str(expected_root))}" in emitted
 
 
 def test_e2e_leaves_the_input_model_directory_untouched(compiled: dict[str, Any]) -> None:
-    """The input model directory is read-only (v0.6実装計画.md §2-11)."""
+    """The input model directory is read-only."""
     assert _mtimes(compiled["model_dir"]) == compiled["mtimes_before"]
 
 
@@ -822,6 +1309,13 @@ def test_e2e_selfcheck_hook_result_is_recorded(compiled: dict[str, Any]) -> None
     assert contexts[0].tokenizer_path.is_file()
     metadata = json.loads((compiled["model_root"] / f"{E2E_STEM}.json").read_text(encoding="utf-8"))
     assert metadata["selfcheck"] == {"status": "passed", "note": "fake"}
+
+    info = json.loads(
+        (compiled["model_root"] / artifacts.MODEL_INFO_FILENAME).read_text(encoding="utf-8")
+    )
+    assert info["recommended_buckets"] == [E2E_SEQ_LEN]
+    assert info["calibration"]["buckets"][str(E2E_SEQ_LEN)]["status"] == "passed"
+    assert info["calibration"]["buckets"][str(E2E_SEQ_LEN)]["measured"] is True
 
 
 def test_e2e_failing_selfcheck_fails_the_compile(compiled: dict[str, Any]) -> None:
@@ -913,9 +1407,8 @@ def test_e2e_incremental_bucket_keeps_earlier_buckets(
 ) -> None:
     """Adding one bucket to an existing cache must keep listing the earlier ones.
 
-    Regression test for the v0.6 T7 finding: a `--buckets 2048` run on a
-    cache holding S512/S1024 emitted a snippet and model_info.json that
-    listed only 2048.
+    Regression test: a `--buckets 2048` run on a cache holding S512/S1024
+    must not emit a snippet and model_info.json that list only 2048.
     """
     workspace = tmp_path_factory.mktemp("incremental")
     out_dir = workspace / "cache"
@@ -937,15 +1430,17 @@ def test_e2e_incremental_bucket_keeps_earlier_buckets(
         return stdout.getvalue()
 
     first_snippet = run_bucket(E2E_SEQ_LEN)
-    assert sorted(_parse_snippet(first_snippet)["artifacts"]) == [str(E2E_SEQ_LEN)]
+    assert sorted(_commented_buckets(first_snippet)) == [str(E2E_SEQ_LEN)]
     capfd.readouterr()
 
     second_snippet = run_bucket(second_bucket)
 
     stderr = capfd.readouterr().err
     assert f"previously compiled bucket(s) kept: {E2E_SEQ_LEN}" in stderr
-    entry = _parse_snippet(second_snippet)
-    assert sorted(entry["artifacts"], key=int) == [str(E2E_SEQ_LEN), str(second_bucket)]
+    assert sorted(_commented_buckets(second_snippet), key=int) == [
+        str(E2E_SEQ_LEN),
+        str(second_bucket),
+    ]
     model_info = json.loads(
         (out_dir / "compiled" / synthetic_model_dir.name / "model_info.json").read_text(
             encoding="utf-8"
@@ -953,3 +1448,6 @@ def test_e2e_incremental_bucket_keeps_earlier_buckets(
     )
     assert model_info["buckets"] == [E2E_SEQ_LEN, second_bucket]
     assert sorted(model_info["artifacts"], key=int) == [str(E2E_SEQ_LEN), str(second_bucket)]
+    # Neither self-check ran (no --skip-selfcheck override here, but no
+    # selfcheck_fn either): both buckets stay recommended (unmeasured).
+    assert model_info["recommended_buckets"] == [E2E_SEQ_LEN, second_bucket]

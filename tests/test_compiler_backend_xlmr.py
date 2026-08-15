@@ -412,7 +412,7 @@ def test_apply_patches_is_a_no_op() -> None:
     with torch.no_grad():
         before = model(input_ids=input_ids, attention_mask=attention_mask)[0]
 
-    assert backend.apply_patches(_loaded(model)) is None
+    assert backend.apply_patches(_loaded(model)) == {}
 
     with torch.no_grad():
         after = model(input_ids=input_ids, attention_mask=attention_mask)[0]
