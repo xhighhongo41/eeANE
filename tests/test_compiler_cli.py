@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 from pathlib import Path
 
@@ -144,18 +145,36 @@ def test_compile_cli_missing_dependency_exits_1_with_install_hint(
     assert "uv sync --extra compile" in captured.err
 
 
-# --- stub behaviour -----------------------------------------------------
+# --- pipeline hand-off (T2's stub was replaced by the real pipeline in T4) ---
 
 
-def test_compile_cli_stub_exits_2_with_not_implemented_message(
-    capsys: pytest.CaptureFixture,
-) -> None:
-    """With [compile] dependencies installed, `eeane compile` must exit 2 (unimplemented stub)."""
-    exit_code = cli.main(["compile", "some/path"])
+def test_compile_cli_reports_an_unresolvable_source(capsys: pytest.CaptureFixture) -> None:
+    """A source that is neither a directory nor a Hub id must exit 1, without a traceback."""
+    exit_code = cli.main(["compile", "definitely/not/a/model/dir"])
 
-    assert exit_code == 2
+    assert exit_code == 1
     captured = capsys.readouterr()
-    assert "not implemented yet" in captured.err
+    assert "definitely/not/a/model/dir" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_compile_cli_delegates_to_the_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`eeane compile` must hand the parsed namespace to the pipeline and return its code."""
+    from eeane.compiler import pipeline
+
+    received: list[argparse.Namespace] = []
+
+    def fake_run(args: argparse.Namespace) -> int:
+        received.append(args)
+        return 0
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+
+    exit_code = cli.main(["compile", "some/path", "--buckets", "128"])
+
+    assert exit_code == 0
+    assert received[0].source == "some/path"
+    assert received[0].buckets == [128]
 
 
 # --- runtime/torch import isolation ------------------------------------

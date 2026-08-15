@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import sys
 
 # Command shown to the user to install the missing dependencies. Kept as
 # a module-level constant so tests can assert on it without duplicating
@@ -56,19 +55,19 @@ def require_compile_dependencies() -> None:
 
 
 def run_compile(args: argparse.Namespace) -> int:
-    """Run ``eeane compile`` (stub; the real pipeline lands in a later task).
+    """Run ``eeane compile``.
 
     Args:
         args: Parsed ``compile`` subcommand arguments (see
-            :func:`eeane.cli.build_parser`). Unused for now.
+            :func:`eeane.cli.build_parser`).
 
     Returns:
-        Always ``2``, after printing a "not implemented yet" message to
-        stderr.
+        The pipeline's exit code: ``0`` on success, ``1`` when a step
+        failed (the reason is printed to stderr).
     """
-    del args  # unused until the conversion pipeline is implemented (T4)
-    print(
-        "eeane compile: not implemented yet (coming in a later v0.6 task)",
-        file=sys.stderr,
-    )
-    return 2
+    # Deferred: importing the pipeline pulls in torch/transformers/
+    # coremltools, which must not happen before
+    # require_compile_dependencies() had a chance to report them missing.
+    from eeane.compiler import pipeline
+
+    return pipeline.run(args)
