@@ -51,6 +51,7 @@ from eeane.compiler.artifacts import (
     CompileError,
     VariantPlan,
     build_config_snippet,
+    discover_variants,
     ensure_writable_directory,
     model_cache_name,
     model_identifier,
@@ -259,6 +260,24 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     ensure_writable_directory(model_root)
     _progress(f"      output directory: {model_root}")
 
+    # The snippet and model_info.json describe the cache as a whole, not
+    # just this invocation: same-family buckets compiled by earlier runs
+    # stay listed (and the tokenizer is verified for them too).
+    existing = discover_variants(
+        model_root,
+        batch_size=batch_size,
+        attn=args.attn,
+        target=args.target,
+        precision=args.precision,
+    )
+    previous_buckets = sorted(set(existing) - set(buckets))
+    if previous_buckets:
+        _progress(
+            "      previously compiled bucket(s) kept: "
+            + ", ".join(str(bucket) for bucket in previous_buckets)
+        )
+    cache_buckets = sorted(set(existing) | set(buckets))
+
     context = _CompileContext(
         args=args,
         model_dir=model_dir,
@@ -277,21 +296,24 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     # The tokenizer is frozen and verified on every run: it costs seconds
     # and it is what guarantees the served artifacts and the tokenizer
     # agree (v0.6実装計画.md §4.6).
-    freeze_info, freeze_report = _freeze_and_verify(context, buckets)
+    freeze_info, freeze_report = _freeze_and_verify(context, cache_buckets)
 
     plans = _plan_variants(context, buckets)
     _convert_variants(context, plans)
 
+    cache_artifacts = dict(existing)
+    cache_artifacts.update({plan.seq_len: plan.mlmodelc_path for plan in plans})
+
     write_json_record(
         context.model_root / MODEL_INFO_FILENAME,
-        _build_model_info(context, buckets, plans, freeze_info, freeze_report),
+        _build_model_info(context, cache_artifacts, freeze_info, freeze_report),
     )
 
     snippet = build_config_snippet(
         model_id=context.model_id,
         kind=context.kind,
         tokenizer_path=context.tokenizer_path,
-        artifacts={plan.seq_len: plan.mlmodelc_path for plan in plans},
+        artifacts=cache_artifacts,
     )
     _progress("[6/6] Done.")
     if args.emit_config is not None:
@@ -623,8 +645,7 @@ def _build_metadata(
 
 def _build_model_info(
     context: _CompileContext,
-    buckets: Sequence[int],
-    plans: Sequence[VariantPlan],
+    artifacts: Mapping[int, Path],
     freeze_info: Mapping[str, Any],
     freeze_report: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -632,8 +653,9 @@ def _build_model_info(
 
     Args:
         context: Per-invocation state.
-        buckets: Compiled bucket lengths.
-        plans: Variant plans (for the artifact names).
+        artifacts: Bucket -> ``.mlmodelc`` path of every same-family
+            variant now present in the cache (this run's plus the ones
+            kept from earlier runs).
         freeze_info: Result of ``freeze_tokenizer``.
         freeze_report: Result of ``verify_frozen_tokenizer``.
 
@@ -646,7 +668,7 @@ def _build_model_info(
         "id": context.model_id,
         "kind": context.kind,
         "output_name": context.output_name,
-        "buckets": list(buckets),
+        "buckets": sorted(artifacts),
         "tokenizer": TOKENIZER_FILENAME,
         "tokenizer_freeze": {
             "verified": bool(freeze_report.get("passed")),
@@ -659,7 +681,7 @@ def _build_model_info(
             "n_pairs": freeze_report.get("n_pairs"),
             "n_comparisons": freeze_report.get("n_comparisons"),
         },
-        "artifacts": {str(plan.seq_len): plan.mlmodelc_path.name for plan in plans},
+        "artifacts": {str(seq_len): path.name for seq_len, path in sorted(artifacts.items())},
         "eeane_version": __version__,
     }
 

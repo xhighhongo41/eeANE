@@ -251,6 +251,63 @@ def needs_conversion(
     return isinstance(selfcheck, dict) and selfcheck.get("status") == SELFCHECK_STATUS_FAILED
 
 
+def discover_variants(
+    model_root: Path,
+    *,
+    batch_size: int,
+    attn: str,
+    target: str,
+    precision: str,
+) -> dict[int, Path]:
+    """Find previously compiled same-family variants in a model's cache dir.
+
+    An ``eeane compile`` run only converts the buckets it was asked for,
+    but the emitted config snippet and ``model_info.json`` describe the
+    cache as a whole: adding one bucket (e.g. ``--buckets 2048``) must not
+    silently drop the buckets compiled by earlier runs. A variant belongs
+    to the family when its recorded batch size, attention implementation,
+    deployment target, and precision all match the current invocation and
+    its ``.mlmodelc`` still exists on disk.
+
+    Args:
+        model_root: The model's cache directory (holding ``s*.json``
+            variant metadata next to the ``.mlmodelc`` directories).
+        batch_size: Batch size of the current invocation.
+        attn: Attention implementation of the current invocation.
+        target: Deployment target of the current invocation.
+        precision: Compute precision of the current invocation.
+
+    Returns:
+        Mapping of bucket length to the existing ``.mlmodelc`` path.
+        Unreadable or incomplete metadata simply leaves its variant
+        unlisted (fail toward "not present", never an error).
+    """
+    found: dict[int, Path] = {}
+    if not model_root.is_dir():
+        return found
+    for metadata_path in sorted(model_root.glob("s*.json")):
+        try:
+            recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
+            variant = recorded["variant"]
+            recorded_args = recorded["args"]
+            seq_len = int(variant["seq_len"])
+            stem = str(variant["stem"])
+            matches = (
+                int(variant["batch_size"]) == batch_size
+                and recorded_args["attn"] == attn
+                and recorded_args["target"] == target
+                and recorded_args["precision"] == precision
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+        if not matches:
+            continue
+        mlmodelc_path = model_root / f"{stem}.mlmodelc"
+        if mlmodelc_path.is_dir():
+            found[seq_len] = mlmodelc_path
+    return found
+
+
 def build_config_snippet(
     *,
     model_id: str,

@@ -718,3 +718,112 @@ def test_e2e_failing_selfcheck_fails_the_compile(compiled: dict[str, Any]) -> No
     assert artifacts.needs_conversion(
         model_root / f"{E2E_STEM}.mlmodelc", metadata_path, metadata["versions"]
     )
+
+
+# --- incremental bucket discovery (cache-wide snippet/model_info) ------------
+
+
+def _write_family_metadata(
+    directory: Path,
+    seq_len: int,
+    *,
+    batch: int = 1,
+    attn: str = "eager",
+    target: str = "macos13",
+    precision: str = "fp16",
+    with_mlmodelc: bool = True,
+    corrupt: bool = False,
+) -> Path:
+    """Write a fake variant metadata file (and optionally its .mlmodelc)."""
+    stem = artifacts.variant_stem(seq_len, batch, attn, target, precision)
+    metadata_path = directory / f"{stem}.json"
+    if corrupt:
+        metadata_path.write_text("{not json", encoding="utf-8")
+    else:
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "variant": {"stem": stem, "seq_len": seq_len, "batch_size": batch},
+                    "args": {"attn": attn, "target": target, "precision": precision},
+                }
+            ),
+            encoding="utf-8",
+        )
+    mlmodelc_path = directory / f"{stem}.mlmodelc"
+    if with_mlmodelc:
+        mlmodelc_path.mkdir(parents=True, exist_ok=True)
+    return mlmodelc_path
+
+
+def test_discover_variants_lists_only_the_matching_family(tmp_path: Path) -> None:
+    """Same-family variants with an existing .mlmodelc are found; everything else is not."""
+    kept_128 = _write_family_metadata(tmp_path, 128)
+    kept_512 = _write_family_metadata(tmp_path, 512)
+    _write_family_metadata(tmp_path, 256, precision="fp32")  # different family
+    _write_family_metadata(tmp_path, 96, batch=2)  # different family
+    _write_family_metadata(tmp_path, 1024, with_mlmodelc=False)  # artifact gone
+    _write_family_metadata(tmp_path, 64, corrupt=True)  # unreadable metadata
+
+    found = artifacts.discover_variants(
+        tmp_path, batch_size=1, attn="eager", target="macos13", precision="fp16"
+    )
+
+    assert found == {128: kept_128, 512: kept_512}
+
+
+def test_discover_variants_of_a_missing_directory_is_empty(tmp_path: Path) -> None:
+    """A model that was never compiled has no discoverable variants."""
+    found = artifacts.discover_variants(
+        tmp_path / "absent", batch_size=1, attn="eager", target="macos13", precision="fp16"
+    )
+
+    assert found == {}
+
+
+def test_e2e_incremental_bucket_keeps_earlier_buckets(
+    synthetic_model_dir: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    capfd: pytest.CaptureFixture,
+) -> None:
+    """Adding one bucket to an existing cache must keep listing the earlier ones.
+
+    Regression test for the v0.6 T7 finding: a `--buckets 2048` run on a
+    cache holding S512/S1024 emitted a snippet and model_info.json that
+    listed only 2048.
+    """
+    workspace = tmp_path_factory.mktemp("incremental")
+    out_dir = workspace / "cache"
+    second_bucket = E2E_SEQ_LEN + 16
+
+    def run_bucket(bucket: int) -> str:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = pipeline.run(
+                _compile_args(
+                    str(synthetic_model_dir),
+                    "--buckets",
+                    str(bucket),
+                    "--out-dir",
+                    str(out_dir),
+                )
+            )
+        assert exit_code == 0
+        return stdout.getvalue()
+
+    first_snippet = run_bucket(E2E_SEQ_LEN)
+    assert sorted(_parse_snippet(first_snippet)["artifacts"]) == [str(E2E_SEQ_LEN)]
+    capfd.readouterr()
+
+    second_snippet = run_bucket(second_bucket)
+
+    stderr = capfd.readouterr().err
+    assert f"previously compiled bucket(s) kept: {E2E_SEQ_LEN}" in stderr
+    entry = _parse_snippet(second_snippet)
+    assert sorted(entry["artifacts"], key=int) == [str(E2E_SEQ_LEN), str(second_bucket)]
+    model_info = json.loads(
+        (out_dir / "compiled" / synthetic_model_dir.name / "model_info.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert model_info["buckets"] == [E2E_SEQ_LEN, second_bucket]
+    assert sorted(model_info["artifacts"], key=int) == [str(E2E_SEQ_LEN), str(second_bucket)]
