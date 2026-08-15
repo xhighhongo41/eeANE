@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -159,13 +160,21 @@ def test_compile_cli_reports_an_unresolvable_source(capsys: pytest.CaptureFixtur
 
 
 def test_compile_cli_delegates_to_the_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`eeane compile` must hand the parsed namespace to the pipeline and return its code."""
-    from eeane.compiler import pipeline
+    """`eeane compile` must hand the parsed namespace and self-check hook to the pipeline.
+
+    v0.6 T5 wires ``eeane.compiler.selfcheck.run_selfcheck`` in as
+    ``pipeline.run``'s ``selfcheck_fn`` (開発資料/v0.6実装計画.md §4.5); this
+    also pins that ``run_compile`` still returns the pipeline's exit code
+    and still passes the parsed namespace through unchanged.
+    """
+    from eeane.compiler import pipeline, selfcheck
 
     received: list[argparse.Namespace] = []
+    received_selfcheck_fn: list[Any] = []
 
-    def fake_run(args: argparse.Namespace) -> int:
+    def fake_run(args: argparse.Namespace, selfcheck_fn: Any = None) -> int:
         received.append(args)
+        received_selfcheck_fn.append(selfcheck_fn)
         return 0
 
     monkeypatch.setattr(pipeline, "run", fake_run)
@@ -175,6 +184,7 @@ def test_compile_cli_delegates_to_the_pipeline(monkeypatch: pytest.MonkeyPatch) 
     assert exit_code == 0
     assert received[0].source == "some/path"
     assert received[0].buckets == [128]
+    assert received_selfcheck_fn[0] is selfcheck.run_selfcheck
 
 
 # --- runtime/torch import isolation ------------------------------------

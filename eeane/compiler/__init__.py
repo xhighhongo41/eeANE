@@ -65,9 +65,9 @@ def run_compile(args: argparse.Namespace) -> int:
         The pipeline's exit code: ``0`` on success, ``1`` when a step
         failed (the reason is printed to stderr).
     """
-    # Deferred: importing the pipeline pulls in torch/transformers/
-    # coremltools, which must not happen before
+    # Deferred: importing the pipeline (and the self-check hook) pulls in
+    # torch/transformers/coremltools, which must not happen before
     # require_compile_dependencies() had a chance to report them missing.
-    from eeane.compiler import pipeline
+    from eeane.compiler import pipeline, selfcheck
 
-    return pipeline.run(args)
+    return pipeline.run(args, selfcheck_fn=selfcheck.run_selfcheck)
