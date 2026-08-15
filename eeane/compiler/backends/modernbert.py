@@ -23,6 +23,7 @@ requires the ``[compile]`` extra and must never be imported from the
 from __future__ import annotations
 
 import gc
+import json
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,8 @@ from transformers import (
 )
 from transformers.models.modernbert import modeling_modernbert
 
+from eeane.compiler.backends.base import LoadedModel, SanitySpec
+
 # Model kinds understood by this backend.
 KIND_EMBEDDING = "embedding"
 KIND_RERANKER = "reranker"
@@ -44,6 +47,17 @@ SUPPORTED_KINDS: tuple[str, ...] = (KIND_EMBEDDING, KIND_RERANKER)
 
 # Core ML graph output name per kind (embeddings vs raw relevance logits).
 OUTPUT_NAMES: dict[str, str] = {KIND_EMBEDDING: "embedding", KIND_RERANKER: "logits"}
+
+# Pooling this backend's embedding wrapper performs in-graph. Recorded on
+# the loaded handle so later stages can report it without knowing the
+# wrapper's internals.
+EMBEDDING_POOLING = "mean"
+
+# Model directory file and key the effective maximum sequence length is
+# read from. This architecture indexes positions from 0 with no reserved
+# offset, so the configured position budget is the usable length.
+CONFIG_FILENAME = "config.json"
+MAX_POSITION_KEY = "max_position_embeddings"
 
 # Short Japanese sentence used as the example input for torch.jit.trace.
 TRACE_EXAMPLE_TEXT = "これは変換用のサンプル文です。"
@@ -83,9 +97,14 @@ SANITY_PAIRS: list[tuple[str, str]] = [
     ),
 ]
 
-# Indices into SANITY_PAIRS used by the reranker ordering check.
-RELEVANT_PAIR_INDEX = 0
-IRRELEVANT_PAIR_INDEX = 1
+# Sanity fixtures per kind, as handed to the pipeline and the self-check.
+# SANITY_PAIRS is ordered relevant, irrelevant, partially related, so the
+# reranker is expected to score pair 0 above pair 1; embeddings are compared
+# row by row against their own baseline and carry no ordering expectation.
+SANITY_SPECS: dict[str, SanitySpec] = {
+    KIND_EMBEDDING: SanitySpec(inputs=tuple(SANITY_TEXTS)),
+    KIND_RERANKER: SanitySpec(inputs=tuple(SANITY_PAIRS), relevant_index=0, irrelevant_index=1),
+}
 
 # Filler rows used to pad the last sanity batch when the number of sanity
 # inputs is not a multiple of B. The empty strings encode to special tokens
@@ -489,33 +508,23 @@ class RerankerWrapper(torch.nn.Module):
 class ModernBertBackend:
     """Compile backend for the ModernBERT architecture family.
 
-    Provisional v0.6 interface (v0.6実装計画.md §4.2): the methods are the
-    minimum ``pipeline.py`` needs to convert ModernBERT, deliberately not
-    generalised into an abstract base class -- the real multi-architecture
-    interface is decided in v0.7. Every method is stateless; the caller
-    owns the loaded model and tokenizer.
-
-    Typical call order::
-
-        model, tokenizer = backend.load(model_dir, kind)
-        backend.apply_patches(model)
-        wrapper = backend.wrap(model, kind)
-        example = backend.tokenize(
-            tokenizer, kind, [backend.trace_example(kind)] * batch, seq_len
-        )
+    Implements the backend interface declared in
+    :mod:`eeane.compiler.backends.base`, which documents what each member
+    is for, in which order the pipeline calls them, and the rules an
+    implementation must follow. Every method is stateless: all per-model
+    state travels in the :class:`~eeane.compiler.backends.base.LoadedModel`
+    handle, so one instance can serve several compile runs.
     """
 
     name = "ModernBert"
     supported_kinds: tuple[str, ...] = SUPPORTED_KINDS
 
-    def load(
-        self, model_dir: Path, kind: str, attn: str = "eager"
-    ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    def load(self, model_dir: Path, kind: str, attn: str = "eager") -> LoadedModel:
         """Load the FP32 model and its tokenizer from a HF model directory.
 
         Args:
-            model_dir: Local HuggingFace-format model directory (read-only,
-                v0.6実装計画.md §2-11).
+            model_dir: Local HuggingFace-format model directory. It is
+                only ever read from.
             kind: ``"embedding"`` (``AutoModel``) or ``"reranker"``
                 (``AutoModelForSequenceClassification``).
             attn: Attention implementation to request. ``"eager"`` is the
@@ -523,9 +532,10 @@ class ModernBertBackend:
                 for the FP32 reference.
 
         Returns:
-            Tuple of the model in eval/FP32 mode with
+            A handle holding the model in eval/FP32 mode with
             ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
-            outputs) and its tokenizer.
+            outputs), its tokenizer, its configuration and the pooling the
+            embedding wrapper applies.
 
         Raises:
             ValueError: If ``kind`` is not supported by this backend.
@@ -535,31 +545,40 @@ class ModernBertBackend:
         loader = AutoModel if kind == KIND_EMBEDDING else AutoModelForSequenceClassification
         model = loader.from_pretrained(model_dir, attn_implementation=attn, dtype=torch.float32)
         model.config.return_dict = False
-        return model.eval(), tokenizer
+        return LoadedModel(
+            model=model.eval(),
+            tokenizer=tokenizer,
+            config=model.config,
+            model_dir=model_dir,
+            kind=kind,
+            attn=attn,
+            pooling=EMBEDDING_POOLING if kind == KIND_EMBEDDING else None,
+        )
 
-    def apply_patches(self, model: PreTrainedModel, mask_fill_value: float | None = None) -> None:
+    def apply_patches(self, loaded: LoadedModel, mask_fill_value: float | None = None) -> None:
         """Apply the mandatory (and optional) ModernBERT graph patches.
 
         ``patch_rotate_half`` and ``patch_eager_attention_rank4`` are
         mandatory constituents of the conversion, applied at every batch
         size so that one graph shape is produced instead of mixing rank-5
-        (B=1) and rank-4 (B>1) variants (v0.6実装計画.md §2-1). Both patch
-        global ``transformers`` symbols, so they affect every ModernBert
-        instance in the process; both are semantically equivalent to
-        upstream, and re-applying them is harmless.
+        (B=1) and rank-4 (B>1) variants. Both patch global
+        ``transformers`` symbols, so they affect every ModernBert instance
+        in the process; both are semantically equivalent to upstream, and
+        re-applying them is harmless.
 
         Args:
-            model: Model returned by :meth:`load`.
+            loaded: Handle returned by :meth:`load`.
             mask_fill_value: Optional finite attention-mask fill value; when
                 given, :func:`patch_mask_fill_value` is applied to the
-                backbone of ``model``.
+                backbone of the loaded model.
 
         Raises:
             ValueError: If the RoPE head dimension is odd (which would make
                 the ``chunk``-based ``rotate_half`` rewrite inexact), or if
                 no ModernBert backbone can be found for the mask patch.
         """
-        head_dim = model.config.hidden_size // model.config.num_attention_heads
+        config = loaded.config
+        head_dim = config.hidden_size // config.num_attention_heads
         if head_dim % 2 != 0:
             raise ValueError(
                 f"odd RoPE head dim ({head_dim}) is incompatible with patch_rotate_half"
@@ -567,25 +586,24 @@ class ModernBertBackend:
         patch_rotate_half()
         patch_eager_attention_rank4()
         if mask_fill_value is not None:
-            patch_mask_fill_value(_resolve_backbone(model), mask_fill_value)
+            patch_mask_fill_value(_resolve_backbone(loaded.model), mask_fill_value)
 
-    def wrap(self, model: PreTrainedModel, kind: str) -> torch.nn.Module:
-        """Wrap the loaded model into the traceable module for ``kind``.
+    def wrap(self, loaded: LoadedModel) -> torch.nn.Module:
+        """Wrap the loaded model into the traceable module for its kind.
 
         Args:
-            model: Model returned by :meth:`load`.
-            kind: Model kind.
+            loaded: Handle returned by :meth:`load`.
 
         Returns:
             :class:`EmbeddingWrapper` (in-graph mean pooling) or
             :class:`RerankerWrapper` (raw logits), in eval mode.
 
         Raises:
-            ValueError: If ``kind`` is not supported by this backend.
+            ValueError: If ``loaded.kind`` is not supported by this backend.
         """
-        self._check_kind(kind)
-        wrapper_class = EmbeddingWrapper if kind == KIND_EMBEDDING else RerankerWrapper
-        return wrapper_class(model).eval()
+        self._check_kind(loaded.kind)
+        wrapper_class = EmbeddingWrapper if loaded.kind == KIND_EMBEDDING else RerankerWrapper
+        return wrapper_class(loaded.model).eval()
 
     def output_name(self, kind: str) -> str:
         """Return the Core ML graph output name used for ``kind``.
@@ -595,6 +613,37 @@ class ModernBertBackend:
         """
         self._check_kind(kind)
         return OUTPUT_NAMES[kind]
+
+    def max_seq_len(self, model_dir: Path) -> int | None:
+        """Return the effective maximum sequence length of ``model_dir``.
+
+        Positions are indexed from 0 with no reserved offset, so the
+        configured position budget is the usable sequence length. Only
+        ``config.json`` is read; no weights are loaded.
+
+        Args:
+            model_dir: Local HuggingFace-format model directory.
+
+        Returns:
+            The configured positive position budget, or ``None`` when the
+            file is absent/unreadable/unparsable or the value is missing
+            or not a positive integer. ``None`` means "unknown", and the
+            caller then imposes no limit.
+        """
+        try:
+            raw = (model_dir / CONFIG_FILENAME).read_text(encoding="utf-8")
+            config = json.loads(raw)
+        except (OSError, ValueError):
+            # A malformed config is reported by the dispatch step; an
+            # optional bucket check must not turn it into a second error.
+            return None
+        if not isinstance(config, dict):
+            return None
+        value = config.get(MAX_POSITION_KEY)
+        # bool is a subclass of int, but a JSON ``true`` is not a length.
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        return value
 
     def trace_example(self, kind: str) -> Any:
         """Return the fixed raw example input used for ``torch.jit.trace``.
@@ -613,18 +662,19 @@ class ModernBertBackend:
         self._check_kind(kind)
         return TRACE_EXAMPLE_TEXT if kind == KIND_EMBEDDING else TRACE_EXAMPLE_PAIR
 
-    def sanity_inputs(self, kind: str) -> list[Any]:
-        """Return the fixed raw sanity-check inputs for ``kind``.
+    def sanity_spec(self, kind: str) -> SanitySpec:
+        """Return the fixed sanity-check inputs and metadata for ``kind``.
 
         Returns:
-            A fresh list of sentences (embedding) or (query, document)
-            pairs (reranker); callers may mutate it freely.
+            The immutable specification for ``kind``: sentences for an
+            embedding model, (query, document) pairs plus the expected
+            relevant/irrelevant indices for a reranker.
 
         Raises:
             ValueError: If ``kind`` is not supported by this backend.
         """
         self._check_kind(kind)
-        return list(SANITY_TEXTS) if kind == KIND_EMBEDDING else list(SANITY_PAIRS)
+        return SANITY_SPECS[kind]
 
     def padding_input(self, kind: str) -> Any:
         """Return the filler input used to pad a partial batch.
@@ -636,13 +686,14 @@ class ModernBertBackend:
         return BATCH_PADDING_TEXT if kind == KIND_EMBEDDING else BATCH_PADDING_PAIR
 
     def tokenize(
-        self, tokenizer: PreTrainedTokenizerBase, kind: str, inputs: list[Any], seq_len: int
+        self, loaded: LoadedModel, inputs: list[Any], seq_len: int
     ) -> dict[str, np.ndarray]:
         """Tokenize raw inputs into fixed-shape int32 Core ML arrays.
 
         Args:
-            tokenizer: Tokenizer returned by :meth:`load`.
-            kind: Model kind, selecting single-sequence vs pair encoding.
+            loaded: Handle returned by :meth:`load`; its tokenizer encodes
+                the inputs and its kind selects single-sequence vs pair
+                encoding.
             inputs: Sentences (embedding) or (query, document) pairs
                 (reranker).
             seq_len: Fixed sequence length S.
@@ -652,17 +703,17 @@ class ModernBertBackend:
             ``(len(inputs), seq_len)`` and dtype ``np.int32``.
 
         Raises:
-            ValueError: If ``kind`` is unsupported, ``inputs`` is empty, or
-                ``seq_len`` is not positive.
+            ValueError: If ``loaded.kind`` is unsupported, ``inputs`` is
+                empty, or ``seq_len`` is not positive.
         """
-        self._check_kind(kind)
+        self._check_kind(loaded.kind)
         if not inputs:
             raise ValueError("no inputs to tokenize")
         if seq_len <= 0:
             raise ValueError(f"seq_len must be a positive integer (got {seq_len})")
-        if kind == KIND_EMBEDDING:
-            return tokenize_batch(tokenizer, list(inputs), seq_len)
-        return tokenize_pairs(tokenizer, [(query, doc) for query, doc in inputs], seq_len)
+        if loaded.kind == KIND_EMBEDDING:
+            return tokenize_batch(loaded.tokenizer, list(inputs), seq_len)
+        return tokenize_pairs(loaded.tokenizer, [(query, doc) for query, doc in inputs], seq_len)
 
     def reference_outputs(
         self, model_dir: Path, kind: str, inputs: list[Any], seq_len: int
@@ -690,13 +741,15 @@ class ModernBertBackend:
         self._check_kind(kind)
         if not inputs:
             raise ValueError("no inputs to score")
-        model, tokenizer = self.load(model_dir, kind, attn="sdpa")
+        loaded = self.load(model_dir, kind, attn="sdpa")
         try:
             if kind == KIND_EMBEDDING:
-                return encode_pytorch(model, tokenizer, list(inputs), seq_len)
-            return score_pytorch(model, tokenizer, [(q, d) for q, d in inputs], seq_len)
+                return encode_pytorch(loaded.model, loaded.tokenizer, list(inputs), seq_len)
+            return score_pytorch(
+                loaded.model, loaded.tokenizer, [(q, d) for q, d in inputs], seq_len
+            )
         finally:
-            del model
+            del loaded
             gc.collect()
 
     def _check_kind(self, kind: str) -> None:

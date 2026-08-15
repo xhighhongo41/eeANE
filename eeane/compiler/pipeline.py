@@ -214,8 +214,9 @@ def verification_inputs(
     texts: list[str] = [*_VERIFICATION_BOUNDARY_TEXTS, long_text]
     pairs: list[tuple[str, str]] = []
 
+    sanity_inputs = list(backend.sanity_spec(kind).inputs)
     if kind == "reranker":
-        sanity_pairs = [(query, document) for query, document in backend.sanity_inputs(kind)]
+        sanity_pairs = [(query, document) for query, document in sanity_inputs]
         trace_pair = tuple(backend.trace_example(kind))
         pairs = [*sanity_pairs, trace_pair, ("", ""), ("a", long_text)]
         # The single-sequence path is verified too: both halves of every
@@ -223,7 +224,7 @@ def verification_inputs(
         for query, document in pairs:
             texts += [query, document]
     else:
-        texts += backend.sanity_inputs(kind)
+        texts += sanity_inputs
         texts.append(backend.trace_example(kind))
 
     return list(dict.fromkeys(texts)), list(dict.fromkeys(pairs))
@@ -253,6 +254,7 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     buckets = resolve_buckets(args.buckets, kind)
     _progress(f"      model directory : {model_dir}")
     _progress(f"      architecture    : {dispatch.architecture} -> {dispatch.backend_name}")
+    buckets = _apply_max_seq_len(backend, model_dir, buckets, explicit=args.buckets is not None)
     _progress(f"      kind / buckets  : {kind} / {', '.join(str(b) for b in buckets)}")
 
     out_root = resolve_out_root(args.out_dir)
@@ -324,6 +326,61 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     return 0
 
 
+def _apply_max_seq_len(
+    backend: Any, model_dir: Path, buckets: Sequence[int], *, explicit: bool
+) -> list[int]:
+    """Reject or drop buckets the model cannot process.
+
+    A bucket longer than the model's effective maximum sequence length
+    would either fail during conversion or silently produce a graph the
+    model was never trained for. An explicit ``--buckets`` value is the
+    user's decision, so a violation is reported; the kind-specific
+    defaults are not, so they are clipped and the clipping is announced.
+
+    Args:
+        backend: Loaded compile backend instance.
+        model_dir: Read-only model directory the limit is read from.
+        buckets: Resolved bucket lengths, ascending.
+        explicit: Whether ``buckets`` came from an explicit ``--buckets``
+            value rather than from the kind defaults.
+
+    Returns:
+        The buckets to compile: ``buckets`` unchanged when the model has
+        no known limit or every bucket fits, else the ones that fit.
+
+    Raises:
+        CompileError: If an explicitly requested bucket exceeds the limit,
+            or if clipping would leave nothing to compile.
+    """
+    limit = backend.max_seq_len(model_dir)
+    if limit is None:
+        # The backend cannot determine a limit; nothing to enforce.
+        return list(buckets)
+
+    too_long = [bucket for bucket in buckets if bucket > limit]
+    if not too_long:
+        return list(buckets)
+
+    offending = ", ".join(str(bucket) for bucket in too_long)
+    if explicit:
+        raise CompileError(
+            f"--buckets asks for {offending}, but the model's maximum sequence length "
+            f"is {limit}; request buckets of at most {limit}"
+        )
+
+    kept = [bucket for bucket in buckets if bucket <= limit]
+    for bucket in too_long:
+        _progress(
+            f"      bucket {bucket} dropped: exceeds the model's max sequence length ({limit})"
+        )
+    if not kept:
+        raise CompileError(
+            f"every default bucket ({offending}) exceeds the model's maximum sequence "
+            f"length ({limit}); rerun with --buckets set to at most {limit}"
+        )
+    return kept
+
+
 def _convert_variants(context: _CompileContext, plans: Sequence[VariantPlan]) -> None:
     """Convert every planned variant, loading the model at most once.
 
@@ -353,10 +410,8 @@ def _convert_variants(context: _CompileContext, plans: Sequence[VariantPlan]) ->
     _progress(f"      loading the model in FP32 (attn={context.args.attn}) and applying patches")
     step = time.perf_counter()
     try:
-        model, tokenizer = context.backend.load(
-            context.model_dir, context.kind, attn=context.args.attn
-        )
-        context.backend.apply_patches(model)
+        loaded = context.backend.load(context.model_dir, context.kind, attn=context.args.attn)
+        context.backend.apply_patches(loaded)
     except Exception as exc:
         raise CompileError(f"failed to load the model from '{context.model_dir}': {exc}") from exc
     load_seconds = time.perf_counter() - step
@@ -364,19 +419,19 @@ def _convert_variants(context: _CompileContext, plans: Sequence[VariantPlan]) ->
 
     try:
         for plan in pending:
-            _convert_variant(context, plan, model, tokenizer, load_seconds)
+            _convert_variant(context, plan, loaded, load_seconds)
     finally:
-        # ~1.2 GB of FP32 weights for a 310M model: release them as soon
-        # as the last bucket is done (or the first one failed).
-        del model
+        # ~1.2 GB of FP32 weights for a 310M model: dropping the handle
+        # releases the model and its tokenizer as soon as the last bucket
+        # is done (or the first one failed).
+        del loaded
         gc.collect()
 
 
 def _convert_variant(
     context: _CompileContext,
     plan: VariantPlan,
-    model: Any,
-    tokenizer: Any,
+    loaded: Any,
     load_seconds: float,
 ) -> None:
     """Trace, convert, compile and describe one bucket.
@@ -384,8 +439,8 @@ def _convert_variant(
     Args:
         context: Per-invocation state.
         plan: The variant to build.
-        model: Loaded and patched PyTorch model.
-        tokenizer: Tokenizer that came with ``model``.
+        loaded: Handle of the loaded and patched model (the backend's
+            ``LoadedModel``).
         load_seconds: Shared model-loading time, recorded in the metadata
             of every variant of this run.
 
@@ -401,12 +456,11 @@ def _convert_variant(
         f"({context.batch_size}, {plan.seq_len}) example"
     )
     try:
-        wrapper = context.backend.wrap(model, context.kind)
+        wrapper = context.backend.wrap(loaded)
         # The single trace example is replicated to B rows so the traced
         # graph already carries the target batch size (PoC behaviour).
         example = context.backend.tokenize(
-            tokenizer,
-            context.kind,
+            loaded,
             [context.backend.trace_example(context.kind)] * context.batch_size,
             plan.seq_len,
         )

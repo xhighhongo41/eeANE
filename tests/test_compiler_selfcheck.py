@@ -33,6 +33,7 @@ from transformers.models.modernbert import modeling_modernbert
 
 from eeane import cli, runtime
 from eeane.compiler import pipeline, selfcheck
+from eeane.compiler.backends import base
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -78,24 +79,40 @@ def _build_toy_tokenizer(path: Path) -> None:
 class _FakeBackend:
     """Minimal, fully controllable stand-in for a compile backend."""
 
-    def __init__(self, kind: str, sanity: list[Any], padding: Any, reference: np.ndarray) -> None:
+    def __init__(
+        self,
+        kind: str,
+        sanity: list[Any],
+        padding: Any,
+        reference: np.ndarray,
+        *,
+        ordering: bool = True,
+    ) -> None:
         """Store the fixed fixtures this fake backend serves.
 
         Args:
             kind: Model kind the fake backend answers for.
-            sanity: Value returned by :meth:`sanity_inputs`.
+            sanity: Inputs of the :class:`~eeane.compiler.backends.base.SanitySpec`
+                returned by :meth:`sanity_spec`.
             padding: Value returned by :meth:`padding_input`.
             reference: Value returned by :meth:`reference_outputs`.
+            ordering: Whether a reranker's spec declares the
+                relevant/irrelevant indices (index 0 / index 1) its
+                ordering check needs. An embedding spec never declares
+                them, as in a real backend.
         """
         self._kind = kind
         self._sanity = sanity
         self._padding = padding
         self._reference = reference
+        self._ordering = ordering
 
-    def sanity_inputs(self, kind: str) -> list[Any]:
-        """Return the fixed sanity fixtures, asserting the expected kind."""
+    def sanity_spec(self, kind: str) -> base.SanitySpec:
+        """Return the fixed sanity specification, asserting the expected kind."""
         assert kind == self._kind
-        return list(self._sanity)
+        if kind != "reranker" or not self._ordering:
+            return base.SanitySpec(inputs=tuple(self._sanity))
+        return base.SanitySpec(inputs=tuple(self._sanity), relevant_index=0, irrelevant_index=1)
 
     def padding_input(self, kind: str) -> Any:
         """Return the fixed padding fixture, asserting the expected kind."""
@@ -118,17 +135,21 @@ def _make_context(
     reference: np.ndarray,
     seq_len: int = 16,
     batch_size: int = 1,
+    ordering: bool = True,
 ) -> tuple[pipeline.SelfcheckContext, runtime.FrozenTokenizer]:
     """Build a :class:`~eeane.compiler.pipeline.SelfcheckContext` for a unit test.
 
     Args:
         tmp_path: Test-scoped scratch directory.
         kind: ``"embedding"`` or ``"reranker"``.
-        sanity_inputs: Fixture served by the fake backend's ``sanity_inputs``.
+        sanity_inputs: Inputs of the spec served by the fake backend's
+            ``sanity_spec``.
         padding_input: Fixture served by the fake backend's ``padding_input``.
         reference: Fixture served by the fake backend's ``reference_outputs``.
         seq_len: Fixed sequence length S.
         batch_size: Fixed batch size B.
+        ordering: Whether the fake reranker spec declares the expected
+            relevant/irrelevant pair indices.
 
     Returns:
         Tuple of the context and the frozen tokenizer it points to (handed
@@ -139,7 +160,7 @@ def _make_context(
     frozen = runtime.load_frozen_tokenizer(tokenizer_path)
     mlmodelc_path = tmp_path / "variant.mlmodelc"
     mlmodelc_path.mkdir()
-    backend = _FakeBackend(kind, sanity_inputs, padding_input, reference)
+    backend = _FakeBackend(kind, sanity_inputs, padding_input, reference, ordering=ordering)
     context = pipeline.SelfcheckContext(
         backend=backend,
         model_dir=tmp_path,
@@ -498,9 +519,64 @@ def test_run_selfcheck_reranker_passed(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     assert report["status"] == selfcheck.STATUS_PASSED
     assert report["sanity"]["passed"] is True
+    assert report["sanity"]["ordering_checked"] is True
     assert report["sanity"]["ordering_ok_coreml"] is True
     assert report["sanity"]["ordering_ok_fp32"] is True
     assert report["sanity"]["sigmoid_max_abs_diff"] == pytest.approx(0.0)
+    json.dumps(report)
+
+
+def test_run_selfcheck_reranker_failed_on_wrong_ordering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A compiled model ranking the irrelevant pair higher must fail the sanity check."""
+    sanity_pairs = [("q-relevant", "d-relevant"), ("q-irrelevant", "d-irrelevant")]
+    reference = np.array([2.0, -2.0], dtype=np.float32)
+    context, frozen = _make_context(tmp_path, "reranker", sanity_pairs, ("", ""), reference)
+    rows = runtime.tokenize_pairs(frozen, sanity_pairs, context.seq_len)["input_ids"]
+    # The compiled model returns the two logits swapped, so the relevant
+    # pair scores lower than the irrelevant one.
+    row_outputs = {
+        _row_key(rows[0]): np.array([reference[1]], dtype=np.float32),
+        _row_key(rows[1]): np.array([reference[0]], dtype=np.float32),
+    }
+    _install_row_predict(monkeypatch, "logits", row_outputs)
+    _install_compute_plan(monkeypatch, _build_fake_plan(ne_count=99, cpu_count=1))
+
+    report = selfcheck.run_selfcheck(context)
+
+    assert report["status"] == selfcheck.STATUS_FAILED
+    assert report["sanity"]["ordering_checked"] is True
+    assert report["sanity"]["ordering_ok_coreml"] is False
+    assert report["sanity"]["ordering_ok_fp32"] is True
+    assert report["sanity"]["passed"] is False
+    json.dumps(report)
+
+
+def test_run_selfcheck_reranker_without_ordering_metadata_skips_that_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A spec without relevant/irrelevant indices must record the skip, not crash or fail."""
+    sanity_pairs = [("q-a", "d-a"), ("q-b", "d-b")]
+    reference = np.array([2.0, -2.0], dtype=np.float32)
+    context, frozen = _make_context(
+        tmp_path, "reranker", sanity_pairs, ("", ""), reference, ordering=False
+    )
+    rows = runtime.tokenize_pairs(frozen, sanity_pairs, context.seq_len)["input_ids"]
+    row_outputs = {
+        _row_key(rows[i]): np.array([reference[i]], dtype=np.float32)
+        for i in range(len(sanity_pairs))
+    }
+    _install_row_predict(monkeypatch, "logits", row_outputs)
+    _install_compute_plan(monkeypatch, _build_fake_plan(ne_count=99, cpu_count=1))
+
+    report = selfcheck.run_selfcheck(context)
+
+    assert report["status"] == selfcheck.STATUS_PASSED
+    assert report["sanity"]["ordering_checked"] is False
+    assert report["sanity"]["ordering_ok_coreml"] is None
+    assert report["sanity"]["ordering_ok_fp32"] is None
+    assert report["sanity"]["passed"] is True
     json.dumps(report)
 
 

@@ -47,7 +47,6 @@ import numpy as np
 
 from eeane import runtime
 from eeane.compiler import conversion
-from eeane.compiler.backends import modernbert as mb
 
 if TYPE_CHECKING:
     from eeane.compiler.pipeline import SelfcheckContext
@@ -178,7 +177,7 @@ def _sanity_embedding(
     context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Accuracy sanity check for an embedding variant (ported from poc/convert_embedding.py)."""
-    raw_texts: list[str] = context.backend.sanity_inputs(context.kind)
+    raw_texts: list[str] = list(context.backend.sanity_spec(context.kind).inputs)
     tokens = runtime.tokenize_texts(frozen_tokenizer, raw_texts, context.seq_len)
     padding = runtime.tokenize_texts(
         frozen_tokenizer, [context.backend.padding_input(context.kind)], context.seq_len
@@ -222,8 +221,15 @@ def _sanity_embedding(
 def _sanity_reranker(
     context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    """Accuracy sanity check for a reranker variant (ported from poc/convert_reranker.py)."""
-    raw_pairs: list[tuple[str, str]] = context.backend.sanity_inputs(context.kind)
+    """Accuracy sanity check for a reranker variant (ported from poc/convert_reranker.py).
+
+    The expected ordering comes from the backend's sanity specification;
+    when it declares no relevant/irrelevant pair, the ordering check is
+    skipped and the report says so (``ordering_checked``) instead of
+    silently passing an unperformed check.
+    """
+    spec = context.backend.sanity_spec(context.kind)
+    raw_pairs: list[tuple[str, str]] = [(query, document) for query, document in spec.inputs]
     tokens = runtime.tokenize_pairs(frozen_tokenizer, raw_pairs, context.seq_len)
     padding = runtime.tokenize_pairs(
         frozen_tokenizer, [context.backend.padding_input(context.kind)], context.seq_len
@@ -249,12 +255,9 @@ def _sanity_reranker(
     fp32_scores = runtime.sigmoid(fp32_logits)
     abs_diff = np.abs(coreml_scores - fp32_scores)
     finite = bool(np.isfinite(coreml_logits).all() and np.isfinite(fp32_logits).all())
-    ordering_coreml = bool(
-        coreml_scores[mb.RELEVANT_PAIR_INDEX] > coreml_scores[mb.IRRELEVANT_PAIR_INDEX]
-    )
-    ordering_fp32 = bool(
-        fp32_scores[mb.RELEVANT_PAIR_INDEX] > fp32_scores[mb.IRRELEVANT_PAIR_INDEX]
-    )
+    ordering_checked = spec.relevant_index is not None and spec.irrelevant_index is not None
+    ordering_coreml = _check_ordering(coreml_scores, spec)
+    ordering_fp32 = _check_ordering(fp32_scores, spec)
     max_abs_diff = float(abs_diff.max())
     sanity = {
         "output_key": output_key,
@@ -266,6 +269,7 @@ def _sanity_reranker(
         "sigmoid_abs_diff": [float(v) for v in abs_diff],
         "sigmoid_max_abs_diff": max_abs_diff,
         "sigmoid_tolerance": SANITY_SIGMOID_TOLERANCE,
+        "ordering_checked": ordering_checked,
         "ordering_ok_coreml": ordering_coreml,
         "ordering_ok_fp32": ordering_fp32,
         "batch_consistency": consistency,
@@ -273,12 +277,30 @@ def _sanity_reranker(
         "passed": (
             finite
             and max_abs_diff <= SANITY_SIGMOID_TOLERANCE
-            and ordering_coreml
-            and ordering_fp32
+            and (not ordering_checked or (bool(ordering_coreml) and bool(ordering_fp32)))
             and (consistency is None or bool(consistency["passed"]))
         ),
     }
     return sanity, _first_predict_batch(tokens, padding, context.batch_size)
+
+
+def _check_ordering(scores: np.ndarray, spec: Any) -> bool | None:
+    """Report whether the relevant input scored above the irrelevant one.
+
+    Args:
+        scores: One score per sanity input, in the spec's own order.
+        spec: The backend's sanity specification
+            (:class:`eeane.compiler.backends.base.SanitySpec`).
+
+    Returns:
+        ``True``/``False`` when the spec declares both the relevant and
+        the irrelevant index, ``None`` when it declares no expected
+        ordering (nothing to check).
+    """
+    relevant, irrelevant = spec.relevant_index, spec.irrelevant_index
+    if relevant is None or irrelevant is None:
+        return None
+    return bool(scores[relevant] > scores[irrelevant])
 
 
 def _fill_batch(rows: np.ndarray, padding_row: np.ndarray, batch_size: int) -> np.ndarray:

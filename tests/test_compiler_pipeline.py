@@ -389,7 +389,7 @@ def test_verification_inputs_are_self_contained_for_an_embedding_model() -> None
     assert any(len(text) == 1 for text in texts)  # single character
     assert max(len(text) for text in texts) > 4 * 128  # far longer than the bucket
     assert all(isinstance(text, str) for text in texts)
-    assert set(backend.sanity_inputs("embedding")).issubset(texts)
+    assert set(backend.sanity_spec("embedding").inputs).issubset(texts)
     assert pairs == []  # an embedding model never encodes pairs
 
 
@@ -402,7 +402,7 @@ def test_verification_inputs_include_pairs_for_a_reranker() -> None:
     assert texts and "" in texts
     assert ("", "") in pairs
     assert all(len(pair) == 2 for pair in pairs)
-    assert set(backend.sanity_inputs("reranker")).issubset(pairs)
+    assert set(backend.sanity_spec("reranker").inputs).issubset(pairs)
 
 
 def test_verification_long_input_scales_with_the_largest_bucket() -> None:
@@ -468,6 +468,132 @@ def test_run_reports_an_unusable_out_dir(tmp_path: Path, capsys: pytest.CaptureF
 
     assert exit_code == 1
     assert "director" in capsys.readouterr().err
+
+
+# --- buckets vs the model's maximum sequence length --------------------------
+
+
+class _LimitBackend:
+    """Backend stub answering only the bucket-validation questions."""
+
+    name = "Stub"
+    supported_kinds: tuple[str, ...] = ("embedding", "reranker")
+
+    def __init__(self, limit: int | None) -> None:
+        """Store the effective maximum sequence length to report.
+
+        Args:
+            limit: Value returned by :meth:`max_seq_len` (``None`` = no
+                known limit).
+        """
+        self._limit = limit
+        self.seen: list[Path] = []
+
+    def max_seq_len(self, model_dir: Path) -> int | None:
+        """Record the queried directory and return the fixed limit."""
+        self.seen.append(model_dir)
+        return self._limit
+
+    def output_name(self, kind: str) -> str:
+        """Return the graph output name of ``kind`` (embedding-style stub)."""
+        return "logits" if kind == "reranker" else "embedding"
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_buckets_within_the_model_limit_are_kept(
+    explicit: bool, capsys: pytest.CaptureFixture
+) -> None:
+    """Buckets the model can actually process must pass through untouched and silently."""
+    backend = _LimitBackend(1024)
+
+    resolved = pipeline._apply_max_seq_len(
+        backend, Path("/models/example"), [128, 512, 1024], explicit=explicit
+    )
+
+    assert resolved == [128, 512, 1024]
+    assert backend.seen == [Path("/models/example")]
+    assert "dropped" not in capsys.readouterr().err
+
+
+def test_explicit_buckets_beyond_the_model_limit_are_an_error() -> None:
+    """A user-requested bucket the model cannot process must be reported, not silently changed."""
+    backend = _LimitBackend(512)
+
+    with pytest.raises(artifacts.CompileError) as excinfo:
+        pipeline._apply_max_seq_len(
+            backend, Path("/models/example"), [128, 512, 1024, 2048], explicit=True
+        )
+
+    message = str(excinfo.value)
+    assert "512" in message  # the model's effective maximum
+    assert "1024" in message and "2048" in message  # every offending bucket
+
+
+def test_default_buckets_beyond_the_model_limit_are_dropped_with_a_message(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Default buckets must be clipped to what the model supports, visibly."""
+    backend = _LimitBackend(512)
+
+    resolved = pipeline._apply_max_seq_len(
+        backend, Path("/models/example"), [128, 512, 1024], explicit=False
+    )
+
+    assert resolved == [128, 512]
+    stderr = capsys.readouterr().err
+    assert "bucket 1024 dropped" in stderr
+    assert "512" in stderr
+
+
+def test_an_unknown_maximum_sequence_length_skips_the_validation() -> None:
+    """A backend that cannot determine the limit must not block any bucket."""
+    backend = _LimitBackend(None)
+
+    resolved = pipeline._apply_max_seq_len(
+        backend, Path("/models/example"), [128, 99999], explicit=True
+    )
+
+    assert resolved == [128, 99999]
+
+
+def test_dropping_every_default_bucket_is_an_error() -> None:
+    """Clipping must never leave the pipeline with nothing to compile."""
+    backend = _LimitBackend(64)
+
+    with pytest.raises(artifacts.CompileError, match="64"):
+        pipeline._apply_max_seq_len(backend, Path("/models/example"), [128, 512], explicit=False)
+
+
+def test_run_reports_explicit_buckets_beyond_the_model_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The bucket check must fail the run cleanly, before anything is loaded or written."""
+    source = tmp_path / "model"
+    source.mkdir()
+    out_dir = tmp_path / "cache"
+
+    class _StubDispatch:
+        """Dispatch result pointing at the limit-reporting stub backend."""
+
+        architecture = "StubModel"
+        backend_name = "Stub"
+        kind = "embedding"
+
+        def load_backend(self) -> Any:
+            """Return the stub backend instance."""
+            return _LimitBackend(512)
+
+    monkeypatch.setattr(pipeline, "resolve_dispatch", lambda model_dir, kind: _StubDispatch())
+
+    exit_code = pipeline.run(
+        _compile_args(str(source), "--buckets", "1024", "--out-dir", str(out_dir))
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "1024" in stderr and "512" in stderr
+    assert "Traceback" not in stderr
+    assert not out_dir.exists()  # nothing was written
 
 
 # --- end-to-end on a synthetic ModernBERT (local only) -----------------------
