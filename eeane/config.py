@@ -421,7 +421,9 @@ def _load_from_file(path: Path) -> EeaneConfig:
     except OSError as exc:
         raise ConfigError(f"Failed to read config file '{path}': {exc}") from exc
 
-    _resolve_relative_paths(raw, base_dir=path.parent)
+    # path may itself be relative (e.g. --config eeane.example.toml), so
+    # resolve it first: model paths must come out absolute either way.
+    _resolve_relative_paths(raw, base_dir=path.resolve().parent)
 
     try:
         return EeaneConfig(**raw)

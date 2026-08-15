@@ -177,6 +177,21 @@ def test_relative_paths_resolve_against_config_file_directory(tmp_path: Path) ->
     assert embedding.artifacts[256] == tmp_path / "compiled" / "emb-only" / "s256.mlmodelc"
 
 
+def test_relative_config_path_still_yields_absolute_model_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CWD-relative --config path must still absolutize the model paths."""
+    _write_toml(tmp_path / "eeane.toml", _MINIMAL_TOML)
+    monkeypatch.chdir(tmp_path)
+
+    loaded = load_config(explicit_path=Path("eeane.toml"), env={})
+
+    embedding = loaded.config.embedding_model
+    assert embedding.model_dir.is_absolute()
+    assert embedding.model_dir == tmp_path / "models" / "emb-only"
+    assert embedding.artifacts[256] == tmp_path / "compiled" / "emb-only" / "s256.mlmodelc"
+
+
 def test_absolute_artifact_paths_pass_through_unresolved(tmp_path: Path) -> None:
     """An already-absolute artifact path must not be re-based on the config directory."""
     absolute_artifact = tmp_path / "elsewhere" / "s256.mlmodelc"
