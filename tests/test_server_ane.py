@@ -1,4 +1,4 @@
-"""Integration tests against the real Core ML artifacts (T4 of v0.4実装計画.md §4.8).
+"""Integration tests against the real Core ML artifacts.
 
 These check the wiring (HTTP -> engine -> ANE -> HTTP) on the actual
 compiled models; the heavy accuracy work belongs to tools/verify_server.py.
@@ -44,16 +44,31 @@ def client() -> Iterator[TestClient]:
 
 
 def test_health_lists_the_real_buckets(client: TestClient) -> None:
-    """/health must expose the buckets of the loaded artifacts."""
+    """/health must expose every configured model with the buckets it loaded."""
     response = client.get("/health")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
-    assert payload["models"] == {
-        "embedding": list(_EMBEDDING.buckets),
-        "reranker": list(_RERANKER.buckets),
-    }
+    assert payload["models"] == [
+        {"id": _EMBEDDING.id, "kind": "embedding", "buckets": list(_EMBEDDING.buckets)},
+        {"id": _RERANKER.id, "kind": "reranker", "buckets": list(_RERANKER.buckets)},
+    ]
+
+
+def test_embeddings_route_to_the_named_model(client: TestClient) -> None:
+    """Naming the configured embedding model must serve the request as usual."""
+    response = client.post("/v1/embeddings", json={"input": ["東京の天気"], "model": _EMBEDDING.id})
+
+    assert response.status_code == 200
+    assert response.json()["model"] == _EMBEDDING.id
+
+
+def test_embeddings_reject_the_reranker_id(client: TestClient) -> None:
+    """A configured id of the wrong kind must be a 400, not a fallback."""
+    response = client.post("/v1/embeddings", json={"input": ["東京"], "model": _RERANKER.id})
+
+    assert response.status_code == 400
 
 
 def test_embeddings_return_finite_unit_vectors(client: TestClient) -> None:
