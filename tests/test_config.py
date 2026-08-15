@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from eeane import settings
 from eeane.config import (
     CliOverrides,
     ConfigError,
@@ -154,7 +153,7 @@ def test_embedding_model_accessor_returns_the_single_embedding_entry() -> None:
     """embedding_model must return the configured embedding entry."""
     config = default_config()
 
-    assert config.embedding_model.id == settings.EMBEDDING_MODEL_ID
+    assert config.embedding_model.id == "ruri-v3-310m"
 
 
 def test_reranker_model_accessor_returns_none_when_absent() -> None:
@@ -655,28 +654,44 @@ def test_no_config_file_anywhere_uses_built_in_default(
     assert loaded.config == default_config()
 
 
-# --- default_config() vs legacy eeane.settings ---------------------------
+# --- default_config() vs the v0.4 hard-coded values ----------------------
+
+# Literal copies of the constants the v0.4 hard-coded settings module
+# held (it is deleted in v0.5). The repository root is derived from this
+# test file, independently of eeane.config, so the comparison below still
+# checks the values instead of restating them.
+_V04_REPO_ROOT = Path(__file__).resolve().parent.parent
+_V04_COMPILED_ROOT = _V04_REPO_ROOT / "models" / "compiled"
+_V04_EMBEDDING_COMPILED = {
+    128: _V04_COMPILED_ROOT / "ruri-v3-310m" / "s128_b1_eager_macos13.mlmodelc",
+    512: _V04_COMPILED_ROOT / "ruri-v3-310m" / "s512_b1_eager_macos13.mlmodelc",
+    1024: _V04_COMPILED_ROOT / "ruri-v3-310m" / "s1024_b1_eager_macos13.mlmodelc",
+}
+_V04_RERANKER_COMPILED = {
+    512: _V04_COMPILED_ROOT / "ruri-v3-reranker-310m" / "s512_b1_eager_macos13.mlmodelc",
+    1024: _V04_COMPILED_ROOT / "ruri-v3-reranker-310m" / "s1024_b1_eager_macos13.mlmodelc",
+}
 
 
 def test_default_config_matches_v04_settings_values() -> None:
-    """default_config() must reproduce every value from the legacy eeane.settings module."""
+    """default_config() must reproduce every value of the v0.4 settings module."""
     config = default_config()
 
-    assert config.server.host == settings.HOST
-    assert config.server.port == settings.PORT
+    assert config.server.host == "127.0.0.1"
+    assert config.server.port == 7997
 
     embedding = config.embedding_model
-    assert embedding.id == settings.EMBEDDING_MODEL_ID
-    assert embedding.model_dir == settings.EMBEDDING_MODEL_DIR
-    assert embedding.artifacts == settings.EMBEDDING_COMPILED
-    assert embedding.buckets == tuple(sorted(settings.EMBEDDING_COMPILED))
-    assert embedding.normalize is settings.NORMALIZE_EMBEDDINGS
-    assert embedding.output_name == settings.EMBEDDING_OUTPUT_NAME
+    assert embedding.id == "ruri-v3-310m"
+    assert embedding.model_dir == _V04_REPO_ROOT / "models" / "ruri-v3-310m"
+    assert embedding.artifacts == _V04_EMBEDDING_COMPILED
+    assert embedding.buckets == tuple(sorted(_V04_EMBEDDING_COMPILED))
+    assert embedding.normalize is True
+    assert embedding.output_name == "embedding"
 
     reranker = config.reranker_model
     assert reranker is not None
-    assert reranker.id == settings.RERANKER_MODEL_ID
-    assert reranker.model_dir == settings.RERANKER_MODEL_DIR
-    assert reranker.artifacts == settings.RERANKER_COMPILED
-    assert reranker.buckets == tuple(sorted(settings.RERANKER_COMPILED))
-    assert reranker.output_name == settings.RERANKER_OUTPUT_NAME
+    assert reranker.id == "ruri-v3-reranker-310m"
+    assert reranker.model_dir == _V04_REPO_ROOT / "models" / "ruri-v3-reranker-310m"
+    assert reranker.artifacts == _V04_RERANKER_COMPILED
+    assert reranker.buckets == tuple(sorted(_V04_RERANKER_COMPILED))
+    assert reranker.output_name == "logits"

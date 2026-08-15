@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from eeane import settings
+from eeane.config import default_config
 from eeane.runtime import (
     base64_to_floats,
     count_pair_tokens,
@@ -20,7 +20,8 @@ from eeane.runtime import (
     tokenize_texts,
 )
 
-_MODEL_AVAILABLE = settings.EMBEDDING_MODEL_DIR.exists()
+_EMBEDDING_MODEL_DIR = default_config().embedding_model.model_dir
+_MODEL_AVAILABLE = _EMBEDDING_MODEL_DIR.exists()
 
 _BUCKETS = (128, 512, 1024)
 
@@ -112,7 +113,7 @@ def test_base64_roundtrip_is_bit_exact() -> None:
 @pytest.fixture(scope="module")
 def tokenizer():
     """Load the ruri-v3-310m tokenizer once for the tokenizer-dependent tests below."""
-    return AutoTokenizer.from_pretrained(settings.EMBEDDING_MODEL_DIR)
+    return AutoTokenizer.from_pretrained(_EMBEDDING_MODEL_DIR)
 
 
 @pytest.mark.skipif(not _MODEL_AVAILABLE, reason="ruri-v3-310m model directory not found")

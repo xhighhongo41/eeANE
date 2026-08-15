@@ -15,14 +15,19 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from eeane import settings
+from eeane.config import default_config
 from eeane.server import create_app
 
+_CONFIG = default_config()
+_EMBEDDING = _CONFIG.embedding_model
+_RERANKER = _CONFIG.reranker_model
+assert _RERANKER is not None, "the built-in default configuration always has a reranker"
+
 _REQUIRED_PATHS = [
-    settings.EMBEDDING_MODEL_DIR,
-    settings.RERANKER_MODEL_DIR,
-    *settings.EMBEDDING_COMPILED.values(),
-    *settings.RERANKER_COMPILED.values(),
+    _EMBEDDING.model_dir,
+    _RERANKER.model_dir,
+    *_EMBEDDING.artifacts.values(),
+    *_RERANKER.artifacts.values(),
 ]
 if not all(path.exists() for path in _REQUIRED_PATHS):
     pytest.skip(
@@ -34,7 +39,7 @@ if not all(path.exists() for path in _REQUIRED_PATHS):
 @pytest.fixture(scope="module")
 def client() -> Iterator[TestClient]:
     """Client backed by the real engine, loaded once for the whole module."""
-    with TestClient(create_app()) as test_client:
+    with TestClient(create_app(_CONFIG)) as test_client:
         yield test_client
 
 
@@ -46,8 +51,8 @@ def test_health_lists_the_real_buckets(client: TestClient) -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["models"] == {
-        "embedding": sorted(settings.EMBEDDING_COMPILED),
-        "reranker": sorted(settings.RERANKER_COMPILED),
+        "embedding": list(_EMBEDDING.buckets),
+        "reranker": list(_RERANKER.buckets),
     }
 
 
@@ -64,7 +69,7 @@ def test_embeddings_return_finite_unit_vectors(client: TestClient) -> None:
         vector = np.asarray(item["embedding"], dtype=np.float64)
         assert vector.shape == (768,)
         assert np.all(np.isfinite(vector))
-        # settings.NORMALIZE_EMBEDDINGS is True by default (Infinity parity).
+        # The default config normalizes embeddings (Infinity parity).
         assert np.linalg.norm(vector) == pytest.approx(1.0, abs=1e-3)
     # Both inputs are far below 128 tokens, so they route to the S128 bucket.
     assert payload["usage"]["prompt_tokens"] <= 2 * 128

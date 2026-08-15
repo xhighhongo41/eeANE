@@ -22,7 +22,8 @@ import coremltools as ct
 import numpy as np
 from transformers import AutoTokenizer
 
-from eeane import runtime, settings
+from eeane import runtime
+from eeane.config import EeaneConfig
 
 # Hidden size of ruri-v3-310m. Only used to shape the empty result of an
 # empty request; non-empty results take their width from the model output.
@@ -182,8 +183,8 @@ def _load_compiled(path: Path) -> Any:
 class CoreMLEngine:
     """Resident Core ML engine holding one compiled model per bucket.
 
-    All models and both tokenizers are loaded in ``__init__`` and kept
-    until the process exits (v0.4 has no on-demand loading). Every
+    All configured models and their tokenizers are loaded in ``__init__``
+    and kept until the process exits (no on-demand loading yet). Every
     ``predict`` call is serialized by a single process-wide lock, and
     tokenizer calls are serialized by a second one (fast tokenizers keep
     mutable padding/truncation state, see ``__init__``).
@@ -193,35 +194,63 @@ class CoreMLEngine:
         self,
         *,
         embedding_model_dir: Path,
-        reranker_model_dir: Path,
         embedding_compiled: dict[int, Path],
-        reranker_compiled: dict[int, Path],
         embedding_output_name: str,
-        reranker_output_name: str,
+        reranker_model_dir: Path | None = None,
+        reranker_compiled: dict[int, Path] | None = None,
+        reranker_output_name: str | None = None,
     ) -> None:
         """Validate the artifacts, then load tokenizers and compiled models.
+
+        The reranker is optional: passing ``None`` for all three
+        ``reranker_*`` arguments builds an embedding-only engine, whose
+        :attr:`reranker_buckets` is empty and whose :meth:`rerank` always
+        raises (the HTTP layer answers 503 before reaching it).
 
         Args:
             embedding_model_dir: HuggingFace-format embedding model
                 directory (tokenizer source).
-            reranker_model_dir: HuggingFace-format reranker model
-                directory (tokenizer source).
             embedding_compiled: Bucket -> ``.mlmodelc`` path for the
                 embedding model.
-            reranker_compiled: Bucket -> ``.mlmodelc`` path for the
-                reranker model.
             embedding_output_name: Output tensor name chosen when the
                 embedding model was converted.
+            reranker_model_dir: HuggingFace-format reranker model
+                directory (tokenizer source), or ``None`` when no reranker
+                is configured.
+            reranker_compiled: Bucket -> ``.mlmodelc`` path for the
+                reranker model, or ``None`` when no reranker is
+                configured.
             reranker_output_name: Output tensor name chosen when the
-                reranker model was converted.
+                reranker model was converted, or ``None`` when no reranker
+                is configured.
 
         Raises:
+            ValueError: If the ``reranker_*`` arguments are only partially
+                given, or map no bucket at all.
             RuntimeError: If any model directory or compiled artifact is
                 missing. The message lists every problem and the command
                 that produces each missing artifact.
         """
+        # The three reranker arguments describe one optional model, so
+        # they are only meaningful all together.
+        provided = [
+            part is not None
+            for part in (reranker_model_dir, reranker_compiled, reranker_output_name)
+        ]
+        if any(provided) and not all(provided):
+            raise ValueError(
+                "incomplete reranker configuration: pass reranker_model_dir, "
+                "reranker_compiled and reranker_output_name together, or none of them"
+            )
+        self._has_reranker = all(provided)
+        if self._has_reranker and not reranker_compiled:
+            raise ValueError("reranker_compiled must map at least one bucket to an artifact")
+
         problems = _collect_missing("embedding", embedding_model_dir, embedding_compiled)
-        problems += _collect_missing("reranker", reranker_model_dir, reranker_compiled)
+        # The reranker is only checked when it is configured (the "all or
+        # none" rule above makes both values non-None together).
+        if reranker_model_dir is not None and reranker_compiled is not None:
+            problems += _collect_missing("reranker", reranker_model_dir, reranker_compiled)
         if problems:
             raise RuntimeError(
                 "eeANE cannot start, the following model artifacts are missing:\n  - "
@@ -229,18 +258,26 @@ class CoreMLEngine:
             )
 
         self.embedding_buckets: tuple[int, ...] = tuple(sorted(embedding_compiled))
-        self.reranker_buckets: tuple[int, ...] = tuple(sorted(reranker_compiled))
+        self.reranker_buckets: tuple[int, ...] = (
+            tuple(sorted(reranker_compiled)) if reranker_compiled else ()
+        )
         self._embedding_output_name = embedding_output_name
         self._reranker_output_name = reranker_output_name
 
         self._embedding_tokenizer = AutoTokenizer.from_pretrained(embedding_model_dir)
-        self._reranker_tokenizer = AutoTokenizer.from_pretrained(reranker_model_dir)
         self._embedding_models = {
             seq_len: _load_compiled(path) for seq_len, path in sorted(embedding_compiled.items())
         }
-        self._reranker_models = {
-            seq_len: _load_compiled(path) for seq_len, path in sorted(reranker_compiled.items())
-        }
+        # Skip the reranker tokenizer/model load entirely when the server
+        # is configured as embedding-only.
+        self._reranker_tokenizer = (
+            AutoTokenizer.from_pretrained(reranker_model_dir) if self._has_reranker else None
+        )
+        self._reranker_models = (
+            {seq_len: _load_compiled(path) for seq_len, path in sorted(reranker_compiled.items())}
+            if reranker_compiled
+            else {}
+        )
         # One lock for both models: the ANE serializes predictions anyway
         # and switching between the two models costs nothing (v0.3 TB).
         self._lock = threading.Lock()
@@ -252,15 +289,29 @@ class CoreMLEngine:
         self._tokenizer_lock = threading.Lock()
 
     @classmethod
-    def from_settings(cls) -> CoreMLEngine:
-        """Build the engine from the hard-coded ``eeane.settings`` constants."""
+    def from_config(cls, config: EeaneConfig) -> CoreMLEngine:
+        """Build the engine from a resolved eeANE configuration.
+
+        Args:
+            config: Validated configuration (see :mod:`eeane.config`).
+                Its single embedding entry is required; the reranker entry
+                is optional and, when absent, yields an embedding-only
+                engine.
+
+        Returns:
+            A loaded engine serving the configured artifacts.
+        """
+        embedding = config.embedding_model
+        reranker = config.reranker_model
+        # output_name is always derived during config validation; the
+        # fallbacks only guard against a hand-built ModelEntry.
         return cls(
-            embedding_model_dir=settings.EMBEDDING_MODEL_DIR,
-            reranker_model_dir=settings.RERANKER_MODEL_DIR,
-            embedding_compiled=settings.EMBEDDING_COMPILED,
-            reranker_compiled=settings.RERANKER_COMPILED,
-            embedding_output_name=settings.EMBEDDING_OUTPUT_NAME,
-            reranker_output_name=settings.RERANKER_OUTPUT_NAME,
+            embedding_model_dir=embedding.model_dir,
+            embedding_compiled=dict(embedding.artifacts),
+            embedding_output_name=embedding.output_name or "embedding",
+            reranker_model_dir=None if reranker is None else reranker.model_dir,
+            reranker_compiled=None if reranker is None else dict(reranker.artifacts),
+            reranker_output_name=None if reranker is None else (reranker.output_name or "logits"),
         )
 
     def embed(self, texts: list[str]) -> EmbeddingBatch:
@@ -324,7 +375,15 @@ class CoreMLEngine:
         Returns:
             Raw logits plus the token accounting; the sigmoid mapping is
             applied by the HTTP layer (``raw_scores`` decides).
+
+        Raises:
+            RuntimeError: If no reranker is configured. The HTTP layer
+                answers 503 before calling this, so this is a defensive
+                guard for direct engine users.
         """
+        if not self._has_reranker:
+            raise RuntimeError("reranker is not configured")
+
         if not documents:
             return RerankBatch(
                 logits=np.empty((0,), dtype=np.float32),
