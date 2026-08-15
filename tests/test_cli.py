@@ -1,4 +1,4 @@
-"""Tests for eeane.cli (v0.5 T3, see 開発資料/v0.5実装計画.md §4.3-§4.4)."""
+"""Tests for eeane.cli."""
 
 from __future__ import annotations
 
@@ -29,6 +29,22 @@ api_key = "top-secret-key"
 id = "emb-only"
 kind = "embedding"
 tokenizer = "models/emb-only/tokenizer.json"
+
+[models.artifacts]
+256 = "compiled/emb-only/s256.mlmodelc"
+"""
+
+
+_DETAILED_TOML = """
+[server]
+cache_root = "cache"
+
+[[models]]
+id = "emb-only"
+kind = "embedding"
+tokenizer = "models/emb-only/tokenizer.json"
+embedding_dim = 768
+excluded_buckets = [1024]
 
 [models.artifacts]
 256 = "compiled/emb-only/s256.mlmodelc"
@@ -343,6 +359,36 @@ def test_check_config_with_malformed_toml_exits_1(
     captured = capsys.readouterr()
     assert "eeane.toml" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_check_config_prints_the_optional_cache_and_model_details(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A cache root, an embedding width and excluded buckets must be reported."""
+    config_path = _write(tmp_path / "eeane.toml", _DETAILED_TOML)
+
+    exit_code = cli.main(["check-config", "--config", str(config_path)])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "cache_root:" in captured.out
+    assert "embedding_dim: 768" in captured.out
+    assert "excluded_buckets: 1024" in captured.out
+
+
+def test_check_config_omits_the_optional_details_when_unset(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """What the configuration does not set must not be printed at all."""
+    config_path = _write(tmp_path / "eeane.toml", _KEYLESS_TOML)
+
+    exit_code = cli.main(["check-config", "--config", str(config_path)])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "cache_root:" not in captured.out
+    assert "embedding_dim:" not in captured.out
+    assert "excluded_buckets:" not in captured.out
 
 
 def test_check_config_without_explicit_path_uses_cwd_eeane_toml(

@@ -1,4 +1,4 @@
-"""Tests for eeane.runtime (T2 of v0.4実装計画.md §4.2, §4.3; v0.6 §4.6)."""
+"""Tests for eeane.runtime."""
 
 from __future__ import annotations
 

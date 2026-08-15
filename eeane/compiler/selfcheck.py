@@ -1,4 +1,4 @@
-"""Post-compile self-check: accuracy sanity, ANE placement, latency (v0.6実装計画.md §4.5).
+"""Post-compile self-check: accuracy sanity, ANE placement, latency.
 
 Plugs into :data:`eeane.compiler.pipeline.SelfcheckFn`: it is handed one
 just-compiled ``.mlmodelc`` (as a :class:`~eeane.compiler.pipeline.
@@ -47,20 +47,18 @@ import numpy as np
 
 from eeane import runtime
 from eeane.compiler import conversion
-from eeane.compiler.backends import modernbert as mb
 
 if TYPE_CHECKING:
     from eeane.compiler.pipeline import SelfcheckContext
 
 # Statuses this module can produce. "skipped" is the pipeline's own status
-# for when no self-check ran at all (v0.6実装計画.md §4.5); it is never
-# returned from here.
+# for when no self-check ran at all; it is never returned from here.
 STATUS_PASSED = "passed"
 STATUS_WARNED = "warned"
 STATUS_FAILED = "failed"
 
 # --- accuracy sanity thresholds, ported verbatim from
-# poc/convert_embedding.py / poc/convert_reranker.py (§2-4) ---
+# poc/convert_embedding.py / poc/convert_reranker.py ---
 
 # Minimum cosine similarity against the PyTorch FP32 baseline (embedding).
 SANITY_COSINE_THRESHOLD = 0.99
@@ -69,20 +67,20 @@ SANITY_COSINE_THRESHOLD = 0.99
 SANITY_SIGMOID_TOLERANCE = 0.02
 
 # Minimum cosine similarity between rows of a batch holding the same text
-# (embedding batch consistency check, R1).
+# (embedding batch consistency check).
 BATCH_CONSISTENCY_COSINE_THRESHOLD = 0.99999
 
 # Maximum tolerated |logit(row k) - logit(row 0)| between rows of a batch
-# holding the same pair (reranker batch consistency check, R1).
+# holding the same pair (reranker batch consistency check).
 BATCH_CONSISTENCY_LOGIT_TOLERANCE = 0.01
 
-# --- NE placement (§2-5) ---
+# --- NE placement ---
 
 # Below this NE-placement percentage the report is downgraded to "warned"
 # (never "failed": the goal is data collection on unverified machines).
 NE_PLACEMENT_WARN_THRESHOLD = 90.0
 
-# --- warm latency (§4.5 step 3, a simplified measurement) ---
+# --- warm latency (a simplified measurement) ---
 
 LATENCY_WARMUP_PREDICTS = 3
 LATENCY_TIMED_PREDICTS = 20
@@ -178,7 +176,7 @@ def _sanity_embedding(
     context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Accuracy sanity check for an embedding variant (ported from poc/convert_embedding.py)."""
-    raw_texts: list[str] = context.backend.sanity_inputs(context.kind)
+    raw_texts: list[str] = list(context.backend.sanity_spec(context.kind).inputs)
     tokens = runtime.tokenize_texts(frozen_tokenizer, raw_texts, context.seq_len)
     padding = runtime.tokenize_texts(
         frozen_tokenizer, [context.backend.padding_input(context.kind)], context.seq_len
@@ -204,6 +202,7 @@ def _sanity_embedding(
     sanity = {
         "output_key": output_key,
         "batch_size": context.batch_size,
+        "embedding_dim": int(coreml_emb.shape[1]),
         "cosine_per_text": [float(c) for c in cosines],
         "cosine_min": float(cosines.min()),
         "cosine_mean": float(cosines.mean()),
@@ -222,8 +221,15 @@ def _sanity_embedding(
 def _sanity_reranker(
     context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    """Accuracy sanity check for a reranker variant (ported from poc/convert_reranker.py)."""
-    raw_pairs: list[tuple[str, str]] = context.backend.sanity_inputs(context.kind)
+    """Accuracy sanity check for a reranker variant (ported from poc/convert_reranker.py).
+
+    The expected ordering comes from the backend's sanity specification;
+    when it declares no relevant/irrelevant pair, the ordering check is
+    skipped and the report says so (``ordering_checked``) instead of
+    silently passing an unperformed check.
+    """
+    spec = context.backend.sanity_spec(context.kind)
+    raw_pairs: list[tuple[str, str]] = [(query, document) for query, document in spec.inputs]
     tokens = runtime.tokenize_pairs(frozen_tokenizer, raw_pairs, context.seq_len)
     padding = runtime.tokenize_pairs(
         frozen_tokenizer, [context.backend.padding_input(context.kind)], context.seq_len
@@ -249,12 +255,9 @@ def _sanity_reranker(
     fp32_scores = runtime.sigmoid(fp32_logits)
     abs_diff = np.abs(coreml_scores - fp32_scores)
     finite = bool(np.isfinite(coreml_logits).all() and np.isfinite(fp32_logits).all())
-    ordering_coreml = bool(
-        coreml_scores[mb.RELEVANT_PAIR_INDEX] > coreml_scores[mb.IRRELEVANT_PAIR_INDEX]
-    )
-    ordering_fp32 = bool(
-        fp32_scores[mb.RELEVANT_PAIR_INDEX] > fp32_scores[mb.IRRELEVANT_PAIR_INDEX]
-    )
+    ordering_checked = spec.relevant_index is not None and spec.irrelevant_index is not None
+    ordering_coreml = _check_ordering(coreml_scores, spec)
+    ordering_fp32 = _check_ordering(fp32_scores, spec)
     max_abs_diff = float(abs_diff.max())
     sanity = {
         "output_key": output_key,
@@ -266,6 +269,7 @@ def _sanity_reranker(
         "sigmoid_abs_diff": [float(v) for v in abs_diff],
         "sigmoid_max_abs_diff": max_abs_diff,
         "sigmoid_tolerance": SANITY_SIGMOID_TOLERANCE,
+        "ordering_checked": ordering_checked,
         "ordering_ok_coreml": ordering_coreml,
         "ordering_ok_fp32": ordering_fp32,
         "batch_consistency": consistency,
@@ -273,12 +277,30 @@ def _sanity_reranker(
         "passed": (
             finite
             and max_abs_diff <= SANITY_SIGMOID_TOLERANCE
-            and ordering_coreml
-            and ordering_fp32
+            and (not ordering_checked or (bool(ordering_coreml) and bool(ordering_fp32)))
             and (consistency is None or bool(consistency["passed"]))
         ),
     }
     return sanity, _first_predict_batch(tokens, padding, context.batch_size)
+
+
+def _check_ordering(scores: np.ndarray, spec: Any) -> bool | None:
+    """Report whether the relevant input scored above the irrelevant one.
+
+    Args:
+        scores: One score per sanity input, in the spec's own order.
+        spec: The backend's sanity specification
+            (:class:`eeane.compiler.backends.base.SanitySpec`).
+
+    Returns:
+        ``True``/``False`` when the spec declares both the relevant and
+        the irrelevant index, ``None`` when it declares no expected
+        ordering (nothing to check).
+    """
+    relevant, irrelevant = spec.relevant_index, spec.irrelevant_index
+    if relevant is None or irrelevant is None:
+        return None
+    return bool(scores[relevant] > scores[irrelevant])
 
 
 def _fill_batch(rows: np.ndarray, padding_row: np.ndarray, batch_size: int) -> np.ndarray:
@@ -383,7 +405,7 @@ def _check_batch_consistency_embedding(
     batch_size: int,
     output_key: str,
 ) -> dict[str, Any]:
-    """Verify that rows of one embedding batch do not influence each other (R1).
+    """Verify that rows of one embedding batch do not influence each other.
 
     Ported from ``poc/convert_embedding.py``'s ``check_batch_consistency``.
 
@@ -425,7 +447,7 @@ def _check_batch_consistency_reranker(
     batch_size: int,
     output_key: str,
 ) -> dict[str, Any]:
-    """Verify that rows of one reranker batch do not influence each other (R1).
+    """Verify that rows of one reranker batch do not influence each other.
 
     Ported from ``poc/convert_reranker.py``'s ``check_batch_consistency``.
 
@@ -485,8 +507,8 @@ def _cosine_rowwise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 def _compute_plan_report(mlmodelc_path: Any) -> dict[str, Any]:
     """Summarize per-op compute device placement via MLComputePlan.
 
-    Ported from ``poc/benchmark_latency.py``'s ``compute_plan_report``
-    (§2-5): always measured against ``CPU_AND_NE``, matching the sanity
+    Ported from ``poc/benchmark_latency.py``'s ``compute_plan_report``:
+    always measured against ``CPU_AND_NE``, matching the sanity
     check's own compute unit selection. If the API is unavailable or
     raises at runtime, the failure is recorded rather than propagated so
     that a self-check never fails because of this best-effort report.
@@ -569,7 +591,7 @@ def _collect_program_operations(block: Any) -> list[Any]:
 def _measure_latency(
     compiled: ct.models.CompiledMLModel, batch: dict[str, np.ndarray]
 ) -> dict[str, Any]:
-    """Measure warm predict() latency on one fixed batch (informational only, §4.5 step 3).
+    """Measure warm predict() latency on one fixed batch (informational only).
 
     A simplified measurement compared to ``poc/benchmark_latency.py``
     (which remains the tool for real benchmarking): one batch, no cold
@@ -605,10 +627,7 @@ def _measure_latency(
 
 
 def _machine_info() -> dict[str, str]:
-    """Collect the machine info recorded in every report (§4.5 compatibility summary).
-
-    Args:
-        None.
+    """Collect the machine info recorded in every report.
 
     Returns:
         Dict with the OS ``platform.platform()`` string and the CPU brand
@@ -636,7 +655,7 @@ def _cpu_brand() -> str:
 
 
 def _print_summary(context: SelfcheckContext, report: dict[str, Any]) -> None:
-    """Print the self-check compatibility summary to stderr (§4.5).
+    """Print the self-check compatibility summary to stderr.
 
     One block per compiled bucket, in the pipeline's own progress style,
     meant to be pasted verbatim into a "works on my machine" report (the

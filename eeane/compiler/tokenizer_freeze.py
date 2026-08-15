@@ -1,4 +1,4 @@
-"""Tokenizer freezing and equivalence verification (v0.6実装計画.md §4.6).
+"""Tokenizer freezing and equivalence verification.
 
 ``eeane serve`` must not depend on ``transformers``: at compile time the
 *effective* backend tokenizer -- the one ``AutoTokenizer.from_pretrained``
@@ -12,8 +12,8 @@ Freezing is only half of the contract: :func:`verify_frozen_tokenizer` is
 the compile-time gate that proves the frozen file reproduces
 ``AutoTokenizer``'s ``input_ids``/``attention_mask`` exactly, for every
 bucket length the model is compiled for. A mismatch fails the compile
-(v0.6実装計画.md §4.10 C2) instead of silently shipping a tokenizer that
-disagrees with the one the accuracy checks were run against.
+instead of silently shipping a tokenizer that disagrees with the one the
+accuracy checks were run against.
 
 This module belongs to the ``[compile]`` side: it imports
 ``transformers`` at module load time and must never be imported from a
@@ -65,7 +65,7 @@ def freeze_tokenizer(model_dir: Path, out_path: Path) -> dict[str, Any]:
     the sequence-length bucket is known.
 
     ``model_dir`` is only read; the frozen file is written to ``out_path``
-    (v0.6実装計画.md §2-11: input model directories are read-only).
+    (input model directories are read-only).
 
     Args:
         model_dir: HuggingFace distribution-format model directory, or
@@ -131,7 +131,7 @@ def verify_frozen_tokenizer(
     token counts (which drive bucket selection) are compared as well.
 
     Everything runs serially on purpose: fast tokenizers keep mutable
-    Rust-side padding/truncation state (v0.6実装計画.md §4.10 C7).
+    Rust-side padding/truncation state.
 
     Args:
         model_dir: Model directory the frozen file was produced from.

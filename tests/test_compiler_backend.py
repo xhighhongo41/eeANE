@@ -1,9 +1,14 @@
-"""Tests for eeane.compiler.backends.modernbert (v0.6 T3, see 開発資料/v0.6実装計画.md §4.2).
+"""Tests for the compile-backend interface and its ModernBERT implementation.
 
-The patch/wrapper logic is ported from the frozen PoC scripts, so these
-tests pin both the numerics that the PoC verified (masked mean pooling,
-stable sigmoid, patched-eager == unpatched-sdpa forward outputs) and the
-provisional backend interface that pipeline.py will drive.
+Two layers:
+
+* The interface types of ``eeane.compiler.backends.base`` (the handle and
+  the sanity specification every backend hands to the pipeline and the
+  self-check), which are pure data and run anywhere.
+* ``eeane.compiler.backends.modernbert``: the numerics ported from the
+  frozen PoC scripts (masked mean pooling, stable sigmoid, patched-eager
+  == unpatched-sdpa forward outputs) plus the conformance of every
+  registered backend to the interface that pipeline.py drives.
 
 Tests needing the real 310M models skip themselves when
 ``models/ruri-v3-310m`` / ``models/ruri-v3-reranker-310m`` are absent.
@@ -11,6 +16,9 @@ Tests needing the real 310M models skip themselves when
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +29,9 @@ import pytest
 import torch
 from transformers.models.modernbert import modeling_modernbert
 
+from eeane.compiler.backends import base
 from eeane.compiler.backends import modernbert as mb
+from eeane.compiler.backends import xlm_roberta as xlmr
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 EMBEDDING_MODEL_DIR = _REPO_ROOT / "models" / "ruri-v3-310m"
@@ -34,8 +44,8 @@ _RERANKER_AVAILABLE = (RERANKER_MODEL_DIR / "config.json").exists()
 SMOKE_SEQ_LEN = 128
 
 # Tolerance between the patched eager path and the untouched sdpa path.
-# The rank-4 rewrite is bit-exact against upstream eager (v0.3実装記録
-# §6-6); what is left here is the eager-vs-sdpa kernel difference in FP32.
+# The rank-4 rewrite is bit-exact against upstream eager; what is left
+# here is the eager-vs-sdpa kernel difference in FP32.
 PATCH_ABS_TOLERANCE = 1e-4
 
 
@@ -73,6 +83,72 @@ def _tiny_inputs(seq_len: int = 16, batch_size: int = 2) -> tuple[torch.Tensor, 
     attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
     attention_mask[-1, seq_len // 2 :] = 0  # last row is half padding
     return input_ids, attention_mask
+
+
+def _loaded(
+    model: Any,
+    kind: str = "embedding",
+    tokenizer: Any = None,
+    model_dir: Path = Path("/nonexistent-model-dir"),
+) -> base.LoadedModel:
+    """Build the handle the backend interface passes between its stages."""
+    return base.LoadedModel(
+        model=model,
+        tokenizer=tokenizer,
+        config=getattr(model, "config", None),
+        model_dir=model_dir,
+        kind=kind,
+        attn="eager",
+        pooling="mean" if kind == "embedding" else None,
+    )
+
+
+# --- interface types (backends/base.py) --------------------------------------
+
+
+def test_loaded_model_is_frozen_and_defaults_pooling_to_none() -> None:
+    """The handle must be immutable and carry no pooling mode unless one is given."""
+    loaded = base.LoadedModel(
+        model="model",
+        tokenizer="tokenizer",
+        config="config",
+        model_dir=Path("/models/example"),
+        kind="reranker",
+        attn="eager",
+    )
+
+    assert loaded.pooling is None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        loaded.kind = "embedding"  # type: ignore[misc]
+
+
+def test_sanity_spec_defaults_have_no_ordering_expectation() -> None:
+    """Fixtures without expected ordering (embeddings) must default both indices to None."""
+    spec = base.SanitySpec(inputs=("a", "b"))
+
+    assert spec.relevant_index is None
+    assert spec.irrelevant_index is None
+
+
+def test_sanity_spec_is_frozen_and_holds_immutable_inputs() -> None:
+    """Neither the spec nor its inputs may be modified by a consumer."""
+    spec = base.SanitySpec(inputs=("a", "b"), relevant_index=0, irrelevant_index=1)
+
+    assert isinstance(spec.inputs, tuple)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.relevant_index = 1  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        spec.inputs[0] = "mutated"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("relevant", "irrelevant"),
+    [(2, 1), (0, 2), (-1, 0), (0, -1)],
+)
+def test_sanity_spec_rejects_out_of_range_indices(relevant: int, irrelevant: int) -> None:
+    """An index that does not address an input would only fail deep inside the self-check."""
+    with pytest.raises(ValueError, match="out of range"):
+        base.SanitySpec(inputs=("a", "b"), relevant_index=relevant, irrelevant_index=irrelevant)
 
 
 # --- pooling / sigmoid (the numerics moved out of poc/common.py) -------------
@@ -123,7 +199,59 @@ def test_sigmoid_np_is_stable_for_large_magnitudes() -> None:
     assert np.all((result >= 0.0) & (result <= 1.0))
 
 
-# --- provisional backend interface ------------------------------------------
+# --- backend interface conformance ------------------------------------------
+
+# Callable members the interface declares; the parametrized signature test
+# below drives itself from this list, so a member added to (or dropped
+# from) the protocol is automatically checked against the implementation.
+_PROTOCOL_METHODS = sorted(
+    name
+    for name, member in vars(base.CompileBackend).items()
+    if not name.startswith("_") and callable(member)
+)
+
+# Every registered backend implementation, so that a new architecture is
+# held to the same interface as the existing ones.
+_BACKEND_CLASSES = [mb.ModernBertBackend, xlmr.XlmRobertaBackend]
+
+
+def _parameters(function: Any) -> list[tuple[str, Any]]:
+    """Return a function's parameter names and defaults, ignoring annotations."""
+    return [(name, param.default) for name, param in inspect.signature(function).parameters.items()]
+
+
+def test_the_protocol_declares_the_documented_members() -> None:
+    """The interface must stay the set of members the module docstring describes."""
+    assert set(_PROTOCOL_METHODS) == {
+        "load",
+        "apply_patches",
+        "wrap",
+        "output_name",
+        "max_seq_len",
+        "trace_example",
+        "sanity_spec",
+        "padding_input",
+        "tokenize",
+        "reference_outputs",
+    }
+
+
+@pytest.mark.parametrize("backend_class", _BACKEND_CLASSES, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("method", _PROTOCOL_METHODS)
+def test_every_backend_matches_the_declared_signature(backend_class: type, method: str) -> None:
+    """Every interface member must exist on each backend with the declared parameters."""
+    implemented = getattr(backend_class, method, None)
+
+    assert implemented is not None, f"{backend_class.__name__} does not implement {method}()"
+    assert _parameters(implemented) == _parameters(getattr(base.CompileBackend, method))
+
+
+def test_modernbert_backend_declares_the_interface_attributes() -> None:
+    """The backend must name itself and the kinds it can compile."""
+    backend = mb.ModernBertBackend()
+
+    assert backend.name == "ModernBert"
+    assert backend.supported_kinds == ("embedding", "reranker")
 
 
 def test_output_name_per_kind() -> None:
@@ -139,36 +267,60 @@ def test_fixtures_have_the_expected_shape_per_kind() -> None:
     backend = mb.ModernBertBackend()
 
     assert isinstance(backend.trace_example("embedding"), str)
-    assert all(isinstance(text, str) for text in backend.sanity_inputs("embedding"))
+    assert all(isinstance(text, str) for text in backend.sanity_spec("embedding").inputs)
     assert backend.padding_input("embedding") == ""
 
     trace_pair = backend.trace_example("reranker")
     assert isinstance(trace_pair, tuple) and len(trace_pair) == 2
-    assert all(len(pair) == 2 for pair in backend.sanity_inputs("reranker"))
+    assert all(len(pair) == 2 for pair in backend.sanity_spec("reranker").inputs)
     assert backend.padding_input("reranker") == ("", "")
 
 
-def test_sanity_inputs_are_defensive_copies() -> None:
-    """Mutating the returned fixture list must not corrupt the module constants."""
+def test_sanity_spec_inputs_are_immutable() -> None:
+    """The fixtures a caller receives must not be corruptible module state."""
     backend = mb.ModernBertBackend()
 
-    returned = backend.sanity_inputs("embedding")
-    returned.append("mutated")
+    inputs = backend.sanity_spec("embedding").inputs
 
-    assert len(backend.sanity_inputs("embedding")) == len(mb.SANITY_TEXTS)
+    assert isinstance(inputs, tuple)
+    assert len(inputs) == len(mb.SANITY_TEXTS)
+    with pytest.raises(TypeError):
+        inputs[0] = "mutated"  # type: ignore[index]
+
+
+def test_embedding_sanity_spec_declares_no_ordering() -> None:
+    """Embedding fixtures are compared row-wise; there is no expected ordering."""
+    spec = mb.ModernBertBackend().sanity_spec("embedding")
+
+    assert spec.inputs
+    assert spec.relevant_index is None
+    assert spec.irrelevant_index is None
+
+
+def test_reranker_sanity_spec_points_at_the_relevant_and_irrelevant_pairs() -> None:
+    """The reranker ordering check must be driven by the spec, not by module constants."""
+    spec = mb.ModernBertBackend().sanity_spec("reranker")
+
+    assert spec.relevant_index == 0
+    assert spec.irrelevant_index == 1
+    assert spec.inputs[0] == mb.SANITY_PAIRS[0]
+    assert spec.inputs[1] == mb.SANITY_PAIRS[1]
+    # The relevant pair shares its query with the irrelevant one, so only the
+    # document decides the expected ordering.
+    assert spec.inputs[0][0] == spec.inputs[1][0]
+    assert spec.inputs[0][1] != spec.inputs[1][1]
 
 
 @pytest.mark.parametrize(
     "method",
-    ["wrap", "trace_example", "sanity_inputs", "padding_input", "output_name"],
+    ["trace_example", "sanity_spec", "padding_input", "output_name"],
 )
 def test_unknown_kind_is_rejected(method: str) -> None:
     """Every kind-dispatching method must reject an unsupported kind."""
     backend = mb.ModernBertBackend()
-    arguments = {"wrap": (SimpleNamespace(),)}.get(method, ())
 
     with pytest.raises(ValueError, match="kind"):
-        getattr(backend, method)(*arguments, "classifier")
+        getattr(backend, method)("classifier")
 
 
 def test_load_rejects_unknown_kind(tmp_path: Path) -> None:
@@ -179,13 +331,24 @@ def test_load_rejects_unknown_kind(tmp_path: Path) -> None:
         backend.load(tmp_path, "classifier")
 
 
+@pytest.mark.parametrize("method", ["wrap", "tokenize"])
+def test_handle_taking_methods_reject_an_unsupported_kind(method: str) -> None:
+    """A handle carrying an unsupported kind must be rejected, not silently wrapped."""
+    backend = mb.ModernBertBackend()
+    loaded = _loaded(torch.nn.Identity(), kind="classifier")
+    arguments = {"tokenize": (["text"], 8)}.get(method, ())
+
+    with pytest.raises(ValueError, match="kind"):
+        getattr(backend, method)(loaded, *arguments)
+
+
 def test_wrap_selects_the_kind_specific_wrapper() -> None:
     """wrap must return the mean-pooling wrapper vs the raw-logits wrapper."""
     backend = mb.ModernBertBackend()
     model = torch.nn.Identity()
 
-    assert isinstance(backend.wrap(model, "embedding"), mb.EmbeddingWrapper)
-    assert isinstance(backend.wrap(model, "reranker"), mb.RerankerWrapper)
+    assert isinstance(backend.wrap(_loaded(model, "embedding")), mb.EmbeddingWrapper)
+    assert isinstance(backend.wrap(_loaded(model, "reranker")), mb.RerankerWrapper)
 
 
 def test_apply_patches_rejects_odd_rope_head_dim() -> None:
@@ -194,7 +357,87 @@ def test_apply_patches_rejects_odd_rope_head_dim() -> None:
     model = SimpleNamespace(config=SimpleNamespace(hidden_size=12, num_attention_heads=4))
 
     with pytest.raises(ValueError, match="head dim"):
-        backend.apply_patches(model)
+        backend.apply_patches(_loaded(model))
+
+
+def test_apply_patches_returns_the_applied_patch_record() -> None:
+    """The two mandatory rewrites must be reported, without a mask fill entry."""
+    backend = mb.ModernBertBackend()
+    model = SimpleNamespace(config=SimpleNamespace(hidden_size=32, num_attention_heads=4))
+
+    applied = backend.apply_patches(_loaded(model))
+
+    assert applied == {"rotate_half_static": True, "eager_attention_rank4": True}
+
+
+def test_apply_patches_records_the_mask_fill_value_when_given() -> None:
+    """A given mask_fill_value must be recorded verbatim in the returned record."""
+    backend = mb.ModernBertBackend()
+    model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=32, num_attention_heads=4, local_attention=8),
+        _update_attention_mask=lambda *args, **kwargs: None,
+    )
+
+    applied = backend.apply_patches(_loaded(model), mask_fill_value=-30000.0)
+
+    assert applied == {
+        "rotate_half_static": True,
+        "eager_attention_rank4": True,
+        "mask_fill_value": -30000.0,
+    }
+
+
+# --- effective maximum sequence length ---------------------------------------
+
+
+def _write_config(directory: Path, config: dict[str, Any]) -> Path:
+    """Write a minimal ``config.json`` into ``directory`` and return the directory."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return directory
+
+
+def test_max_seq_len_reads_max_position_embeddings(tmp_path: Path) -> None:
+    """The configured position budget is the effective maximum for this architecture."""
+    model_dir = _write_config(
+        tmp_path / "model", {"architectures": ["ModernBertModel"], "max_position_embeddings": 8192}
+    )
+
+    assert mb.ModernBertBackend().max_seq_len(model_dir) == 8192
+
+
+def test_max_seq_len_of_a_missing_directory_is_none(tmp_path: Path) -> None:
+    """No config.json means no known limit, not a crash."""
+    assert mb.ModernBertBackend().max_seq_len(tmp_path / "absent") is None
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"architectures": ["ModernBertModel"]},
+        {"max_position_embeddings": None},
+        {"max_position_embeddings": "8192"},
+        {"max_position_embeddings": 0},
+        {"max_position_embeddings": -1},
+        {"max_position_embeddings": True},
+    ],
+)
+def test_max_seq_len_ignores_a_missing_or_unusable_value(
+    tmp_path: Path, config: dict[str, Any]
+) -> None:
+    """A missing or nonsensical value must degrade to 'unknown', never to a bogus limit."""
+    model_dir = _write_config(tmp_path / "model", config)
+
+    assert mb.ModernBertBackend().max_seq_len(model_dir) is None
+
+
+def test_max_seq_len_of_a_corrupt_config_is_none(tmp_path: Path) -> None:
+    """Unparsable JSON must not turn an optional check into a compile failure."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{not json", encoding="utf-8")
+
+    assert mb.ModernBertBackend().max_seq_len(model_dir) is None
 
 
 # --- patch behaviour on a tiny randomly initialised model --------------------
@@ -209,7 +452,7 @@ def test_patched_eager_matches_unpatched_sdpa_on_a_tiny_model() -> None:
     with torch.no_grad():
         reference = model(input_ids=input_ids, attention_mask=attention_mask)[0]
 
-    mb.ModernBertBackend().apply_patches(model)
+    mb.ModernBertBackend().apply_patches(_loaded(model))
     model.config._attn_implementation = "eager"
     with torch.no_grad():
         patched = model(input_ids=input_ids, attention_mask=attention_mask)[0]
@@ -223,12 +466,13 @@ def test_patches_are_idempotent() -> None:
     model = _tiny_model()
     input_ids, attention_mask = _tiny_inputs()
     backend = mb.ModernBertBackend()
+    loaded = _loaded(model)
 
-    backend.apply_patches(model)
+    backend.apply_patches(loaded)
     model.config._attn_implementation = "eager"
     with torch.no_grad():
         once = model(input_ids=input_ids, attention_mask=attention_mask)[0]
-    backend.apply_patches(model)
+    backend.apply_patches(loaded)
     with torch.no_grad():
         twice = model(input_ids=input_ids, attention_mask=attention_mask)[0]
 
@@ -299,11 +543,11 @@ def reranker_smoke() -> dict[str, Any]:
 def _run_smoke(model_dir: Path, kind: str) -> dict[str, Any]:
     """Compare one patched eager forward pass against the FP32 sdpa reference."""
     backend = mb.ModernBertBackend()
-    inputs = backend.sanity_inputs(kind)[:1]
-    model, tokenizer = backend.load(model_dir, kind, attn="eager")
-    backend.apply_patches(model)
-    wrapper = backend.wrap(model, kind)
-    tokens = backend.tokenize(tokenizer, kind, inputs, SMOKE_SEQ_LEN)
+    inputs = list(backend.sanity_spec(kind).inputs[:1])
+    loaded = backend.load(model_dir, kind, attn="eager")
+    backend.apply_patches(loaded)
+    wrapper = backend.wrap(loaded)
+    tokens = backend.tokenize(loaded, inputs, SMOKE_SEQ_LEN)
     with torch.no_grad():
         patched = wrapper(
             torch.from_numpy(tokens["input_ids"]).long(),
@@ -314,6 +558,19 @@ def _run_smoke(model_dir: Path, kind: str) -> dict[str, Any]:
         "tokens": tokens,
         "patched": patched.numpy().reshape(len(inputs), -1),
         "reference": np.asarray(reference, dtype=np.float32).reshape(len(inputs), -1),
+        # Only cheap facts about the handle are kept: retaining the handle
+        # itself would pin ~1.2 GB of FP32 weights for the whole module.
+        "handle": {
+            "kind": loaded.kind,
+            "attn": loaded.attn,
+            "pooling": loaded.pooling,
+            "model_dir": loaded.model_dir,
+            "training": loaded.model.training,
+            "dtype": next(loaded.model.parameters()).dtype,
+            "return_dict": loaded.config.return_dict,
+            "config_is_model_config": loaded.config is loaded.model.config,
+            "tokenizer_encodes": bool(loaded.tokenizer("x")["input_ids"]),
+        },
     }
 
 
@@ -329,6 +586,27 @@ def test_tokenize_returns_fixed_shape_int32_arrays(
         assert tokens[key].shape == (1, SMOKE_SEQ_LEN)
     assert tokens["attention_mask"].sum() > 0
     assert tokens["attention_mask"].sum() < SMOKE_SEQ_LEN  # the row really is padded
+
+
+@pytest.mark.parametrize(
+    ("smoke_fixture", "kind", "pooling"),
+    [("embedding_smoke", "embedding", "mean"), ("reranker_smoke", "reranker", None)],
+)
+def test_load_returns_a_conforming_handle(
+    smoke_fixture: str, kind: str, pooling: str | None, request: pytest.FixtureRequest
+) -> None:
+    """load must hand back an eval/FP32/tuple-output model plus its tokenizer and config."""
+    handle = request.getfixturevalue(smoke_fixture)["handle"]
+
+    assert handle["kind"] == kind
+    assert handle["pooling"] == pooling
+    assert handle["attn"] == "eager"
+    assert handle["model_dir"].is_dir()
+    assert handle["training"] is False
+    assert handle["dtype"] == torch.float32
+    assert handle["return_dict"] is False
+    assert handle["config_is_model_config"] is True
+    assert handle["tokenizer_encodes"] is True
 
 
 @pytest.mark.parametrize("smoke_fixture", ["embedding_smoke", "reranker_smoke"])

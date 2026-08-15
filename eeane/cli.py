@@ -1,4 +1,4 @@
-"""Command-line interface for eeANE (v0.5実装計画.md §4.3, v0.6実装計画.md §4.1).
+"""Command-line interface for eeANE.
 
 Provides three subcommands:
 
@@ -35,7 +35,7 @@ logger = logging.getLogger("eeane.cli")
 
 # Config file permission bits that indicate group/other read access. Used
 # to warn when a config file holding an api_key is not private (chmod 600
-# recommended), per 開発資料/v0.5実装計画.md §4.4.
+# recommended).
 _GROUP_OTHER_READABLE = 0o044
 
 _LOG_LEVEL_CHOICES = ("debug", "info", "warning", "error")
@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_compile_subparser(
     subparsers: argparse._SubParsersAction,  # type: ignore[type-arg]
 ) -> None:
-    """Add the ``compile`` subcommand (v0.6実装計画.md §4.1).
+    """Add the ``compile`` subcommand.
 
     ``compile`` is standalone: it does not read ``eeane.toml`` and has
     no ``--config`` option (unlike ``serve``/``check-config``).
@@ -318,11 +318,10 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     """Check ``[compile]`` dependencies and run model compilation (the ``compile`` subcommand).
 
     Unlike ``serve``/``check-config``, this does not read ``eeane.toml``:
-    ``eeane compile`` is a standalone conversion tool (v0.6実装計画.md
-    §4.1). ``eeane.compiler`` is imported here, not at module load time,
-    so that ``eeane serve``/``check-config`` keep working in
-    environments without the ``[compile]`` extra (torch/transformers)
-    installed.
+    ``eeane compile`` is a standalone conversion tool. ``eeane.compiler``
+    is imported here, not at module load time, so that ``eeane
+    serve``/``check-config`` keep working in environments without the
+    ``[compile]`` extra (torch/transformers) installed.
 
     Args:
         args: Parsed ``compile`` arguments (see
@@ -382,6 +381,11 @@ def _describe_api_key(api_key_source: str | None) -> str:
 def _print_effective_config(loaded: LoadedConfig) -> None:
     """Print the resolved configuration to stdout in human-readable form.
 
+    Values that are only meaningful when set (the cache root, an entry's
+    embedding width and the buckets excluded on the cache's
+    recommendation) are printed only then, so the common output stays
+    short.
+
     Also checks whether every configured artifact path exists; missing
     ones are marked ``[MISSING]`` inline and logged as one WARNING each
     (the configuration remains valid: artifact existence is checked at
@@ -400,6 +404,8 @@ def _print_effective_config(loaded: LoadedConfig) -> None:
     print(f"  log_level: {config.server.log_level}")
     print(f"  api_key: {_describe_api_key(loaded.api_key_source)}")
     print(f"  health_rate_limit: {config.server.health_rate_limit}")
+    if config.server.cache_root is not None:
+        print(f"  cache_root: {config.server.cache_root}")
 
     print("models:")
     for entry in config.models:
@@ -407,8 +413,13 @@ def _print_effective_config(loaded: LoadedConfig) -> None:
         print(f"    kind: {entry.kind}")
         print(f"    tokenizer: {entry.tokenizer}")
         print(f"    buckets: {', '.join(str(bucket) for bucket in entry.buckets)}")
+        if entry.excluded_buckets:
+            excluded = ", ".join(str(bucket) for bucket in entry.excluded_buckets)
+            print(f"    excluded_buckets: {excluded}")
         if entry.kind == "embedding":
             print(f"    normalize: {entry.normalize}")
+            if entry.embedding_dim is not None:
+                print(f"    embedding_dim: {entry.embedding_dim}")
         print("    artifacts:")
         for bucket in entry.buckets:
             path = entry.artifacts[bucket]

@@ -1,4 +1,4 @@
-"""Compile backend dispatch (v0.6実装計画.md §4.2).
+"""Compile backend dispatch.
 
 Reads the ``config.json`` of a HuggingFace-format model directory and
 decides (a) which compile backend implements that architecture and (b)
@@ -25,14 +25,20 @@ KIND_EMBEDDING = "embedding"
 KIND_RERANKER = "reranker"
 KINDS: tuple[str, ...] = (KIND_EMBEDDING, KIND_RERANKER)
 
-# Human-readable list of architectures eeANE v0.6 can compile, used in the
-# "unsupported architecture" error message.
-SUPPORTED_ARCHITECTURES = "ModernBERT (e.g. cl-nagoya/ruri-v3-310m)"
+# Human-readable list of the architectures a backend is registered for,
+# used in the "unsupported architecture" error message.
+SUPPORTED_ARCHITECTURES = (
+    "ModernBERT (e.g. cl-nagoya/ruri-v3-310m) and "
+    "XLM-RoBERTa (e.g. intfloat/multilingual-e5-base, BAAI/bge-reranker-v2-m3)"
+)
 
 # Architecture-name prefix -> "module:attribute" of the backend class. The
-# value is a string so that selecting a backend never imports torch.
+# value is a string so that selecting a backend never imports torch. No key
+# may start with another key, or prefix matching would depend on the order
+# of this mapping.
 BACKEND_REGISTRY: dict[str, str] = {
     "ModernBert": "eeane.compiler.backends.modernbert:ModernBertBackend",
+    "XLMRoberta": "eeane.compiler.backends.xlm_roberta:XlmRobertaBackend",
 }
 
 # Architecture-name suffix that identifies a cross-encoder reranker.
@@ -138,7 +144,8 @@ def select_backend(architectures: list[str]) -> tuple[str, str, str]:
 
     Matching is by name prefix (``ModernBertModel``,
     ``ModernBertForSequenceClassification``, ... all map to the
-    ``ModernBert`` backend); the first matching entry wins.
+    ``ModernBert`` backend); the first matching entry wins, which is
+    unambiguous as long as no registry key starts with another one.
 
     Args:
         architectures: Architecture names from config.json.
@@ -155,7 +162,7 @@ def select_backend(architectures: list[str]) -> tuple[str, str, str]:
                 return architecture, prefix, target
     raise UnsupportedArchitectureError(
         f"Unsupported architecture '{architectures[0]}'. "
-        f"eeANE v0.6 supports: {SUPPORTED_ARCHITECTURES}."
+        f"eeane compile supports: {SUPPORTED_ARCHITECTURES}."
     )
 
 

@@ -1,4 +1,4 @@
-"""Compile artifact layout, naming and records (v0.6実装計画.md §4.3, §4.4).
+"""Compile artifact layout, naming and records.
 
 Everything ``eeane compile`` decides *about* its outputs -- where the
 cache lives, what a model directory and a variant are called, which
@@ -22,13 +22,14 @@ from typing import Any
 from eeane.compiler import sources
 
 # Schema versions of the JSON files written next to the artifacts. Bumped
-# whenever a consumer (v0.7 cache auto-resolution) would need to tell old
-# and new layouts apart.
+# whenever a consumer (the cache auto-resolution in eeane.config) would
+# need to tell old and new layouts apart. model_info.json is at 2 since it
+# now also records embedding_dim, recommended_buckets and calibration.
 METADATA_FORMAT_VERSION = 1
-MODEL_INFO_FORMAT_VERSION = 1
+MODEL_INFO_FORMAT_VERSION = 2
 
-# Default sequence-length buckets per model kind (v0.6実装計画.md §4.1);
-# they reproduce the v0.4/v0.5 deployed configuration.
+# Default sequence-length buckets per model kind; they reproduce the
+# v0.4/v0.5 deployed configuration.
 DEFAULT_BUCKETS: dict[str, tuple[int, ...]] = {
     "embedding": (128, 512, 1024),
     "reranker": (512, 1024),
@@ -40,7 +41,7 @@ TOKENIZER_FILENAME = "tokenizer.json"
 MODEL_INFO_FILENAME = "model_info.json"
 
 # Version keys compared against the recorded metadata when deciding
-# whether an existing variant can be reused (v0.6実装計画.md §4.3).
+# whether an existing variant can be reused.
 SKIP_VERSION_KEYS: tuple[str, ...] = (
     "python",
     "torch",
@@ -188,11 +189,10 @@ def resolve_buckets(buckets: Sequence[int] | None, kind: str) -> list[int]:
 def variant_stem(seq_len: int, batch_size: int, attn: str, target: str, precision: str) -> str:
     """Build the artifact base name of one variant.
 
-    Follows the PoC naming (v0.6実装計画.md §4.3) so that artifacts
-    produced by ``eeane compile`` and by the frozen PoC scripts stay
-    recognisably the same: ``s{S}_b{B}_{attn}_{target}`` plus an
-    ``_fp32`` suffix, which keeps an fp32 experiment from overwriting the
-    fp16 baseline.
+    Follows the PoC naming so that artifacts produced by ``eeane compile``
+    and by the frozen PoC scripts stay recognisably the same:
+    ``s{S}_b{B}_{attn}_{target}`` plus an ``_fp32`` suffix, which keeps an
+    fp32 experiment from overwriting the fp16 baseline.
 
     Args:
         seq_len: Fixed sequence length S.
@@ -222,7 +222,7 @@ def needs_conversion(
     A variant is reusable only when the compiled artifact and its
     metadata both exist, every :data:`SKIP_VERSION_KEYS` entry matches the
     current environment, and the recorded self-check did not fail (a
-    failed variant must never be silently reused, v0.6実装計画.md §4.5).
+    failed variant must never be silently reused).
 
     Args:
         mlmodelc_path: Compiled artifact directory.
@@ -308,6 +308,178 @@ def discover_variants(
     return found
 
 
+def aggregate_calibration(
+    kind: str,
+    cache_artifacts: Mapping[int, Path],
+    run_reports: Mapping[int, Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[int], int | None]:
+    """Aggregate every cached bucket's self-check into the model-level summary.
+
+    Reads back the ``selfcheck`` block every same-family bucket already
+    carries (this run's own buckets from ``run_reports``, the rest from
+    their metadata JSON file next to ``cache_artifacts[seq_len]``) and
+    turns it into the three pieces of ``model_info.json`` that describe
+    the cache as a whole rather than one bucket.
+
+    Args:
+        kind: Resolved model kind (``embedding_dim`` is only ever derived
+            for ``"embedding"``).
+        cache_artifacts: Bucket -> ``.mlmodelc`` path of every same-family
+            variant now present in the cache.
+        run_reports: Self-check reports this invocation itself produced,
+            keyed by bucket. A bucket this run reused or skipped is not
+            in here and is read back from disk instead.
+
+    Returns:
+        Tuple of ``(calibration, recommended_buckets, embedding_dim)``:
+        the ``calibration`` record, the ascending buckets to recommend
+        loading (every cached bucket whose self-check did not report
+        ``status="failed"``), and the embedding width (``None`` for a
+        reranker, or when no cached bucket recorded one).
+
+    Raises:
+        CompileError: If cached embedding buckets disagree on
+            ``embedding_dim`` -- a corrupt or hand-edited cache.
+    """
+    reports: dict[int, Mapping[str, Any] | None] = {
+        seq_len: run_reports[seq_len] if seq_len in run_reports else _read_selfcheck(mlmodelc_path)
+        for seq_len, mlmodelc_path in cache_artifacts.items()
+    }
+    buckets = {
+        str(seq_len): _calibration_bucket_entry(reports[seq_len]) for seq_len in sorted(reports)
+    }
+    calibration = {"machine": _pick_machine(reports, run_reports), "buckets": buckets}
+    recommended_buckets = sorted(
+        seq_len for seq_len in reports if buckets[str(seq_len)]["status"] != SELFCHECK_STATUS_FAILED
+    )
+    embedding_dim = _resolve_embedding_dim(kind, reports)
+    return calibration, recommended_buckets, embedding_dim
+
+
+def _read_selfcheck(mlmodelc_path: Path) -> Mapping[str, Any] | None:
+    """Read back the ``selfcheck`` block of a variant from its metadata file.
+
+    Args:
+        mlmodelc_path: Compiled ``.mlmodelc`` path; its metadata JSON is
+            the same stem with a ``.json`` extension.
+
+    Returns:
+        The ``selfcheck`` dict, or ``None`` when the metadata is missing,
+        unreadable, or carries no usable ``selfcheck`` block.
+    """
+    metadata_path = mlmodelc_path.with_suffix(".json")
+    try:
+        recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(recorded, dict):
+        return None
+    selfcheck = recorded.get("selfcheck")
+    return selfcheck if isinstance(selfcheck, dict) else None
+
+
+def _calibration_bucket_entry(report: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Build one bucket's entry of ``calibration.buckets``.
+
+    Args:
+        report: That bucket's ``selfcheck`` block, or ``None``.
+
+    Returns:
+        ``{"status": None, ..., "measured": False}`` when the metadata
+        could not be read, the self-check was skipped, or no self-check
+        ran at all; otherwise every measured field the report carries
+        (``None`` for a field the report itself does not have, e.g. the
+        internal-exception report of ``eeane.compiler.selfcheck``, which
+        has no ``sanity``/``compute_plan``/``latency`` section) plus
+        ``"measured": True``.
+    """
+    status = report.get("status") if isinstance(report, Mapping) else None
+    if status is None or status == SELFCHECK_STATUS_SKIPPED:
+        return {
+            "status": None,
+            "sanity_passed": None,
+            "ne_placement_pct": None,
+            "latency_median_ms": None,
+            "latency_p95_ms": None,
+            "measured": False,
+        }
+    sanity = report.get("sanity") if isinstance(report, Mapping) else None
+    compute_plan = report.get("compute_plan") if isinstance(report, Mapping) else None
+    latency = report.get("latency") if isinstance(report, Mapping) else None
+    return {
+        "status": status,
+        "sanity_passed": sanity.get("passed") if isinstance(sanity, Mapping) else None,
+        "ne_placement_pct": (
+            compute_plan.get("ne_placement_pct") if isinstance(compute_plan, Mapping) else None
+        ),
+        "latency_median_ms": latency.get("median_ms") if isinstance(latency, Mapping) else None,
+        "latency_p95_ms": latency.get("p95_ms") if isinstance(latency, Mapping) else None,
+        "measured": True,
+    }
+
+
+def _pick_machine(
+    reports: Mapping[int, Mapping[str, Any] | None],
+    run_reports: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Pick the ``calibration.machine`` block, preferring this run's own.
+
+    Args:
+        reports: Every cached bucket's ``selfcheck`` block (or ``None``),
+            keyed by bucket.
+        run_reports: The subset ``reports`` this invocation itself
+            produced; a machine block from here always wins over one read
+            back from an earlier run's metadata.
+
+    Returns:
+        The first ``machine`` block found, preferring this run's own
+        buckets (ascending) and falling back to the rest (ascending), or
+        ``None`` when no bucket carries one (e.g. every self-check was
+        skipped, always and previously).
+    """
+    ordered = sorted(reports, key=lambda seq_len: (seq_len not in run_reports, seq_len))
+    for seq_len in ordered:
+        report = reports[seq_len]
+        machine = report.get("machine") if isinstance(report, Mapping) else None
+        if isinstance(machine, Mapping):
+            return dict(machine)
+    return None
+
+
+def _resolve_embedding_dim(
+    kind: str, reports: Mapping[int, Mapping[str, Any] | None]
+) -> int | None:
+    """Derive the single ``embedding_dim`` recorded across every cached bucket.
+
+    Args:
+        kind: Resolved model kind; a reranker never records a width.
+        reports: Every cached bucket's ``selfcheck`` block (or ``None``).
+
+    Returns:
+        The shared ``embedding_dim``, or ``None`` for a reranker or when
+        no cached bucket recorded one (e.g. every self-check was skipped).
+
+    Raises:
+        CompileError: If cached buckets disagree on ``embedding_dim``.
+    """
+    if kind != "embedding":
+        return None
+    dims: set[int] = set()
+    for report in reports.values():
+        sanity = report.get("sanity") if isinstance(report, Mapping) else None
+        dim = sanity.get("embedding_dim") if isinstance(sanity, Mapping) else None
+        if isinstance(dim, int) and not isinstance(dim, bool):
+            dims.add(dim)
+    if not dims:
+        return None
+    if len(dims) > 1:
+        raise CompileError(
+            f"the compiled-model cache records inconsistent embedding_dim values "
+            f"{sorted(dims)} across its buckets; it looks corrupt -- recompile with --force"
+        )
+    return next(iter(dims))
+
+
 def build_config_snippet(
     *,
     model_id: str,
@@ -315,8 +487,17 @@ def build_config_snippet(
     tokenizer_path: Path,
     artifacts: Mapping[int, Path],
     normalize: bool = True,
+    cache_root_hint: Path | None = None,
 ) -> str:
-    """Build the ``[[models]]`` TOML snippet for a compiled model.
+    """Build the minimal ``[[models]]`` TOML snippet for a compiled model.
+
+    The minimal form sets only ``id`` (plus ``normalize`` for an embedding
+    entry): ``kind``, ``tokenizer`` and ``artifacts`` are then resolved
+    automatically from the compiled-model cache at server start, so the
+    snippet keeps working across recompiles that add or drop buckets. The
+    explicit equivalent -- what a user would write to pin those fields
+    instead, e.g. to point at artifacts moved out of the cache -- is
+    included as a comment.
 
     Paths are absolutized because the snippet is meant to be pasted into
     a config file living somewhere else entirely (eeANE resolves relative
@@ -329,21 +510,36 @@ def build_config_snippet(
         artifacts: Bucket length -> compiled ``.mlmodelc`` path.
         normalize: ``normalize`` value for an embedding entry. Never
             emitted for a reranker: the config schema rejects it there.
+        cache_root_hint: The cache root the artifacts were compiled into,
+            when it is not the default eeANE resolves on its own; a
+            reminder comment naming the ``[server] cache_root`` the
+            entry needs is prepended. ``None`` when the default cache
+            root was used, which needs no such reminder.
 
     Returns:
         A TOML fragment ending in a newline.
     """
-    lines = [
-        "[[models]]",
-        f"id = {_toml_string(model_id)}",
-        f"kind = {_toml_string(kind)}",
-        f"tokenizer = {_toml_string(str(Path(tokenizer_path).resolve()))}",
-    ]
+    lines: list[str] = []
+    if cache_root_hint is not None:
+        lines += [
+            "# This model was compiled into a non-default cache root; the server",
+            "# needs to be pointed at the same one to resolve this entry automatically:",
+            "# [server]",
+            f"# cache_root = {_toml_string(str(Path(cache_root_hint).resolve()))}",
+            "",
+        ]
+    lines += ["[[models]]", f"id = {_toml_string(model_id)}"]
     if kind == "embedding":
         lines.append(f"normalize = {'true' if normalize else 'false'}")
-    lines += ["", "[models.artifacts]"]
     lines += [
-        f"{bucket} = {_toml_string(str(Path(artifacts[bucket]).resolve()))}"
+        "# kind / tokenizer / artifacts are resolved from the compiled-model cache.",
+        "# To pin them explicitly instead:",
+        f"# kind = {_toml_string(kind)}",
+        f"# tokenizer = {_toml_string(str(Path(tokenizer_path).resolve()))}",
+        "# [models.artifacts]",
+    ]
+    lines += [
+        f"# {bucket} = {_toml_string(str(Path(artifacts[bucket]).resolve()))}"
         for bucket in sorted(artifacts)
     ]
     return "\n".join(lines) + "\n"

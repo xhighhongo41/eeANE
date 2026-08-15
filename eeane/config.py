@@ -1,14 +1,21 @@
 """Configuration schema, TOML loader, and built-in defaults for eeANE.
 
 A TOML config file plus CLI/environment overrides, validated via pydantic
-v2. See 開発資料/v0.5実装計画.md §4.1-§4.2 for the authoritative design,
-and 開発資料/v0.6実装計画.md §4.6 for the v0.6 change from a
-HuggingFace model directory to a frozen ``tokenizer.json`` per model.
+v2.
 
 Precedence (lowest to highest): built-in default < config file <
 ``EEANE_API_KEY`` environment variable (``api_key`` only) < CLI overrides.
 No deep merge is implemented: if a config file is used, its ``models`` list
 fully replaces the built-in default model list.
+
+Any number of embedding and reranker models may be served at once; within
+each kind, the first entry listed is the default one. A ``[[models]]``
+entry either spells out everything it needs (``kind``, ``tokenizer``,
+``artifacts``) or gives only an ``id``, in which case the omitted fields
+are filled in from the compiled-model cache written by ``eeane compile``
+(see :mod:`eeane.cache`). Both forms end up equally complete: after
+loading, every entry has a kind, a frozen tokenizer, and at least one
+compiled artifact.
 """
 
 from __future__ import annotations
@@ -30,7 +37,20 @@ from pydantic import (
     model_validator,
 )
 
+from eeane.cache import (
+    MODEL_INFO_FILENAME,
+    CacheError,
+    load_model_info,
+    model_cache_dir,
+    resolve_cache_root,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Highest ``model_info.json`` schema version this release knows how to
+# read. A newer record may assign different meanings to the keys below,
+# so it is rejected instead of guessed at.
+MAX_MODEL_INFO_FORMAT_VERSION = 2
 
 
 class ConfigError(Exception):
@@ -54,6 +74,10 @@ class ServerConfig(BaseModel):
             non-empty.
         health_rate_limit: Maximum ``/health`` requests per minute per
             client IP. ``0`` disables the limit.
+        cache_root: Root of the compiled-model cache used to auto-resolve
+            model entries, or ``None`` for the default location (see
+            :func:`eeane.cache.resolve_cache_root`). A relative path is
+            resolved against the config file's directory.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -63,18 +87,26 @@ class ServerConfig(BaseModel):
     log_level: Literal["debug", "info", "warning", "error"] = "info"
     api_key: str | None = Field(default=None, min_length=1)
     health_rate_limit: int = Field(default=60, ge=0)
+    cache_root: Path | None = None
 
 
 class ModelEntry(BaseModel):
     """A single ``[[models]]`` entry: one served embedding or reranker model.
 
+    Every field except ``id`` may be omitted in the config file and filled
+    in from the compiled-model cache instead (see :func:`load_config`).
+    Validation therefore runs *after* that resolution: an entry that still
+    lacks a kind, a tokenizer, or artifacts by then is rejected.
+
     Attributes:
-        id: Model identifier reported in API responses. Must be non-empty.
+        id: Model identifier reported in API responses, and the key used
+            to look the model up in the compiled-model cache. Must be
+            non-empty.
         kind: Either ``"embedding"`` or ``"reranker"``.
         tokenizer: Frozen ``tokenizer.json`` file written by ``eeane
-            compile`` (v0.6実装計画.md §4.6). Pointing this at a
-            HuggingFace-distributed ``tokenizer.json`` is rejected at
-            engine startup: it carries no padding section.
+            compile``. Pointing this at a HuggingFace-distributed
+            ``tokenizer.json`` is rejected at engine startup: it carries
+            no padding section.
         artifacts: Map of fixed sequence-length bucket to compiled Core ML
             artifact path (``.mlmodelc``). TOML tables always have string
             keys, so this is coerced to ``int`` explicitly rather than
@@ -83,33 +115,46 @@ class ModelEntry(BaseModel):
             for ``kind="embedding"``; explicitly setting this on a
             ``kind="reranker"`` entry is a configuration error.
         output_name: Name of the Core ML output tensor to read. If
-            omitted, derived from ``kind`` (``"embedding"`` ->
-            ``"embedding"``, ``"reranker"`` -> ``"logits"``).
+            omitted (and not recorded in the cache), derived from ``kind``
+            (``"embedding"`` -> ``"embedding"``, ``"reranker"`` ->
+            ``"logits"``).
+        embedding_dim: Width of the embedding vectors, when known. Filled
+            in from the cache for embedding models compiled by a release
+            that records it; ``None`` otherwise, and always ``None`` for a
+            reranker.
+        excluded_buckets: Buckets present in the cache but left out of
+            ``artifacts`` because the cache recommends against loading
+            them. Informational only (reported at server startup).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1)
-    kind: Literal["embedding", "reranker"]
-    tokenizer: Path
-    artifacts: dict[int, Path]
+    kind: Literal["embedding", "reranker"] | None = None
+    tokenizer: Path | None = None
+    artifacts: dict[int, Path] | None = None
     normalize: bool = True
     output_name: str | None = None
+    embedding_dim: int | None = Field(default=None, gt=0)
+    excluded_buckets: tuple[int, ...] = ()
 
     @field_validator("artifacts", mode="before")
     @classmethod
-    def _coerce_artifact_keys(cls, value: Any, info: ValidationInfo) -> dict[int, Path]:
+    def _coerce_artifact_keys(cls, value: Any, info: ValidationInfo) -> dict[int, Path] | None:
         """Coerce TOML string bucket-length keys to positive ints.
 
         Args:
             value: Raw ``artifacts`` value as parsed from TOML (or as
                 re-supplied by :func:`load_config` during re-validation).
+                ``None`` means "not configured yet" and is passed through
+                for the model-level validator to report.
             info: Validation context; used to look up the entry's ``id``
                 (already validated, since it is declared earlier in the
                 model) for error messages.
 
         Returns:
-            A dict mapping positive bucket-length ints to ``Path``.
+            A dict mapping positive bucket-length ints to ``Path``, or
+            ``None``.
 
         Raises:
             ValueError: If ``value`` is not a non-empty mapping, or any
@@ -117,6 +162,8 @@ class ModelEntry(BaseModel):
         """
         entry_id = info.data.get("id", "<unknown>")
 
+        if value is None:
+            return None
         if not isinstance(value, dict):
             raise ValueError(f"model '{entry_id}': 'artifacts' must be a table of bucket lengths")
         if not value:
@@ -141,16 +188,28 @@ class ModelEntry(BaseModel):
 
     @model_validator(mode="after")
     def _finalize(self) -> ModelEntry:
-        """Reject reranker-with-explicit-``normalize``; derive ``output_name``.
+        """Check completeness, reject reranker-with-``normalize``, derive ``output_name``.
 
         Raises:
-            ValueError: If ``normalize`` was explicitly set on a
+            ValueError: If ``kind``/``tokenizer``/``artifacts`` are still
+                unset (neither configured nor resolved from the cache), or
+                if ``normalize`` was explicitly set on a
                 ``kind="reranker"`` entry.
 
         Returns:
             ``self``, with ``output_name`` filled in from ``kind`` when it
             was not explicitly provided.
         """
+        missing = [
+            name for name in ("kind", "tokenizer", "artifacts") if getattr(self, name) is None
+        ]
+        if missing:
+            listed = ", ".join(f"'{name}'" for name in missing)
+            raise ValueError(
+                f"model '{self.id}': {listed} must be set explicitly unless the entry is "
+                "resolved from the compiled-model cache (omit 'tokenizer' and 'artifacts' "
+                "to resolve it by id)"
+            )
         if self.kind == "reranker" and "normalize" in self.model_fields_set:
             raise ValueError(
                 f"model '{self.id}': 'normalize' may only be set on kind='embedding' entries"
@@ -162,7 +221,7 @@ class ModelEntry(BaseModel):
     @property
     def buckets(self) -> tuple[int, ...]:
         """Ascending tuple of sequence-length buckets covered by ``artifacts``."""
-        return tuple(sorted(self.artifacts))
+        return tuple(sorted(self.artifacts or ()))
 
 
 class EeaneConfig(BaseModel):
@@ -170,10 +229,11 @@ class EeaneConfig(BaseModel):
 
     Attributes:
         server: Server/network/auth settings.
-        models: Served model entries. Exactly one ``kind="embedding"``
-            entry is required; at most one ``kind="reranker"`` entry is
-            allowed. Serving multiple models of the same kind
-            simultaneously is out of scope until v0.7.
+        models: Served model entries, in config-file order. At least one
+            ``kind="embedding"`` entry is required (the engine's embedding
+            endpoints have no meaning without one); rerankers are
+            optional. Any number of either kind may be listed, as long as
+            every ``id`` is unique across kinds.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -183,7 +243,7 @@ class EeaneConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_model_composition(self) -> EeaneConfig:
-        """Enforce embedding=1, reranker<=1, and unique ``id`` across ``models``.
+        """Enforce embedding>=1 and unique ``id`` across ``models``.
 
         Raises:
             ValueError: If the composition constraints are violated.
@@ -191,21 +251,8 @@ class EeaneConfig(BaseModel):
         Returns:
             ``self``.
         """
-        embeddings = [entry for entry in self.models if entry.kind == "embedding"]
-        rerankers = [entry for entry in self.models if entry.kind == "reranker"]
-
-        if not embeddings:
-            raise ValueError("exactly one 'embedding' model entry is required, found 0")
-        if len(embeddings) > 1:
-            raise ValueError(
-                f"exactly one 'embedding' model entry is required, found {len(embeddings)}; "
-                "serving multiple models simultaneously is planned for v0.7"
-            )
-        if len(rerankers) > 1:
-            raise ValueError(
-                f"at most one 'reranker' model entry is allowed, found {len(rerankers)}; "
-                "serving multiple models simultaneously is planned for v0.7"
-            )
+        if not self.models_of_kind("embedding"):
+            raise ValueError("at least one 'embedding' model entry is required, found 0")
 
         seen_ids: set[str] = set()
         for entry in self.models:
@@ -215,22 +262,61 @@ class EeaneConfig(BaseModel):
 
         return self
 
+    def models_of_kind(self, kind: str) -> list[ModelEntry]:
+        """Return every configured entry of ``kind``, in config-file order.
+
+        Args:
+            kind: ``"embedding"`` or ``"reranker"``.
+
+        Returns:
+            The matching entries; empty if none are configured.
+        """
+        return [entry for entry in self.models if entry.kind == kind]
+
+    def default_model(self, kind: str) -> ModelEntry | None:
+        """Return the default entry of ``kind``: the first one listed.
+
+        Args:
+            kind: ``"embedding"`` or ``"reranker"``.
+
+        Returns:
+            The first configured entry of that kind, or ``None`` if none
+            is configured. An ``"embedding"`` lookup always succeeds: the
+            composition rules require at least one.
+        """
+        for entry in self.models:
+            if entry.kind == kind:
+                return entry
+        return None
+
+    def model_by_id(self, model_id: str) -> ModelEntry | None:
+        """Return the entry with the given ``id``.
+
+        Args:
+            model_id: Exact model id as configured.
+
+        Returns:
+            The matching entry (ids are unique), or ``None`` if no
+            configured model has that id.
+        """
+        for entry in self.models:
+            if entry.id == model_id:
+                return entry
+        return None
+
     @property
     def embedding_model(self) -> ModelEntry:
-        """Return the (always present) configured embedding model entry."""
-        for entry in self.models:
-            if entry.kind == "embedding":
-                return entry
-        # Unreachable: _validate_model_composition guarantees exactly one.
-        raise RuntimeError("no embedding model configured")  # pragma: no cover
+        """Return the default (first-listed) embedding model entry."""
+        entry = self.default_model("embedding")
+        if entry is None:
+            # Unreachable: _validate_model_composition requires one.
+            raise RuntimeError("no embedding model configured")  # pragma: no cover
+        return entry
 
     @property
     def reranker_model(self) -> ModelEntry | None:
-        """Return the configured reranker model entry, or ``None`` if absent."""
-        for entry in self.models:
-            if entry.kind == "reranker":
-                return entry
-        return None
+        """Return the default (first-listed) reranker entry, or ``None`` if absent."""
+        return self.default_model("reranker")
 
 
 @dataclass
@@ -320,9 +406,11 @@ def load_config(
     3. ``~/.config/eeane/eeane.toml``.
     4. None of the above: use :func:`default_config`.
 
-    When a config file is used, relative ``tokenizer``/``artifacts``
-    paths are resolved against the config file's parent directory before
-    pydantic validation runs.
+    When a config file is used, relative ``tokenizer``/``artifacts``/
+    ``cache_root`` paths are resolved against the config file's parent
+    directory, and model entries that omit ``tokenizer`` or ``artifacts``
+    are completed from the compiled-model cache, both before pydantic
+    validation runs.
 
     Overrides are applied in ascending precedence: built-in default <
     config file < ``EEANE_API_KEY`` (``api_key`` only, empty string is
@@ -336,22 +424,23 @@ def load_config(
             caller (e.g. via ``--config``), taking precedence over the
             search order.
         overrides: CLI-supplied scalar overrides for ``server``.
-        env: Environment mapping to read ``EEANE_API_KEY`` from. Defaults
-            to ``os.environ`` when ``None`` (kept as a parameter for
-            testability).
+        env: Environment mapping to read ``EEANE_API_KEY`` and
+            ``XDG_CACHE_HOME`` from. Defaults to ``os.environ`` when
+            ``None`` (kept as a parameter for testability).
 
     Returns:
         The resolved configuration plus provenance information.
 
     Raises:
         ConfigError: If ``explicit_path`` does not exist, the config file
-            has a TOML syntax error, or the resolved configuration fails
-            pydantic validation.
+            has a TOML syntax error, a model entry cannot be resolved
+            from the compiled-model cache, or the resolved configuration
+            fails pydantic validation.
     """
     env = env if env is not None else os.environ
 
     source = _resolve_source_path(explicit_path)
-    config = default_config() if source is None else _load_from_file(source)
+    config = default_config() if source is None else _load_from_file(source, env=env)
 
     api_key_source: str | None = "file" if config.server.api_key else None
 
@@ -405,18 +494,20 @@ def _resolve_source_path(explicit_path: Path | None) -> Path | None:
     return None
 
 
-def _load_from_file(path: Path) -> EeaneConfig:
-    """Parse, resolve relative paths in, and validate a config file.
+def _load_from_file(path: Path, *, env: Mapping[str, str]) -> EeaneConfig:
+    """Parse, resolve paths and cache references in, and validate a config file.
 
     Args:
         path: Config file to load.
+        env: Environment mapping used to locate the compiled-model cache.
 
     Returns:
         The validated configuration.
 
     Raises:
         ConfigError: If the file has a TOML syntax error, cannot be read,
-            or fails pydantic validation.
+            references a model that is not in the compiled-model cache, or
+            fails pydantic validation.
     """
     try:
         with path.open("rb") as fh:
@@ -429,6 +520,7 @@ def _load_from_file(path: Path) -> EeaneConfig:
     # path may itself be relative (e.g. --config eeane.example.toml), so
     # resolve it first: model paths must come out absolute either way.
     _resolve_relative_paths(raw, base_dir=path.resolve().parent)
+    _resolve_from_cache(raw, source=path, env=env)
 
     try:
         return EeaneConfig(**raw)
@@ -441,13 +533,22 @@ def _load_from_file(path: Path) -> EeaneConfig:
 
 
 def _resolve_relative_paths(raw: dict[str, Any], *, base_dir: Path) -> None:
-    """Absolutize relative tokenizer/artifacts paths in-place, before validation.
+    """Absolutize relative tokenizer/artifacts/cache_root paths in-place, before validation.
 
     Args:
         raw: Dict as parsed by ``tomllib.load`` (mutated in place).
         base_dir: Directory the config file lives in; relative paths are
             resolved against this directory.
     """
+    server = raw.get("server")
+    if isinstance(server, dict):
+        cache_root = server.get("cache_root")
+        if isinstance(cache_root, str):
+            # ``~`` is expanded here rather than joined onto base_dir: a
+            # cache root is a machine-level location, so a home-relative
+            # spelling is the natural one to write.
+            server["cache_root"] = _resolve_one_path(base_dir, cache_root, expand_user=True)
+
     models = raw.get("models")
     if not isinstance(models, list):
         return
@@ -467,19 +568,242 @@ def _resolve_relative_paths(raw: dict[str, Any], *, base_dir: Path) -> None:
                     artifacts[bucket_key] = _resolve_one_path(base_dir, artifact_path)
 
 
-def _resolve_one_path(base_dir: Path, value: str) -> Path:
+def _resolve_one_path(base_dir: Path, value: str, *, expand_user: bool = False) -> Path:
     """Resolve a single possibly-relative path string against ``base_dir``.
 
     Args:
         base_dir: Directory to resolve relative paths against.
         value: Raw path string from the config file.
+        expand_user: Whether a leading ``~`` is expanded to the user's
+            home directory before the relative/absolute decision.
 
     Returns:
         ``value`` unchanged (as a ``Path``) if already absolute, otherwise
         ``base_dir / value``.
     """
     candidate = Path(value)
+    if expand_user:
+        candidate = candidate.expanduser()
     return candidate if candidate.is_absolute() else base_dir / candidate
+
+
+def _resolve_from_cache(raw: dict[str, Any], *, source: Path, env: Mapping[str, str]) -> None:
+    """Complete cache-resolvable model entries in-place, before validation.
+
+    An entry is left untouched when it spells out both ``tokenizer`` and
+    ``artifacts``: that is the fully explicit form, which must keep
+    working without any cache on disk. Otherwise the entry's ``id`` is
+    looked up in the compiled-model cache and every omitted field is
+    filled in from the recorded ``model_info.json``.
+
+    Args:
+        raw: Dict as parsed by ``tomllib.load`` (mutated in place).
+        source: Config file the entries came from, for error messages.
+        env: Environment mapping used to locate the cache root.
+
+    Raises:
+        ConfigError: If an entry needs the cache and the cache cannot be
+            read or contradicts the entry.
+    """
+    models = raw.get("models")
+    if not isinstance(models, list):
+        return
+
+    cache_root_value: Any = None
+    server = raw.get("server")
+    if isinstance(server, dict):
+        cache_root_value = server.get("cache_root")
+        if cache_root_value is not None and not isinstance(cache_root_value, str | Path):
+            # Guessing a cache root here would hide the real problem;
+            # leave the entries alone so pydantic reports the bad type.
+            return
+
+    cache_root: Path | None = None
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("tokenizer") is not None and entry.get("artifacts") is not None:
+            continue
+        model_id = entry.get("id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            # An unusable id is a schema error; let pydantic name it.
+            continue
+        if cache_root is None:
+            override = None if cache_root_value is None else Path(cache_root_value)
+            cache_root = resolve_cache_root(override, env=env)
+        try:
+            _fill_entry_from_cache(entry, model_id, cache_root)
+        except (CacheError, ConfigError) as exc:
+            raise ConfigError(f"Invalid config file '{source}': model '{model_id}': {exc}") from exc
+
+
+def _fill_entry_from_cache(entry: dict[str, Any], model_id: str, cache_root: Path) -> None:
+    """Fill one raw model entry's omitted fields from the compiled-model cache.
+
+    Args:
+        entry: Raw ``[[models]]`` table (mutated in place).
+        model_id: The entry's ``id``, used as the cache lookup key.
+        cache_root: Root of the compiled-model cache.
+
+    Raises:
+        ConfigError: If the model is not in the cache, its record is
+            unreadable/malformed, or the record contradicts a field the
+            entry states explicitly. Messages are written without the
+            config-file context, which the caller adds.
+    """
+    model_dir = model_cache_dir(cache_root, model_id)
+    try:
+        info = load_model_info(model_dir)
+    except CacheError as exc:
+        missing = ", ".join(
+            f"'{name}'" for name in ("tokenizer", "artifacts") if entry.get(name) is None
+        )
+        raise ConfigError(
+            f"{missing} not set and the compiled-model cache in '{model_dir}' cannot be "
+            f"used ({exc}); run 'eeane compile {model_id}' first, or set 'kind', "
+            "'tokenizer' and 'artifacts' explicitly"
+        ) from exc
+
+    record = f"'{model_dir / MODEL_INFO_FILENAME}'"
+    version = info.get("format_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise ConfigError(
+            f"{record} has no usable 'format_version'; re-run 'eeane compile {model_id}'"
+        )
+    if version > MAX_MODEL_INFO_FORMAT_VERSION:
+        raise ConfigError(
+            f"{record} has format_version {version}, which this eeANE release cannot read "
+            f"(it understands up to {MAX_MODEL_INFO_FORMAT_VERSION}); upgrade eeANE or "
+            f"re-run 'eeane compile {model_id}' with this release"
+        )
+
+    kind = info.get("kind")
+    if kind not in ("embedding", "reranker"):
+        raise ConfigError(f"{record} records an unsupported model kind {kind!r}")
+    declared_kind = entry.get("kind")
+    if declared_kind is not None and declared_kind != kind:
+        raise ConfigError(
+            f"the config declares kind '{declared_kind}', but the compiled model in "
+            f"'{model_dir}' is a '{kind}' model"
+        )
+    entry["kind"] = kind
+
+    if entry.get("tokenizer") is None:
+        entry["tokenizer"] = _cache_relative_path(
+            model_dir, info.get("tokenizer"), field="tokenizer"
+        )
+
+    if entry.get("artifacts") is None:
+        artifacts, excluded = _cached_artifacts(info, model_dir)
+        entry["artifacts"] = artifacts
+        entry["excluded_buckets"] = excluded
+
+    if entry.get("output_name") is None:
+        output_name = info.get("output_name")
+        if output_name is not None:
+            if not isinstance(output_name, str) or not output_name:
+                raise ConfigError(f"{record} records an unusable 'output_name'")
+            entry["output_name"] = output_name
+
+    # Recorded only from format_version 2 on, and never for a reranker:
+    # an absent or null value simply leaves the width unknown.
+    if entry.get("embedding_dim") is None:
+        embedding_dim = info.get("embedding_dim")
+        if embedding_dim is not None:
+            if (
+                not isinstance(embedding_dim, int)
+                or isinstance(embedding_dim, bool)
+                or embedding_dim <= 0
+            ):
+                raise ConfigError(f"{record} records an unusable 'embedding_dim'")
+            entry["embedding_dim"] = embedding_dim
+
+
+def _cached_artifacts(
+    info: Mapping[str, Any], model_dir: Path
+) -> tuple[dict[int, Path], list[int]]:
+    """Pick the artifacts to load from a cache record.
+
+    Args:
+        info: Parsed ``model_info.json`` contents.
+        model_dir: Directory the record lives in; artifact file names are
+            recorded relative to it.
+
+    Returns:
+        A ``(artifacts, excluded_buckets)`` pair. When the record carries
+        a ``recommended_buckets`` list, only those buckets are loaded and
+        the remaining compiled ones are reported as excluded.
+
+    Raises:
+        ConfigError: If the record lists no usable artifact, or its
+            recommendation leaves nothing to load.
+    """
+    record = f"'{model_dir / MODEL_INFO_FILENAME}'"
+    recorded = info.get("artifacts")
+    if not isinstance(recorded, dict) or not recorded:
+        raise ConfigError(f"{record} lists no compiled artifacts")
+
+    artifacts: dict[int, Path] = {}
+    for raw_key, raw_name in recorded.items():
+        try:
+            bucket = int(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"{record} has artifacts key '{raw_key}', which is not a bucket length"
+            ) from exc
+        if bucket <= 0:
+            raise ConfigError(
+                f"{record} has artifacts key '{raw_key}', which is not a positive bucket length"
+            )
+        artifacts[bucket] = _cache_relative_path(model_dir, raw_name, field="artifacts")
+
+    recommended = info.get("recommended_buckets")
+    if recommended is None:
+        # Recorded only from format_version 2 on: without it, every
+        # compiled bucket is loaded, as earlier releases did.
+        return artifacts, []
+    if not isinstance(recommended, list) or any(
+        not isinstance(bucket, int) or isinstance(bucket, bool) for bucket in recommended
+    ):
+        raise ConfigError(f"{record} has an unusable 'recommended_buckets' list")
+
+    wanted = set(recommended)
+    selected = {bucket: path for bucket, path in artifacts.items() if bucket in wanted}
+    if not selected:
+        raise ConfigError(
+            f"{record} has 'recommended_buckets' {sorted(wanted)}, none of which are "
+            f"compiled (available: {sorted(artifacts)})"
+        )
+    return selected, sorted(set(artifacts) - set(selected))
+
+
+def _cache_relative_path(model_dir: Path, value: Any, *, field: str) -> Path:
+    """Turn a file name recorded in the cache into an absolute path.
+
+    Args:
+        model_dir: Directory the record lives in.
+        value: Recorded file name, expected to be a relative path that
+            stays inside ``model_dir``.
+        field: Field name, for error messages.
+
+    Returns:
+        ``model_dir / value``.
+
+    Raises:
+        ConfigError: If ``value`` is not a relative, non-escaping file
+            name (a record pointing outside its own directory is treated
+            as corrupt rather than followed).
+    """
+    record = f"'{model_dir / MODEL_INFO_FILENAME}'"
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{record} records no usable '{field}' file name")
+
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ConfigError(
+            f"{record} points '{field}' at '{value}', outside its own cache directory"
+        )
+    return model_dir / relative
 
 
 def _revalidate(config: EeaneConfig) -> EeaneConfig:

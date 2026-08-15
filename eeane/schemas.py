@@ -1,4 +1,4 @@
-"""Request/response models for eeANE's HTTP API (v0.4 T3, see 開発資料/v0.4実装計画.md §4.4-§4.6).
+"""Request/response models for eeANE's HTTP API.
 
 eeANE exposes an OpenAI-compatible ``/v1/embeddings`` endpoint and an
 Infinity-compatible ``/rerank`` / ``/v1/rerank`` endpoint pair. Compatible
@@ -36,8 +36,10 @@ class EmbeddingsRequest(BaseModel):
         input: Text(s) to embed. A single string is normalized to a
             one-element list. Token id arrays (as allowed by the OpenAI API)
             are not supported and are rejected with a validation error.
-        model: Requested model id. Accepted but ignored (eeANE serves a
-            single fixed embedding model per v0.4 scope).
+        model: Id of the embedding model to serve the request with, as
+            listed by ``GET /models``. Omitting it (or sending ``null``)
+            selects the server's default embedding model. An unknown id is
+            answered with 404, an id naming a reranker with 400.
         encoding_format: Either ``"float"`` (plain JSON floats) or
             ``"base64"`` (base64-encoded little-endian float32 bytes, as
             requested by the official OpenAI SDK by default).
@@ -124,8 +126,10 @@ class RerankRequest(BaseModel):
             corresponding result entry.
         raw_scores: If true, return raw logits instead of sigmoid-mapped
             relevance scores.
-        model: Requested model id. Accepted but ignored (eeANE serves a
-            single fixed reranker model per v0.4 scope).
+        model: Id of the reranker to serve the request with, as listed by
+            ``GET /models``. Omitting it (or sending ``null``) selects the
+            server's default reranker. An unknown id is answered with 404,
+            an id naming an embedding model with 400.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -196,12 +200,25 @@ class ModelListResponse(BaseModel):
 
     Attributes:
         object: Discriminator, always ``"list"``.
-        data: One card per configured model (the embedding model, plus the
-            reranker model when one is configured).
+        data: One card per configured model, in configuration order.
     """
 
     object: Literal["list"] = "list"
     data: list[ModelCard]
+
+
+class HealthModel(BaseModel):
+    """A single served model within a ``GET /health`` response.
+
+    Attributes:
+        id: Model id requests route by (``[[models]] id``).
+        kind: Either ``"embedding"`` or ``"reranker"``.
+        buckets: Ascending sequence-length buckets the model serves.
+    """
+
+    id: str
+    kind: str
+    buckets: list[int]
 
 
 class HealthResponse(BaseModel):
@@ -210,11 +227,10 @@ class HealthResponse(BaseModel):
     Attributes:
         status: Server status string (e.g. ``"ok"``).
         version: eeANE package version (``eeane.__version__``).
-        models: Mapping from model kind (``"embedding"``, ``"reranker"``)
-            to the list of supported sequence-length buckets, e.g.
-            ``{"embedding": [128, 512, 1024], "reranker": [512]}``.
+        models: One entry per served model, in configuration order, e.g.
+            ``[{"id": "m1", "kind": "embedding", "buckets": [128, 512]}]``.
     """
 
     status: str
     version: str
-    models: dict[str, list[int]]
+    models: list[HealthModel]

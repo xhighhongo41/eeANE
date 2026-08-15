@@ -1,4 +1,4 @@
-"""Tests for eeane.compiler.dispatch (v0.6 T3, see 開発資料/v0.6実装計画.md §4.2, §4.9)."""
+"""Tests for eeane.compiler.dispatch."""
 
 from __future__ import annotations
 
@@ -45,13 +45,51 @@ def test_resolve_dispatch_detects_reranker_kind(tmp_path: Path) -> None:
     assert result.backend_name == "ModernBert"
 
 
+def test_resolve_dispatch_detects_an_xlm_roberta_embedding_model(tmp_path: Path) -> None:
+    """A bare XLMRobertaModel must be dispatched to the XLM-RoBERTa backend."""
+    model_dir = _write_config(tmp_path / "m", {"architectures": ["XLMRobertaModel"]})
+
+    result = dispatch.resolve_dispatch(model_dir)
+
+    assert result.kind == dispatch.KIND_EMBEDDING
+    assert result.architecture == "XLMRobertaModel"
+    assert result.backend_name == "XLMRoberta"
+
+
+def test_resolve_dispatch_detects_an_xlm_roberta_reranker(tmp_path: Path) -> None:
+    """XLMRobertaForSequenceClassification must be dispatched as a reranker."""
+    model_dir = _write_config(
+        tmp_path / "m", {"architectures": ["XLMRobertaForSequenceClassification"]}
+    )
+
+    result = dispatch.resolve_dispatch(model_dir)
+
+    assert result.kind == dispatch.KIND_RERANKER
+    assert result.architecture == "XLMRobertaForSequenceClassification"
+    assert result.backend_name == "XLMRoberta"
+
+
+def test_no_registry_key_is_a_prefix_of_another_one() -> None:
+    """Prefix matching stays unambiguous only while no key starts with another key."""
+    keys = list(dispatch.BACKEND_REGISTRY)
+
+    for key in keys:
+        for other in keys:
+            assert key == other or not other.startswith(key), (
+                f"'{other}' starts with '{key}': prefix matching would depend on dict order"
+            )
+
+
 @pytest.mark.parametrize(
     ("architecture", "expected"),
     [
         ("ModernBertModel", dispatch.KIND_EMBEDDING),
         ("BertModel", dispatch.KIND_EMBEDDING),
+        ("XLMRobertaModel", dispatch.KIND_EMBEDDING),
         ("ModernBertForSequenceClassification", dispatch.KIND_RERANKER),
+        ("XLMRobertaForSequenceClassification", dispatch.KIND_RERANKER),
         ("ModernBertForMaskedLM", None),
+        ("XLMRobertaForMaskedLM", None),
         ("", None),
     ],
 )
@@ -137,7 +175,7 @@ def test_resolve_dispatch_rejects_unknown_kind_value(tmp_path: Path) -> None:
 
 
 def test_resolve_dispatch_unsupported_architecture_lists_supported_models(tmp_path: Path) -> None:
-    """An unregistered architecture must raise and name what v0.6 supports."""
+    """An unregistered architecture must raise and name every supported family."""
     model_dir = _write_config(tmp_path / "m", {"architectures": ["LlamaForCausalLM"]})
 
     with pytest.raises(dispatch.UnsupportedArchitectureError) as excinfo:
@@ -147,6 +185,9 @@ def test_resolve_dispatch_unsupported_architecture_lists_supported_models(tmp_pa
     assert "Unsupported architecture 'LlamaForCausalLM'" in message
     assert "ModernBERT" in message
     assert "cl-nagoya/ruri-v3-310m" in message
+    assert "XLM-RoBERTa" in message
+    assert "intfloat/multilingual-e5-base" in message
+    assert "BAAI/bge-reranker-v2-m3" in message
 
 
 def test_resolve_dispatch_missing_config_json(tmp_path: Path) -> None:
@@ -196,14 +237,23 @@ def test_resolve_dispatch_bad_architectures_field(tmp_path: Path, config: object
 # --- backend loading ---------------------------------------------------------
 
 
-def test_dispatch_load_backend_returns_modernbert_backend(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("architecture", "class_name", "backend_name"),
+    [
+        ("ModernBertModel", "ModernBertBackend", "ModernBert"),
+        ("XLMRobertaModel", "XlmRobertaBackend", "XLMRoberta"),
+    ],
+)
+def test_dispatch_load_backend_returns_the_registered_backend(
+    tmp_path: Path, architecture: str, class_name: str, backend_name: str
+) -> None:
     """load_backend must import the registered class lazily and instantiate it."""
-    model_dir = _write_config(tmp_path / "m", {"architectures": ["ModernBertModel"]})
+    model_dir = _write_config(tmp_path / "m", {"architectures": [architecture]})
 
     backend = dispatch.resolve_dispatch(model_dir).load_backend()
 
-    assert type(backend).__name__ == "ModernBertBackend"
-    assert backend.name == "ModernBert"
+    assert type(backend).__name__ == class_name
+    assert backend.name == backend_name
     for method in ("load", "apply_patches", "wrap", "trace_example", "reference_outputs"):
         assert callable(getattr(backend, method))
 

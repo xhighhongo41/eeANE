@@ -1,11 +1,11 @@
-"""Tests for eeane.server with a stub engine (v0.4実装計画.md §4.8, v0.5 §4.8).
+"""Tests for eeane.server with a stub engine.
 
-These tests never touch Core ML: a deterministic in-memory engine is
-injected into :func:`eeane.server.create_app`, so the endpoints' shapes,
-sorting, encodings and error handling can be checked in any environment.
-The v0.5 additions (API key auth, ``/models``, ``/health`` rate limiting,
-embedding-only deployments) are exercised the same way, by feeding
-``create_app`` a configuration built from the built-in default.
+These tests never touch Core ML: a deterministic in-memory engine (see
+``tests/conftest.py``) is injected into :func:`eeane.server.create_app`,
+so the endpoints' shapes, sorting, encodings, model routing and error
+handling can be checked in any environment. Deployments are described by
+a configuration built from the built-in default, which is also what the
+injected engine mirrors.
 """
 
 from __future__ import annotations
@@ -15,53 +15,34 @@ from collections.abc import Iterator
 
 import numpy as np
 import pytest
+from conftest import (
+    STUB_BUCKETS,
+    StubEngine,
+    make_config,
+    make_model_entry,
+    stub_logit,
+    stub_vector,
+)
 from fastapi.testclient import TestClient
 
 from eeane import runtime
-from eeane.config import EeaneConfig, ModelEntry, ServerConfig, default_config
 from eeane.engine import EmbeddingBatch, RerankBatch
 from eeane.server import HealthRateLimiter, create_app
-
-# Stub vectors are intentionally low-dimensional: the endpoints treat the
-# width as opaque, so 4 keeps the expected values readable.
-_STUB_DIM = 4
 
 # API key used by the authenticated fixtures below (test-only value).
 _API_KEY = "unit-test-api-key"
 
+# Ids of the default deployment, as listed by the built-in configuration.
+_EMBEDDING_ID = "ruri-v3-310m"
+_RERANKER_ID = "ruri-v3-reranker-310m"
 
-def make_config(
-    *,
-    normalize: bool = True,
-    api_key: str | None = None,
-    host: str = "127.0.0.1",
-    health_rate_limit: int = 60,
-    with_reranker: bool = True,
-) -> EeaneConfig:
-    """Build a test configuration by tweaking the built-in default.
+# Extra models appended to the default deployment by the routing tests.
+_SECOND_EMBEDDING_ID = "second-embedding"
+_SECOND_RERANKER_ID = "second-reranker"
 
-    Args:
-        normalize: Value of the embedding entry's ``normalize`` flag.
-        api_key: Bearer key required by protected endpoints, or ``None``
-            to keep the server unauthenticated.
-        host: Bind address recorded in the config (only the start-up
-            warning depends on it; nothing is actually bound in tests).
-        health_rate_limit: ``/health`` requests allowed per minute per IP.
-        with_reranker: When ``False``, drop the reranker entry to build an
-            embedding-only deployment.
-
-    Returns:
-        A validated configuration serving the default model ids.
-    """
-    base = default_config()
-    models: list[ModelEntry] = [base.embedding_model.model_copy(update={"normalize": normalize})]
-    reranker = base.reranker_model
-    if with_reranker and reranker is not None:
-        models.append(reranker)
-    return EeaneConfig(
-        server=ServerConfig(host=host, api_key=api_key, health_rate_limit=health_rate_limit),
-        models=models,
-    )
+# Buckets those extra models serve, chosen so /health tells them apart
+# from the default ones.
+_SECOND_BUCKETS = (256,)
 
 
 class FakeClock:
@@ -76,82 +57,21 @@ class FakeClock:
         return self.now
 
 
-def stub_vector(text: str) -> np.ndarray:
-    """Build the deterministic embedding the stub returns for ``text``.
-
-    Args:
-        text: Input text; only its length matters.
-
-    Returns:
-        ``[len(text), len(text) + 1, ...]`` as a float32 vector of length
-        :data:`_STUB_DIM`.
-    """
-    return np.arange(_STUB_DIM, dtype=np.float32) + float(len(text))
-
-
-def stub_logit(document: str) -> float:
-    """Build the deterministic logit the stub returns for ``document``.
-
-    Args:
-        document: Candidate document; only its length matters.
-
-    Returns:
-        A value in ``[-2.0, 2.0]`` derived from ``len(document)``.
-    """
-    return float(len(document) % 5) - 2.0
-
-
-class StubEngine:
-    """Deterministic engine implementing the InferenceEngine protocol."""
-
-    embedding_buckets: tuple[int, ...] = (128, 512, 1024)
-    reranker_buckets: tuple[int, ...] = (512,)
-
-    def embed(self, texts: list[str]) -> EmbeddingBatch:
-        """Return :func:`stub_vector` for each text, counting 1 token per character."""
-        if not texts:
-            return EmbeddingBatch(
-                vectors=np.empty((0, _STUB_DIM), dtype=np.float32),
-                used_tokens=[],
-                orig_tokens=[],
-                buckets=[],
-                truncated_indices=[],
-            )
-        tokens = [len(text) for text in texts]
-        return EmbeddingBatch(
-            vectors=np.stack([stub_vector(text) for text in texts]),
-            used_tokens=list(tokens),
-            orig_tokens=list(tokens),
-            buckets=[runtime.select_bucket(n, self.embedding_buckets)[0] for n in tokens],
-            truncated_indices=[],
-        )
-
-    def rerank(self, query: str, documents: list[str]) -> RerankBatch:
-        """Return :func:`stub_logit` for each document, ignoring the query's content."""
-        tokens = [len(query) + len(document) for document in documents]
-        return RerankBatch(
-            logits=np.asarray([stub_logit(document) for document in documents], dtype=np.float32),
-            used_tokens=list(tokens),
-            orig_tokens=list(tokens),
-            truncated_indices=[],
-        )
-
-
 class TruncatingStubEngine(StubEngine):
     """Stub reporting every input as truncated, to exercise the warning path."""
 
-    def embed(self, texts: list[str]) -> EmbeddingBatch:
+    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
         """Pretend each text exceeded the largest bucket and was cut down to it."""
-        batch = super().embed(texts)
+        batch = super().embed(texts, model_id)
         batch.orig_tokens = [2000] * len(texts)
         batch.used_tokens = [1024] * len(texts)
         batch.buckets = [1024] * len(texts)
         batch.truncated_indices = list(range(len(texts)))
         return batch
 
-    def rerank(self, query: str, documents: list[str]) -> RerankBatch:
+    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
         """Pretend each pair exceeded the reranker bucket and was cut down to it."""
-        batch = super().rerank(query, documents)
+        batch = super().rerank(query, documents, model_id)
         batch.orig_tokens = [2000] * len(documents)
         batch.used_tokens = [512] * len(documents)
         batch.truncated_indices = list(range(len(documents)))
@@ -161,8 +81,9 @@ class TruncatingStubEngine(StubEngine):
 @pytest.fixture
 def client() -> Iterator[TestClient]:
     """Client for an app that returns raw (un-normalized) stub vectors."""
+    config = make_config(normalize=False)
     # The with-block runs the lifespan handler, which populates app.state.
-    app = create_app(make_config(normalize=False), engine=StubEngine())
+    app = create_app(config, engine=StubEngine(config))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -170,7 +91,8 @@ def client() -> Iterator[TestClient]:
 @pytest.fixture
 def truncating_client() -> Iterator[TestClient]:
     """Client for an app whose engine always reports truncated inputs."""
-    app = create_app(make_config(normalize=False), engine=TruncatingStubEngine())
+    config = make_config(normalize=False)
+    app = create_app(config, engine=TruncatingStubEngine(config))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -178,7 +100,8 @@ def truncating_client() -> Iterator[TestClient]:
 @pytest.fixture
 def normalizing_client() -> Iterator[TestClient]:
     """Client for an app configured to L2-normalize embeddings."""
-    app = create_app(make_config(normalize=True), engine=StubEngine())
+    config = make_config(normalize=True)
+    app = create_app(config, engine=StubEngine(config))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -186,7 +109,8 @@ def normalizing_client() -> Iterator[TestClient]:
 @pytest.fixture
 def auth_client() -> Iterator[TestClient]:
     """Client for an app protected by :data:`_API_KEY`."""
-    app = create_app(make_config(normalize=False, api_key=_API_KEY), engine=StubEngine())
+    config = make_config(normalize=False, api_key=_API_KEY)
+    app = create_app(config, engine=StubEngine(config))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -194,20 +118,46 @@ def auth_client() -> Iterator[TestClient]:
 @pytest.fixture
 def embedding_only_client() -> Iterator[TestClient]:
     """Client for an app configured without a reranker model."""
-    app = create_app(make_config(normalize=False, with_reranker=False), engine=StubEngine())
+    config = make_config(normalize=False, with_reranker=False)
+    app = create_app(config, engine=StubEngine(config))
     with TestClient(app) as test_client:
         yield test_client
 
 
+@pytest.fixture
+def multi_model() -> Iterator[tuple[TestClient, StubEngine]]:
+    """Client and engine of a deployment serving two models of each kind.
+
+    The default embedding model returns raw vectors while the second one
+    normalizes, so a response tells which model served it.
+    """
+    config = make_config(
+        normalize=False,
+        extra_models=[
+            make_model_entry(_SECOND_EMBEDDING_ID, normalize=True, buckets=_SECOND_BUCKETS),
+            make_model_entry(_SECOND_RERANKER_ID, kind="reranker", buckets=_SECOND_BUCKETS),
+        ],
+    )
+    engine = StubEngine(
+        config,
+        buckets={_SECOND_EMBEDDING_ID: _SECOND_BUCKETS, _SECOND_RERANKER_ID: _SECOND_BUCKETS},
+    )
+    with TestClient(create_app(config, engine=engine)) as test_client:
+        yield test_client, engine
+
+
 def test_health_reports_status_version_and_buckets(client: TestClient) -> None:
-    """/health must return ok plus the buckets of both models."""
+    """/health must return ok plus one entry per served model."""
     response = client.get("/health")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
     assert isinstance(payload["version"], str) and payload["version"]
-    assert payload["models"] == {"embedding": [128, 512, 1024], "reranker": [512]}
+    assert payload["models"] == [
+        {"id": _EMBEDDING_ID, "kind": "embedding", "buckets": list(STUB_BUCKETS["embedding"])},
+        {"id": _RERANKER_ID, "kind": "reranker", "buckets": list(STUB_BUCKETS["reranker"])},
+    ]
 
 
 def test_embeddings_accepts_single_string(client: TestClient) -> None:
@@ -298,7 +248,7 @@ def test_embeddings_ignore_unknown_fields(client: TestClient) -> None:
     """Extra fields sent by compatible clients must not cause a 422."""
     response = client.post(
         "/v1/embeddings",
-        json={"input": "hello", "model": "whatever", "input_type": "query", "user": "u1"},
+        json={"input": "hello", "model": _EMBEDDING_ID, "input_type": "query", "user": "u1"},
         headers={"Authorization": "Bearer "},
     )
 
@@ -453,7 +403,7 @@ def test_rerank_logs_truncation_warning(
     assert warnings == ["/rerank: input 0 truncated from 2000 tokens to bucket 512"]
 
 
-# --- API key authentication (v0.5実装計画.md §4.4) ------------------------
+# --- API key authentication ----------------------------------------------
 
 # Every endpoint that must be protected once an API key is configured,
 # with a minimal valid body for the POST ones.
@@ -542,7 +492,8 @@ def test_health_stays_open_when_a_key_is_configured(auth_client: TestClient) -> 
 
 def test_api_key_startup_log_never_leaks_the_key(caplog: pytest.LogCaptureFixture) -> None:
     """Enabling auth must be reported at INFO without ever printing the key."""
-    app = create_app(make_config(api_key=_API_KEY), engine=StubEngine())
+    config = make_config(api_key=_API_KEY)
+    app = create_app(config, engine=StubEngine(config))
 
     with caplog.at_level(logging.INFO, logger="eeane.server"), TestClient(app):
         pass
@@ -552,7 +503,7 @@ def test_api_key_startup_log_never_leaks_the_key(caplog: pytest.LogCaptureFixtur
     assert all(_API_KEY not in message for message in messages)
 
 
-# --- GET /models (v0.5実装計画.md §4.5) -----------------------------------
+# --- GET /models ----------------------------------------------------------
 
 
 def test_models_lists_the_configured_models(client: TestClient) -> None:
@@ -595,12 +546,13 @@ def test_models_without_reranker_lists_only_the_embedding(
     assert [card["id"] for card in response.json()["data"]] == ["ruri-v3-310m"]
 
 
-# --- start-up security warnings (v0.5実装計画.md §4.4) --------------------
+# --- start-up security warnings -------------------------------------------
 
 
 def test_non_loopback_host_without_api_key_warns(caplog: pytest.LogCaptureFixture) -> None:
     """Binding to the LAN without a key must be reported once at WARNING."""
-    app = create_app(make_config(host="192.168.10.20"), engine=StubEngine())
+    config = make_config(host="192.168.10.20")
+    app = create_app(config, engine=StubEngine(config))
 
     with caplog.at_level(logging.WARNING, logger="eeane.server"), TestClient(app):
         pass
@@ -619,7 +571,8 @@ def test_loopback_host_without_api_key_does_not_warn(
     host: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A loopback bind is the safe default and must stay silent."""
-    app = create_app(make_config(host=host), engine=StubEngine())
+    config = make_config(host=host)
+    app = create_app(config, engine=StubEngine(config))
 
     with caplog.at_level(logging.WARNING, logger="eeane.server"), TestClient(app):
         pass
@@ -634,7 +587,8 @@ def test_loopback_host_without_api_key_does_not_warn(
 
 def test_non_loopback_host_with_api_key_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:
     """The warning is about the missing key, so a configured key silences it."""
-    app = create_app(make_config(host="192.168.10.20", api_key=_API_KEY), engine=StubEngine())
+    config = make_config(host="192.168.10.20", api_key=_API_KEY)
+    app = create_app(config, engine=StubEngine(config))
 
     with caplog.at_level(logging.WARNING, logger="eeane.server"), TestClient(app):
         pass
@@ -647,7 +601,7 @@ def test_non_loopback_host_with_api_key_does_not_warn(caplog: pytest.LogCaptureF
     assert warnings == []
 
 
-# --- embedding-only deployment (v0.5実装計画.md §0-2, §4.6) ---------------
+# --- embedding-only deployment --------------------------------------------
 
 
 @pytest.mark.parametrize("path", ["/rerank", "/v1/rerank"])
@@ -661,13 +615,15 @@ def test_rerank_returns_503_without_a_configured_reranker(
     assert response.json()["detail"] == "reranker is not configured"
 
 
-def test_health_reports_no_reranker_buckets_without_a_reranker(
+def test_health_lists_no_reranker_without_a_reranker(
     embedding_only_client: TestClient,
 ) -> None:
-    """The reranker bucket list must be empty whatever the engine exposes."""
+    """Only configured models may be listed, whatever the engine exposes."""
     payload = embedding_only_client.get("/health").json()
 
-    assert payload["models"] == {"embedding": [128, 512, 1024], "reranker": []}
+    assert payload["models"] == [
+        {"id": _EMBEDDING_ID, "kind": "embedding", "buckets": list(STUB_BUCKETS["embedding"])}
+    ]
 
 
 def test_embeddings_still_work_without_a_reranker(embedding_only_client: TestClient) -> None:
@@ -678,7 +634,7 @@ def test_embeddings_still_work_without_a_reranker(embedding_only_client: TestCli
     assert response.json()["model"] == "ruri-v3-310m"
 
 
-# --- /health rate limiting (v0.5実装計画.md §4.4) -------------------------
+# --- /health rate limiting ------------------------------------------------
 
 
 def test_rate_limiter_rejects_after_the_limit_and_recovers_next_window() -> None:
@@ -731,7 +687,8 @@ def test_rate_limiter_prunes_clients_from_closed_windows() -> None:
 
 def test_health_returns_429_after_the_configured_limit() -> None:
     """The /health endpoint must apply server.health_rate_limit."""
-    app = create_app(make_config(normalize=False, health_rate_limit=2), engine=StubEngine())
+    config = make_config(normalize=False, health_rate_limit=2)
+    app = create_app(config, engine=StubEngine(config))
 
     with TestClient(app) as test_client:
         statuses = [test_client.get("/health").status_code for _ in range(3)]
@@ -741,9 +698,224 @@ def test_health_returns_429_after_the_configured_limit() -> None:
 
 def test_health_is_not_limited_when_the_limit_is_zero() -> None:
     """health_rate_limit=0 must disable the limiter entirely."""
-    app = create_app(make_config(normalize=False, health_rate_limit=0), engine=StubEngine())
+    config = make_config(normalize=False, health_rate_limit=0)
+    app = create_app(config, engine=StubEngine(config))
 
     with TestClient(app) as test_client:
         statuses = [test_client.get("/health").status_code for _ in range(10)]
 
     assert statuses == [200] * 10
+
+
+# --- model routing --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "expected"),
+    [
+        ("/v1/embeddings", {"input": "hello"}, _EMBEDDING_ID),
+        ("/rerank", {"query": "q", "documents": ["a"]}, _RERANKER_ID),
+    ],
+)
+def test_request_without_a_model_uses_the_default_of_its_kind(
+    multi_model: tuple[TestClient, StubEngine],
+    path: str,
+    body: dict[str, object],
+    expected: str,
+) -> None:
+    """An omitted model id must resolve to the first-listed model of the kind."""
+    client, engine = multi_model
+
+    response = client.post(path, json=body)
+
+    assert response.status_code == 200
+    assert response.json()["model"] == expected
+    assert (engine.embed_model_ids + engine.rerank_model_ids) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "requested"),
+    [
+        ("/v1/embeddings", {"input": "hello"}, _SECOND_EMBEDDING_ID),
+        ("/rerank", {"query": "q", "documents": ["a"]}, _SECOND_RERANKER_ID),
+    ],
+)
+def test_request_naming_a_configured_model_is_routed_to_it(
+    multi_model: tuple[TestClient, StubEngine],
+    path: str,
+    body: dict[str, object],
+    requested: str,
+) -> None:
+    """A known model id must reach the engine and be echoed back."""
+    client, engine = multi_model
+
+    response = client.post(path, json={**body, "model": requested})
+
+    assert response.status_code == 200
+    assert response.json()["model"] == requested
+    assert (engine.embed_model_ids + engine.rerank_model_ids) == [requested]
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "kind", "known_id"),
+    [
+        ("/v1/embeddings", {"input": "hello"}, "embedding", _SECOND_EMBEDDING_ID),
+        ("/rerank", {"query": "q", "documents": ["a"]}, "reranker", _SECOND_RERANKER_ID),
+    ],
+)
+def test_request_naming_an_unknown_model_returns_404_with_the_available_ids(
+    multi_model: tuple[TestClient, StubEngine],
+    path: str,
+    body: dict[str, object],
+    kind: str,
+    known_id: str,
+) -> None:
+    """An unknown id must be a 404 that tells the client what it can ask for."""
+    client, engine = multi_model
+
+    response = client.post(path, json={**body, "model": "no-such-model"})
+
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert "no-such-model" in detail
+    assert known_id in detail
+    # Nothing may be inferred with a fallback model.
+    assert engine.embed_model_ids == []
+    assert engine.rerank_model_ids == []
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "wrong_id"),
+    [
+        ("/v1/embeddings", {"input": "hello"}, _RERANKER_ID),
+        ("/rerank", {"query": "q", "documents": ["a"]}, _EMBEDDING_ID),
+    ],
+)
+def test_request_naming_a_model_of_the_other_kind_returns_400(
+    multi_model: tuple[TestClient, StubEngine],
+    path: str,
+    body: dict[str, object],
+    wrong_id: str,
+) -> None:
+    """A configured id of the wrong kind is a bad request, not a missing model."""
+    client, engine = multi_model
+
+    response = client.post(path, json={**body, "model": wrong_id})
+
+    assert response.status_code == 400
+    assert wrong_id in response.json()["detail"]
+    assert engine.embed_model_ids == []
+    assert engine.rerank_model_ids == []
+
+
+def test_normalization_follows_the_resolved_model(
+    multi_model: tuple[TestClient, StubEngine],
+) -> None:
+    """Each embedding model applies its own normalize flag, not a global one."""
+    client, _ = multi_model
+
+    raw = client.post("/v1/embeddings", json={"input": "hello"})
+    normalized = client.post(
+        "/v1/embeddings", json={"input": "hello", "model": _SECOND_EMBEDDING_ID}
+    )
+
+    assert raw.status_code == 200 and normalized.status_code == 200
+    np.testing.assert_allclose(raw.json()["data"][0]["embedding"], stub_vector("hello"))
+    assert np.linalg.norm(normalized.json()["data"][0]["embedding"]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_models_lists_every_configured_model_in_order(
+    multi_model: tuple[TestClient, StubEngine],
+) -> None:
+    """/models must advertise every entry, not just the default of each kind."""
+    client, _ = multi_model
+
+    response = client.get("/models")
+
+    assert response.status_code == 200
+    assert [card["id"] for card in response.json()["data"]] == [
+        _EMBEDDING_ID,
+        _RERANKER_ID,
+        _SECOND_EMBEDDING_ID,
+        _SECOND_RERANKER_ID,
+    ]
+
+
+def test_health_lists_every_model_with_its_kind_and_buckets(
+    multi_model: tuple[TestClient, StubEngine],
+) -> None:
+    """/health must describe each served model on its own."""
+    client, _ = multi_model
+
+    payload = client.get("/health").json()
+
+    assert payload["models"] == [
+        {"id": _EMBEDDING_ID, "kind": "embedding", "buckets": list(STUB_BUCKETS["embedding"])},
+        {"id": _RERANKER_ID, "kind": "reranker", "buckets": list(STUB_BUCKETS["reranker"])},
+        {"id": _SECOND_EMBEDDING_ID, "kind": "embedding", "buckets": list(_SECOND_BUCKETS)},
+        {"id": _SECOND_RERANKER_ID, "kind": "reranker", "buckets": list(_SECOND_BUCKETS)},
+    ]
+
+
+# --- start-up model reporting ---------------------------------------------
+
+
+def test_startup_logs_one_line_per_served_model(caplog: pytest.LogCaptureFixture) -> None:
+    """Every model must be reported at INFO with its kind and buckets."""
+    config = make_config(
+        normalize=False,
+        extra_models=[make_model_entry(_SECOND_EMBEDDING_ID, buckets=_SECOND_BUCKETS)],
+    )
+    app = create_app(config, engine=StubEngine(config))
+
+    with caplog.at_level(logging.INFO, logger="eeane.server"), TestClient(app):
+        pass
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "eeane.server" and record.levelname == "INFO"
+    ]
+    for entry in config.models:
+        assert any(
+            entry.id in message and str(entry.kind) in message and str(entry.buckets[0]) in message
+            for message in messages
+        ), entry.id
+
+
+def test_startup_warns_about_buckets_the_cache_recommends_against(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Excluded buckets must be reported once, naming the model and the buckets."""
+    config = make_config(
+        normalize=False,
+        extra_models=[
+            make_model_entry(
+                _SECOND_EMBEDDING_ID, buckets=_SECOND_BUCKETS, excluded_buckets=(1024,)
+            )
+        ],
+    )
+    app = create_app(config, engine=StubEngine(config))
+
+    with caplog.at_level(logging.WARNING, logger="eeane.server"), TestClient(app):
+        pass
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "eeane.server" and record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert _SECOND_EMBEDDING_ID in warnings[0]
+    assert "1024" in warnings[0]
+
+
+def test_startup_stays_quiet_without_excluded_buckets(caplog: pytest.LogCaptureFixture) -> None:
+    """A deployment loading every compiled bucket must not warn."""
+    config = make_config(normalize=False)
+    app = create_app(config, engine=StubEngine(config))
+
+    with caplog.at_level(logging.WARNING, logger="eeane.server"), TestClient(app):
+        pass
+
+    assert [record for record in caplog.records if record.levelname == "WARNING"] == []

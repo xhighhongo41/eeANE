@@ -1,4 +1,4 @@
-"""Tests for `eeane compile` (v0.6 T2, see 開発資料/v0.6実装計画.md §4.1, §4.7, §4.9)."""
+"""Tests for `eeane compile`."""
 
 from __future__ import annotations
 
@@ -162,10 +162,10 @@ def test_compile_cli_reports_an_unresolvable_source(capsys: pytest.CaptureFixtur
 def test_compile_cli_delegates_to_the_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     """`eeane compile` must hand the parsed namespace and self-check hook to the pipeline.
 
-    v0.6 T5 wires ``eeane.compiler.selfcheck.run_selfcheck`` in as
-    ``pipeline.run``'s ``selfcheck_fn`` (開発資料/v0.6実装計画.md §4.5); this
-    also pins that ``run_compile`` still returns the pipeline's exit code
-    and still passes the parsed namespace through unchanged.
+    ``eeane.compiler.selfcheck.run_selfcheck`` is wired in as
+    ``pipeline.run``'s ``selfcheck_fn``; this also pins that
+    ``run_compile`` still returns the pipeline's exit code and still
+    passes the parsed namespace through unchanged.
     """
     from eeane.compiler import pipeline, selfcheck
 
@@ -261,9 +261,9 @@ def test_runtime_modules_do_not_import_torch_or_transformers() -> None:
     an import: ``coremltools`` (a genuine runtime dependency) try-imports
     torch and transformers itself, in ``coremltools/_deps/__init__.py``,
     to probe its optional converter frontends. A ``sys.modules`` check
-    therefore can never pass, no matter what eeANE does, while what R5
-    actually requires is that *eeANE's own* runtime code never reaches
-    for the [compile] extra (開発資料/v0.6実装計画.md §4.7 担保テスト).
+    therefore can never pass, no matter what eeANE does, while the real
+    requirement is that *eeANE's own* runtime code never reaches for the
+    [compile] extra.
     """
     package_dir = Path(cli.__file__).resolve().parent
 

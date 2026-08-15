@@ -1,4 +1,4 @@
-"""Tests for eeane.schemas (v0.4 T3, see 開発資料/v0.4実装計画.md §4.4-§4.6)."""
+"""Tests for eeane.schemas: request coercion, validation and response shapes."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from eeane.schemas import (
     EmbeddingObject,
     EmbeddingsRequest,
     EmbeddingsResponse,
+    HealthModel,
     HealthResponse,
     RerankRequest,
     RerankResult,
@@ -169,12 +170,27 @@ def test_rerank_result_document_none_is_excluded_from_dump() -> None:
 
 
 def test_health_response_construction() -> None:
-    """HealthResponse must accept the documented status/version/models shape."""
+    """HealthResponse must accept one entry per served model."""
     response = HealthResponse(
         status="ok",
         version="0.5.0.dev0",
-        models={"embedding": [128, 512, 1024], "reranker": [512]},
+        models=[
+            HealthModel(id="emb", kind="embedding", buckets=[128, 512, 1024]),
+            HealthModel(id="rr", kind="reranker", buckets=[512]),
+        ],
     )
 
     assert response.status == "ok"
-    assert response.models["embedding"] == [128, 512, 1024]
+    assert [model.id for model in response.models] == ["emb", "rr"]
+    assert response.models[0].buckets == [128, 512, 1024]
+    assert response.models[1].kind == "reranker"
+
+
+def test_health_response_rejects_the_legacy_kind_to_buckets_mapping() -> None:
+    """The per-kind mapping is gone: a dict must not silently validate."""
+    with pytest.raises(ValidationError):
+        HealthResponse(
+            status="ok",
+            version="0.5.0.dev0",
+            models={"embedding": [128], "reranker": [512]},
+        )

@@ -1,4 +1,4 @@
-"""FastAPI application for the eeANE server (v0.5実装計画.md §4.4-§4.6).
+"""FastAPI application for the eeANE server.
 
 Exposes an OpenAI-compatible ``/v1/embeddings`` endpoint, an
 Infinity-compatible ``/rerank`` + ``/v1/rerank`` pair and an
@@ -8,6 +8,12 @@ from a validated :class:`~eeane.config.EeaneConfig`: model ids, bucket
 artifacts, bind address, the optional Bearer API key and the ``/health``
 rate limit.
 
+Several embedding and reranker models can be served at once. A request's
+``model`` field selects one of them by id; omitting it selects the
+first-listed model of the kind the endpoint serves. The resolved entry
+also decides per-request behaviour such as embedding normalization, and
+its id is echoed in the response.
+
 The engine is built once during startup and kept resident; every inference
 call is serialized inside the engine, so the endpoints are plain ``def``
 functions that FastAPI runs in its thread pool (``/health`` and
@@ -16,7 +22,7 @@ functions that FastAPI runs in its thread pool (``/health`` and
 Run it with ``uv run python -m eeane serve`` (single process, single
 worker: multiple workers would load the models several times).
 ``uv run python -m eeane.server`` remains as a thin alias for the same
-command until v0.10 (see :func:`main`).
+command (see :func:`main`).
 """
 
 from __future__ import annotations
@@ -33,12 +39,13 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 
 from eeane import __version__, runtime
 from eeane.cli import main as cli_main
-from eeane.config import EeaneConfig
+from eeane.config import EeaneConfig, ModelEntry
 from eeane.engine import CoreMLEngine, InferenceEngine
 from eeane.schemas import (
     EmbeddingObject,
     EmbeddingsRequest,
     EmbeddingsResponse,
+    HealthModel,
     HealthResponse,
     ModelCard,
     ModelListResponse,
@@ -52,7 +59,7 @@ logger = logging.getLogger("eeane.server")
 
 # Bind addresses that only accept connections from this machine. Anything
 # else exposes the server to the network, which is worth a warning when no
-# API key is configured (v0.5実装計画.md §4.4).
+# API key is configured.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 # Fixed window of the /health rate limiter, in seconds.
@@ -71,7 +78,7 @@ class HealthRateLimiter:
     enabled, so it gets a dependency-free, in-memory limiter: each client
     IP may issue ``limit_per_minute`` requests per 60-second window. This
     only blunts trivial floods; connection-level protection belongs to a
-    reverse proxy or firewall (v0.5実装計画.md §4.4).
+    reverse proxy or firewall.
     """
 
     def __init__(self, limit_per_minute: int, clock: Callable[[], float] = time.monotonic) -> None:
@@ -167,6 +174,30 @@ def _log_startup_security(config: EeaneConfig) -> None:
         )
 
 
+def _log_served_models(config: EeaneConfig) -> None:
+    """Report the served models at startup, one line each.
+
+    Args:
+        config: Resolved configuration. Every entry is reported at INFO
+            with its kind and buckets; an entry whose compiled-model cache
+            recommends against some of its buckets also gets a WARNING, so
+            an operator sees why a bucket is not in service.
+    """
+    for entry in config.models:
+        details = f"buckets={list(entry.buckets)}"
+        if entry.kind == "embedding":
+            details += f", normalize={entry.normalize}"
+        logger.info("serving %s model '%s' (%s)", entry.kind, entry.id, details)
+        if entry.excluded_buckets:
+            logger.warning(
+                "model '%s': the compiled-model cache recommends against buckets %s, "
+                "which are therefore excluded from service; see the model's compile "
+                "self-check record for the measurements behind that recommendation",
+                entry.id,
+                list(entry.excluded_buckets),
+            )
+
+
 def _format_buckets(buckets: Sequence[int]) -> str:
     """Summarize per-input bucket usage for the request log.
 
@@ -207,14 +238,61 @@ def _warn_truncated(
         )
 
 
+def _resolve_entry(config: EeaneConfig, kind: str, requested: str | None) -> ModelEntry:
+    """Route one request to the model entry that must serve it.
+
+    Args:
+        config: Resolved configuration listing every served model.
+        kind: Model kind the calling endpoint serves (``"embedding"`` or
+            ``"reranker"``).
+        requested: Model id sent by the client, or ``None`` when the
+            request named none.
+
+    Returns:
+        The configured entry to serve the request with: the named one, or
+        the first-listed entry of ``kind`` when the request named none.
+
+    Raises:
+        HTTPException: 404 when ``requested`` matches no configured model
+            (the detail lists the ids this endpoint can serve), 400 when
+            it matches a model of another kind, and 503 when the request
+            named no model and none of ``kind`` is configured.
+    """
+    if requested is None:
+        default_entry = config.default_model(kind)
+        if default_entry is None:
+            raise HTTPException(status_code=503, detail=f"{kind} is not configured")
+        return default_entry
+
+    entry = config.model_by_id(requested)
+    if entry is None:
+        # Listing the servable ids turns a typo into a self-service fix.
+        available = ", ".join(f"'{candidate.id}'" for candidate in config.models_of_kind(kind))
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"model '{requested}' not found; available {kind} models: {available or '(none)'}"
+            ),
+        )
+    if entry.kind != kind:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model '{requested}' is a {entry.kind} model; this endpoint serves {kind} models"
+            ),
+        )
+    return entry
+
+
 def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> FastAPI:
     """Build the eeANE FastAPI application for a resolved configuration.
 
     Args:
         config: Validated configuration (see :mod:`eeane.config`). It
-            supplies the served model ids, the ``normalize`` flag, the
-            optional API key and the ``/health`` rate limit. When its
-            reranker entry is absent, the rerank endpoints answer 503.
+            supplies the served models (their ids, kinds and ``normalize``
+            flags), the optional API key and the ``/health`` rate limit.
+            Requests are routed to those models by id; when no reranker is
+            configured at all, the rerank endpoints answer 503.
         engine: Engine used to serve requests. ``None`` (production
             default) builds a :class:`~eeane.engine.CoreMLEngine` from
             ``config`` during startup; tests inject a stub so no Core ML
@@ -224,9 +302,6 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         The configured application. Nothing is loaded until the lifespan
         handler runs, so building the app is cheap and side-effect free.
     """
-    embedding_entry = config.embedding_model
-    reranker_entry = config.reranker_model
-    normalize_embeddings = embedding_entry.normalize
     api_key = config.server.api_key
 
     async def require_api_key(request: Request) -> None:
@@ -239,8 +314,7 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         Raises:
             HTTPException: 401 when a key is configured and the header is
                 missing, malformed or does not match. Without a configured
-                key the dependency is a no-op, so behaviour is identical to
-                v0.4.
+                key the dependency is a no-op.
         """
         if api_key is None:
             return
@@ -251,7 +325,7 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         if len(parts) != 2 or parts[0].lower() != "bearer":
             raise _unauthorized("Malformed Authorization header; expected 'Bearer <api key>'")
         # Constant-time comparison so a wrong key cannot be recovered by
-        # timing the response (v0.5実装計画.md §4.4).
+        # timing the response.
         if not secrets.compare_digest(parts[1].encode("utf-8"), api_key.encode("utf-8")):
             raise _unauthorized("Invalid API key")
 
@@ -264,25 +338,12 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         if engine is None:
             started = time.perf_counter()
             active_engine: InferenceEngine = CoreMLEngine.from_config(config)
-            elapsed = time.perf_counter() - started
-            logger.info(
-                "loaded Core ML engine in %.2fs "
-                "(embedding buckets=%s, reranker buckets=%s, normalize=%s)",
-                elapsed,
-                list(active_engine.embedding_buckets),
-                list(active_engine.reranker_buckets),
-                normalize_embeddings,
-            )
+            logger.info("loaded Core ML engine in %.2fs", time.perf_counter() - started)
         else:
             active_engine = engine
-            logger.info(
-                "using injected engine (embedding buckets=%s, reranker buckets=%s, normalize=%s)",
-                list(active_engine.embedding_buckets),
-                list(active_engine.reranker_buckets),
-                normalize_embeddings,
-            )
+            logger.info("using injected engine")
+        _log_served_models(config)
         app.state.engine = active_engine
-        app.state.normalize_embeddings = normalize_embeddings
         # Reported as every model card's "created" timestamp.
         app.state.started_at = int(time.time())
         app.state.health_limiter = HealthRateLimiter(config.server.health_rate_limit)
@@ -292,7 +353,7 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
 
     @app.get("/health", response_model=HealthResponse)
     async def health(request: Request) -> HealthResponse:
-        """Report server status and the buckets each model serves.
+        """Report server status and the buckets each served model covers.
 
         Raises:
             HTTPException: 429 when the caller exceeded
@@ -309,29 +370,28 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
             )
 
         engine_impl: InferenceEngine = request.app.state.engine
+        # Driven by the configuration, so only served models are listed
+        # whatever else the engine happens to hold.
         return HealthResponse(
             status="ok",
             version=__version__,
-            models={
-                "embedding": list(engine_impl.embedding_buckets),
-                # An embedding-only deployment serves no reranker bucket,
-                # whatever the injected engine happens to expose.
-                "reranker": [] if reranker_entry is None else list(engine_impl.reranker_buckets),
-            },
+            models=[
+                HealthModel(
+                    id=entry.id,
+                    kind=str(entry.kind),
+                    buckets=list(engine_impl.buckets(entry.id)),
+                )
+                for entry in config.models
+            ],
         )
 
     @app.get("/models", response_model=ModelListResponse, dependencies=auth)
     @app.get("/v1/models", response_model=ModelListResponse, dependencies=auth)
     async def list_models(request: Request) -> ModelListResponse:
-        """List the configured models (OpenAI-compatible, §4.5)."""
+        """List every configured model, in configuration order (OpenAI-compatible)."""
         created = request.app.state.started_at
-        # Deterministic order (embedding first) regardless of how the
-        # config file listed the entries.
-        entries = [embedding_entry]
-        if reranker_entry is not None:
-            entries.append(reranker_entry)
         return ModelListResponse(
-            data=[ModelCard(id=entry.id, created=created) for entry in entries]
+            data=[ModelCard(id=entry.id, created=created) for entry in config.models]
         )
 
     # Registered under /v1 (OpenAI convention) and at the root (where
@@ -339,15 +399,21 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
     @app.post("/embeddings", response_model=EmbeddingsResponse, dependencies=auth)
     @app.post("/v1/embeddings", response_model=EmbeddingsResponse, dependencies=auth)
     def create_embeddings(request: Request, body: EmbeddingsRequest) -> EmbeddingsResponse:
-        """Embed the request's texts (OpenAI-compatible, §4.4)."""
+        """Embed the request's texts with the requested model (OpenAI-compatible).
+
+        Raises:
+            HTTPException: 404 when ``body.model`` names no configured
+                model, 400 when it names a model of another kind.
+        """
         started = time.perf_counter()
+        entry = _resolve_entry(config, "embedding", body.model)
         engine_impl: InferenceEngine = request.app.state.engine
-        batch = engine_impl.embed(body.input)
+        batch = engine_impl.embed(body.input, model_id=entry.id)
 
         vectors = batch.vectors
-        # Skip normalization for an empty request so the (0, D) shape is
-        # never divided by an empty norm array.
-        if request.app.state.normalize_embeddings and vectors.shape[0] > 0:
+        # Normalization is a per-model decision, and an empty request is
+        # skipped so the (0, D) shape is never divided by an empty norm.
+        if entry.normalize and vectors.shape[0] > 0:
             vectors = runtime.l2_normalize(vectors)
         # The official OpenAI SDK asks for base64 by default; both
         # encodings carry the very same float32 values.
@@ -376,7 +442,7 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         )
         return EmbeddingsResponse(
             data=data,
-            model=embedding_entry.id,
+            model=entry.id,
             usage=Usage(prompt_tokens=used_tokens, total_tokens=used_tokens),
         )
 
@@ -393,18 +459,18 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         dependencies=auth,
     )
     def rerank(request: Request, body: RerankRequest) -> RerankResponse:
-        """Score the request's documents against its query (Infinity-compatible, §4.5).
+        """Score the request's documents against its query (Infinity-compatible).
 
         Raises:
-            HTTPException: 503 when the configuration has no reranker
-                entry (embedding-only deployment).
+            HTTPException: 503 when the configuration has no reranker at
+                all (embedding-only deployment), 404 when ``body.model``
+                names no configured model, 400 when it names a model of
+                another kind.
         """
-        if reranker_entry is None:
-            raise HTTPException(status_code=503, detail="reranker is not configured")
-
         started = time.perf_counter()
+        entry = _resolve_entry(config, "reranker", body.model)
         engine_impl: InferenceEngine = request.app.state.engine
-        batch = engine_impl.rerank(body.query, body.documents)
+        batch = engine_impl.rerank(body.query, body.documents, model_id=entry.id)
 
         scores = batch.logits if body.raw_scores else runtime.sigmoid(batch.logits)
         results = [
@@ -426,9 +492,9 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         # select_bucket is a pure function of the pre-truncation token
         # count, so recomputing it here reproduces the engine's routing
         # for logging without widening RerankBatch.
+        reranker_buckets = engine_impl.buckets(entry.id)
         buckets = [
-            runtime.select_bucket(n_tokens, engine_impl.reranker_buckets)[0]
-            for n_tokens in batch.orig_tokens
+            runtime.select_bucket(n_tokens, reranker_buckets)[0] for n_tokens in batch.orig_tokens
         ]
         path = request.url.path
         _warn_truncated(path, batch.truncated_indices, batch.orig_tokens, buckets)
@@ -442,7 +508,7 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         )
         return RerankResponse(
             results=results,
-            model=reranker_entry.id,
+            model=entry.id,
             usage=Usage(prompt_tokens=used_tokens, total_tokens=used_tokens),
         )
 
@@ -450,11 +516,10 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
 
 
 def main() -> None:
-    """Interim alias for ``python -m eeane serve`` (kept until v0.10).
+    """Interim alias for ``python -m eeane serve``.
 
-    ``python -m eeane.server`` predates the ``eeane`` CLI (v0.4); it is
-    kept as a thin wrapper so existing invocations keep working, per
-    開発資料/v0.5実装計画.md §0-6.
+    ``python -m eeane.server`` predates the ``eeane`` CLI; it is kept as a
+    thin wrapper so existing invocations keep working.
     """
     raise SystemExit(cli_main(["serve"]))
 

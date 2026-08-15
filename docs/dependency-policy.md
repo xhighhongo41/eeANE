@@ -31,14 +31,22 @@ Note that transformers 5.x is a different world: it requires
 huggingface_hub >= 1.0 and redesigned its tokenizer backend. Migrating to
 it is a dedicated, verified task — never a casual bump.
 
+The XLM-RoBERTa backend uses stock transformers modeling code with no
+graph patches, so it is less sensitive to transformers internals than
+the ModernBERT backend — but the update rule below applies to every
+architecture equally: an unverified dependency bump is an unverified
+conversion.
+
 ## The update rule
 
 **A dependency update is only complete together with a full conversion
 re-verification.** Concretely, any change to torch, transformers,
 coremltools, numpy, or tokenizers must be accompanied by:
 
-1. `eeane compile` re-run for both reference models
-   (ruri-v3-310m and ruri-v3-reranker-310m) with `--force`,
+1. `eeane compile` re-run with `--force` for the reference models of
+   every supported architecture (ModernBERT: ruri-v3-310m and
+   ruri-v3-reranker-310m; XLM-RoBERTa: multilingual-e5-base and
+   bge-reranker-v2-m3),
 2. all self-checks passing (accuracy sanity, NE placement, warm latency
    recorded — the self-check is the designed detector for a conversion
    silently degrading),

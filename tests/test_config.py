@@ -1,10 +1,15 @@
-"""Tests for eeane.config (v0.5 T2, see 開発資料/v0.5実装計画.md §4.1-§4.2)."""
+"""Tests for eeane.config: TOML schema, overrides, and cache auto-resolution."""
 
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from eeane.config import (
     CliOverrides,
@@ -23,6 +28,68 @@ def _write_toml(path: Path, content: str) -> Path:
     """Write ``content`` to ``path`` and return ``path`` for chaining."""
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def _write_cached_model(
+    cache_root: Path,
+    model_id: str,
+    *,
+    format_version: int = 2,
+    kind: str = "embedding",
+    buckets: Sequence[int] = (128, 512),
+    recommended_buckets: Sequence[int] | None = None,
+    embedding_dim: int | None = 768,
+    overrides: dict[str, Any] | None = None,
+) -> Path:
+    """Create a compiled-model cache entry the way ``eeane compile`` does.
+
+    Args:
+        cache_root: Cache root to create the entry under.
+        model_id: Model id; a Hub id is normalised for the directory name.
+        format_version: ``model_info.json`` schema version to emit. Version
+            1 omits the fields introduced later, so it exercises the
+            degraded path.
+        kind: ``"embedding"`` or ``"reranker"``.
+        buckets: Compiled sequence-length buckets.
+        recommended_buckets: ``recommended_buckets`` value (v2+); defaults
+            to every compiled bucket.
+        embedding_dim: ``embedding_dim`` value (v2+, embeddings only).
+        overrides: Keys merged into the record last, to inject malformed
+            or unknown values.
+
+    Returns:
+        The created model directory.
+    """
+    model_dir = cache_root / "compiled" / model_id.replace("/", "--")
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts = {str(bucket): f"s{bucket}_b1_eager_macos13.mlmodelc" for bucket in buckets}
+    info: dict[str, Any] = {
+        "format_version": format_version,
+        "id": model_id,
+        "kind": kind,
+        "output_name": "embedding" if kind == "embedding" else "logits",
+        "buckets": sorted(buckets),
+        "tokenizer": "tokenizer.json",
+        "artifacts": artifacts,
+        "eeane_version": "test",
+    }
+    if format_version >= 2:
+        info["embedding_dim"] = embedding_dim if kind == "embedding" else None
+        info["recommended_buckets"] = list(
+            recommended_buckets if recommended_buckets is not None else sorted(buckets)
+        )
+        # Recorded by the compiler for provenance; the config layer must
+        # ignore its contents entirely.
+        info["calibration"] = {"measured_at": "2026-01-01T00:00:00Z", "samples": 32}
+    if overrides:
+        info.update(overrides)
+
+    (model_dir / "model_info.json").write_text(json.dumps(info), encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    for name in artifacts.values():
+        (model_dir / name).mkdir(exist_ok=True)
+    return model_dir
 
 
 _FULL_TOML = """
@@ -381,8 +448,8 @@ tokenizer = "models/rr/tokenizer.json"
         load_config(explicit_path=config_path, env={})
 
 
-def test_two_embedding_entries_raises_config_error_mentioning_v07(tmp_path: Path) -> None:
-    """Two embedding entries must be rejected, with the message pointing to v0.7."""
+def test_two_embedding_entries_are_accepted_in_order(tmp_path: Path) -> None:
+    """Several embedding models may be served at once, keeping the config-file order."""
     toml_content = """
 [[models]]
 id = "emb1"
@@ -402,12 +469,14 @@ tokenizer = "models/emb2/tokenizer.json"
 """
     config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
 
-    with pytest.raises(ConfigError, match="v0.7"):
-        load_config(explicit_path=config_path, env={})
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert [entry.id for entry in loaded.config.models_of_kind("embedding")] == ["emb1", "emb2"]
+    assert loaded.config.embedding_model.id == "emb1"
 
 
-def test_two_reranker_entries_raises_config_error_mentioning_v07(tmp_path: Path) -> None:
-    """Two reranker entries must be rejected, with the message pointing to v0.7."""
+def test_two_reranker_entries_are_accepted_in_order(tmp_path: Path) -> None:
+    """Several reranker models may be served at once, keeping the config-file order."""
     toml_content = """
 [[models]]
 id = "emb"
@@ -435,8 +504,11 @@ tokenizer = "models/rr2/tokenizer.json"
 """
     config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
 
-    with pytest.raises(ConfigError, match="v0.7"):
-        load_config(explicit_path=config_path, env={})
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert [entry.id for entry in loaded.config.models_of_kind("reranker")] == ["rr1", "rr2"]
+    assert loaded.config.reranker_model is not None
+    assert loaded.config.reranker_model.id == "rr1"
 
 
 def test_duplicate_model_id_raises_config_error(tmp_path: Path) -> None:
@@ -712,7 +784,7 @@ def test_no_config_file_anywhere_uses_built_in_default(
 # Literal copies of the constants the v0.4 hard-coded settings module
 # held (it is deleted in v0.5), except for the tokenizer paths, which
 # v0.6 moved from the HuggingFace model directory to the frozen
-# tokenizer.json under models/compiled/ (v0.6実装計画.md §4.6). The
+# tokenizer.json under models/compiled/. The
 # repository root is derived from this test file, independently of
 # eeane.config, so the comparison below still checks the values instead
 # of restating them.
@@ -751,3 +823,435 @@ def test_default_config_matches_v04_settings_values() -> None:
     assert reranker.artifacts == _V04_RERANKER_COMPILED
     assert reranker.buckets == tuple(sorted(_V04_RERANKER_COMPILED))
     assert reranker.output_name == "logits"
+
+
+# --- kind-aware accessors -------------------------------------------------
+
+
+def _explicit_entry(model_id: str, kind: str) -> ModelEntry:
+    """Build a minimal, fully explicit entry for accessor tests."""
+    return ModelEntry(
+        id=model_id,
+        kind=kind,
+        tokenizer=Path(f"models/{model_id}/tokenizer.json"),
+        artifacts={128: Path(f"compiled/{model_id}/s128.mlmodelc")},
+    )
+
+
+def test_models_of_kind_returns_every_entry_in_config_order() -> None:
+    """models_of_kind must list all entries of one kind, keeping their declared order."""
+    config = EeaneConfig(
+        models=[
+            _explicit_entry("emb1", "embedding"),
+            _explicit_entry("rr1", "reranker"),
+            _explicit_entry("emb2", "embedding"),
+        ]
+    )
+
+    assert [entry.id for entry in config.models_of_kind("embedding")] == ["emb1", "emb2"]
+    assert [entry.id for entry in config.models_of_kind("reranker")] == ["rr1"]
+
+
+def test_default_model_is_the_first_listed_entry_of_its_kind() -> None:
+    """The default model of a kind must be the first one listed, not e.g. the last."""
+    config = EeaneConfig(
+        models=[
+            _explicit_entry("rr1", "reranker"),
+            _explicit_entry("emb1", "embedding"),
+            _explicit_entry("emb2", "embedding"),
+            _explicit_entry("rr2", "reranker"),
+        ]
+    )
+
+    default_embedding = config.default_model("embedding")
+    default_reranker = config.default_model("reranker")
+
+    assert default_embedding is not None and default_embedding.id == "emb1"
+    assert default_reranker is not None and default_reranker.id == "rr1"
+    # The compatibility properties must agree with the new accessors.
+    assert config.embedding_model is default_embedding
+    assert config.reranker_model is default_reranker
+
+
+def test_default_model_returns_none_for_an_unconfigured_kind() -> None:
+    """A kind with no entries must yield None and an empty list, not an error."""
+    config = EeaneConfig(models=[_explicit_entry("emb", "embedding")])
+
+    assert config.default_model("reranker") is None
+    assert config.models_of_kind("reranker") == []
+    assert config.reranker_model is None
+
+
+def test_model_by_id_finds_entries_of_either_kind() -> None:
+    """model_by_id must look across kinds and return None for an unknown id."""
+    config = EeaneConfig(
+        models=[_explicit_entry("emb", "embedding"), _explicit_entry("rr", "reranker")]
+    )
+
+    found_embedding = config.model_by_id("emb")
+    found_reranker = config.model_by_id("rr")
+
+    assert found_embedding is not None and found_embedding.kind == "embedding"
+    assert found_reranker is not None and found_reranker.kind == "reranker"
+    assert config.model_by_id("absent") is None
+    assert config.model_by_id("") is None
+
+
+def test_zero_embedding_entries_still_rejected_for_a_programmatic_config() -> None:
+    """The composition rule (at least one embedding) must hold for direct construction too."""
+    with pytest.raises(ValidationError, match="embedding"):
+        EeaneConfig(models=[_explicit_entry("rr", "reranker")])
+
+
+# --- cache auto-resolution ------------------------------------------------
+
+
+_CACHE_ROOT_TOML = """
+[server]
+cache_root = "cache"
+
+[[models]]
+id = "org/emb"
+"""
+
+
+def test_id_only_entry_is_completed_from_the_cache(tmp_path: Path) -> None:
+    """An entry holding just an id must gain kind/tokenizer/artifacts/output_name."""
+    model_dir = _write_cached_model(tmp_path / "cache", "org/emb", buckets=(128, 512))
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.id == "org/emb"
+    assert entry.kind == "embedding"
+    assert entry.tokenizer == model_dir / "tokenizer.json"
+    assert entry.tokenizer.is_absolute()
+    assert entry.artifacts == {
+        128: model_dir / "s128_b1_eager_macos13.mlmodelc",
+        512: model_dir / "s512_b1_eager_macos13.mlmodelc",
+    }
+    assert entry.output_name == "embedding"
+    assert entry.embedding_dim == 768
+    assert entry.excluded_buckets == ()
+    assert entry.normalize is True
+
+
+def test_id_only_reranker_entry_is_completed_from_the_cache(tmp_path: Path) -> None:
+    """A cached reranker must resolve to kind='reranker', its logits output, and no dim."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    _write_cached_model(tmp_path / "cache", "rr", kind="reranker", buckets=(512, 1024))
+    config_path = _write_toml(
+        tmp_path / "eeane.toml", _CACHE_ROOT_TOML + '\n[[models]]\nid = "rr"\n'
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    reranker = loaded.config.reranker_model
+    assert reranker is not None
+    assert reranker.kind == "reranker"
+    assert reranker.output_name == "logits"
+    assert reranker.buckets == (512, 1024)
+    assert reranker.embedding_dim is None
+
+
+def test_recommended_buckets_limit_the_loaded_artifacts(tmp_path: Path) -> None:
+    """Only the recommended buckets are loaded; the rest are recorded as excluded."""
+    _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128, 512, 1024),
+        recommended_buckets=(512,),
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.buckets == (512,)
+    assert entry.excluded_buckets == (128, 1024)
+
+
+def test_format_version_1_record_degrades_gracefully(tmp_path: Path) -> None:
+    """A v1 record has no embedding_dim/recommended_buckets: load every bucket, dim unknown."""
+    _write_cached_model(tmp_path / "cache", "org/emb", format_version=1, buckets=(128, 512, 1024))
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.buckets == (128, 512, 1024)
+    assert entry.excluded_buckets == ()
+    assert entry.embedding_dim is None
+    assert entry.kind == "embedding"
+
+
+def test_unknown_record_keys_are_ignored(tmp_path: Path) -> None:
+    """Provenance blocks and future keys in the record must not leak into the entry."""
+    _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        overrides={"something_new": {"nested": True}},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert not hasattr(entry, "calibration")
+    assert not hasattr(entry, "something_new")
+
+
+def test_declared_kind_conflicting_with_the_cache_raises_config_error(tmp_path: Path) -> None:
+    """A kind stated in the config that the cache contradicts must be a hard error."""
+    _write_cached_model(tmp_path / "cache", "org/emb", kind="embedding")
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML + 'kind = "reranker"\n')
+
+    with pytest.raises(ConfigError, match="kind"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_missing_cache_entry_names_the_directory_and_the_compile_command(
+    tmp_path: Path,
+) -> None:
+    """A model that was never compiled must fail with the searched path and the fix."""
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+    expected_dir = tmp_path / "cache" / "compiled" / "org--emb"
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(explicit_path=config_path, env={})
+
+    message = str(excinfo.value)
+    assert "eeane compile org/emb" in message
+    assert str(expected_dir) in message
+    assert "tokenizer" in message
+
+
+def test_corrupt_model_info_reports_the_compile_command(tmp_path: Path) -> None:
+    """A truncated record must be reported like a missing one, not silently ignored."""
+    model_dir = _write_cached_model(tmp_path / "cache", "org/emb")
+    (model_dir / "model_info.json").write_text('{"format_version": 2,', encoding="utf-8")
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match=re.escape("eeane compile org/emb")):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_newer_record_format_version_is_rejected(tmp_path: Path) -> None:
+    """A record from a newer eeANE must be refused rather than half-understood."""
+    _write_cached_model(tmp_path / "cache", "org/emb", overrides={"format_version": 99})
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="format_version"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_record_without_a_usable_format_version_is_rejected(tmp_path: Path) -> None:
+    """A record whose format_version is not a positive integer must be refused."""
+    _write_cached_model(tmp_path / "cache", "org/emb", overrides={"format_version": "one"})
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="format_version"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_record_with_an_unknown_kind_is_rejected(tmp_path: Path) -> None:
+    """A record naming a kind this release cannot serve must be refused."""
+    _write_cached_model(tmp_path / "cache", "org/emb", overrides={"kind": "classifier"})
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="kind"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_recommendation_matching_no_compiled_bucket_is_rejected(tmp_path: Path) -> None:
+    """A recommendation that leaves nothing to load must not yield an empty artifact set."""
+    _write_cached_model(tmp_path / "cache", "org/emb", buckets=(128,), recommended_buckets=(2048,))
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="recommended"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_record_without_artifacts_is_rejected(tmp_path: Path) -> None:
+    """A record listing no compiled artifact must be refused with the compile hint."""
+    _write_cached_model(tmp_path / "cache", "org/emb", overrides={"artifacts": {}})
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="artifact"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_record_with_a_non_positive_bucket_is_rejected(tmp_path: Path) -> None:
+    """A bucket length of zero in the record must be refused like one in the config file."""
+    _write_cached_model(
+        tmp_path / "cache", "org/emb", overrides={"artifacts": {"0": "s0.mlmodelc"}}
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="positive"):
+        load_config(explicit_path=config_path, env={})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("tokenizer", "/etc/passwd"), ("artifacts", {"128": "../../elsewhere.mlmodelc"})],
+)
+def test_record_pointing_outside_its_directory_is_rejected(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """A record must only name files inside its own cache directory."""
+    _write_cached_model(tmp_path / "cache", "org/emb", overrides={field: value})
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match=field):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_resolved_reranker_still_rejects_an_explicit_normalize(tmp_path: Path) -> None:
+    """Field validation must apply to cache-resolved entries just as to explicit ones."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    _write_cached_model(tmp_path / "cache", "rr", kind="reranker", buckets=(512,))
+    config_path = _write_toml(
+        tmp_path / "eeane.toml",
+        _CACHE_ROOT_TOML + '\n[[models]]\nid = "rr"\nnormalize = true\n',
+    )
+
+    with pytest.raises(ConfigError, match="normalize"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_explicit_tokenizer_and_artifacts_skip_cache_resolution(tmp_path: Path) -> None:
+    """A v0.6-style entry must load unchanged even when no cache exists at all."""
+    toml_content = """
+[server]
+cache_root = "no-such-cache"
+
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.tokenizer == tmp_path / "models" / "emb" / "tokenizer.json"
+    assert entry.artifacts == {128: tmp_path / "compiled" / "emb" / "s128.mlmodelc"}
+    assert entry.embedding_dim is None
+    assert entry.excluded_buckets == ()
+
+
+def test_entry_with_only_a_tokenizer_gains_its_artifacts_from_the_cache(tmp_path: Path) -> None:
+    """A half-specified entry must keep what it states and fill in only what it omits."""
+    model_dir = _write_cached_model(tmp_path / "cache", "emb", buckets=(128, 512))
+    toml_content = """
+[server]
+cache_root = "cache"
+
+[[models]]
+id = "emb"
+tokenizer = "models/emb/tokenizer.json"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.tokenizer == tmp_path / "models" / "emb" / "tokenizer.json"
+    assert entry.kind == "embedding"
+    assert entry.artifacts == {
+        128: model_dir / "s128_b1_eager_macos13.mlmodelc",
+        512: model_dir / "s512_b1_eager_macos13.mlmodelc",
+    }
+
+
+def test_explicitly_configured_fields_win_over_the_cache(tmp_path: Path) -> None:
+    """Values stated in the config file must survive resolution untouched."""
+    _write_cached_model(tmp_path / "cache", "org/emb", embedding_dim=768)
+    config_path = _write_toml(
+        tmp_path / "eeane.toml",
+        _CACHE_ROOT_TOML + 'output_name = "custom"\nembedding_dim = 64\nnormalize = false\n',
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.output_name == "custom"
+    assert entry.embedding_dim == 64
+    assert entry.normalize is False
+
+
+def test_cache_root_is_resolved_against_the_config_file_directory(tmp_path: Path) -> None:
+    """A relative cache_root must be anchored at the config file, like the other paths."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.server.cache_root == tmp_path / "cache"
+    assert loaded.config.server.cache_root.is_absolute()
+
+
+def test_relative_config_path_still_yields_an_absolute_cache_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CWD-relative --config path must still absolutize cache_root and the resolved paths."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+    monkeypatch.chdir(tmp_path)
+
+    loaded = load_config(explicit_path=Path("eeane.toml"), env={})
+
+    assert loaded.config.server.cache_root == tmp_path / "cache"
+    assert loaded.config.embedding_model.tokenizer.is_absolute()
+
+
+def test_absolute_cache_root_passes_through(tmp_path: Path) -> None:
+    """An absolute cache_root must not be re-based on the config directory."""
+    cache_root = tmp_path / "elsewhere" / "cache"
+    _write_cached_model(cache_root, "org/emb")
+    toml_content = f"""
+[server]
+cache_root = "{cache_root.as_posix()}"
+
+[[models]]
+id = "org/emb"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.server.cache_root == cache_root
+    assert loaded.config.embedding_model.tokenizer.parent.parent == cache_root / "compiled"
+
+
+def test_xdg_cache_home_locates_the_cache_when_cache_root_is_unset(tmp_path: Path) -> None:
+    """Without cache_root, the cache is looked up below XDG_CACHE_HOME."""
+    model_dir = _write_cached_model(tmp_path / "xdg" / "eeane", "emb")
+    config_path = _write_toml(tmp_path / "eeane.toml", '[[models]]\nid = "emb"\n')
+
+    loaded = load_config(explicit_path=config_path, env={"XDG_CACHE_HOME": str(tmp_path / "xdg")})
+
+    assert loaded.config.server.cache_root is None
+    assert loaded.config.embedding_model.tokenizer == model_dir / "tokenizer.json"
+
+
+def test_explicit_entry_without_kind_raises_config_error(tmp_path: Path) -> None:
+    """Stating tokenizer and artifacts disables resolution, so kind becomes mandatory."""
+    toml_content = """
+[[models]]
+id = "emb"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="kind"):
+        load_config(explicit_path=config_path, env={})
