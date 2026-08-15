@@ -1,4 +1,4 @@
-"""Core ML conversion primitives (v0.6実装計画.md §4.3, ported from poc/).
+"""Core ML conversion primitives (ported from poc/).
 
 The trace -> convert -> compile sequence proven by the PoC scripts
 (``poc/convert_common.py``) lives here, unchanged in behaviour: the frozen
@@ -8,8 +8,7 @@ source of truth for the pipeline steps that talk to ``coremltools`` and
 
 The only functional difference against the PoC is
 :func:`build_versions_info`, which additionally records the eeANE version
-so that compiled artifacts can be invalidated when eeANE itself changes
-(v0.6実装計画.md §4.4).
+so that compiled artifacts can be invalidated when eeANE itself changes.
 
 Importing this module pulls in ``torch``/``transformers``/``coremltools``;
 it therefore requires the ``[compile]`` extra and must never be imported

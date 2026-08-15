@@ -1,4 +1,4 @@
-"""eeANE model compiler subpackage (v0.6実装計画.md §3, §4.1-§4.3).
+"""eeANE model compiler subpackage.
 
 This subpackage implements ``eeane compile``: converting a HuggingFace
 distribution-format model into ANE-ready ``.mlmodelc`` artifacts. It
@@ -20,8 +20,7 @@ import importlib.util
 
 # Command shown to the user to install the missing dependencies. Kept as
 # a module-level constant so tests can assert on it without duplicating
-# the string (開発資料/v0.6実装計画.md §4.1: "eeane compile requires the
-# [compile] extra").
+# the string used in the error message below.
 _INSTALL_HINT = "uv sync --extra compile"
 
 
@@ -36,8 +35,7 @@ def require_compile_dependencies() -> None:
     :func:`importlib.util.find_spec`, so nothing is actually imported
     here) since those are the two packages whose absence is most
     consequential (large, slow to install, and the source of most of
-    the runtime/compile dependency split described in v0.6実装計画.md
-    §4.7).
+    the runtime/compile dependency split).
 
     Raises:
         MissingCompileDependencyError: If ``torch`` and/or

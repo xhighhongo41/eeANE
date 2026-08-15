@@ -1,4 +1,4 @@
-"""Tests for eeane.compiler.tokenizer_freeze (v0.6 T6, 開発資料/v0.6実装計画.md §4.6).
+"""Tests for eeane.compiler.tokenizer_freeze.
 
 The freeze/verify gate is what makes it safe for ``eeane serve`` to drop
 ``transformers``: these tests run the gate on the real ruri-v3 tokenizers
@@ -124,7 +124,7 @@ def test_freeze_tokenizer_reports_what_it_froze(tmp_path: Path) -> None:
 
 
 def test_freeze_tokenizer_does_not_touch_the_model_directory(tmp_path: Path) -> None:
-    """The input model directory is read-only (v0.6実装計画.md §2-11)."""
+    """The input model directory is read-only."""
     before = {path.name: path.stat().st_mtime_ns for path in DEFAULT_MODEL_DIR.iterdir()}
 
     freeze_tokenizer(DEFAULT_MODEL_DIR, tmp_path / "tokenizer.json")

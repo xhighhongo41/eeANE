@@ -1,4 +1,4 @@
-"""Tests for poc.chunking (T2 of v0.3実装計画.md §4.3)."""
+"""Tests for poc.chunking."""
 
 from __future__ import annotations
 

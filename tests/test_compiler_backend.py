@@ -44,8 +44,8 @@ _RERANKER_AVAILABLE = (RERANKER_MODEL_DIR / "config.json").exists()
 SMOKE_SEQ_LEN = 128
 
 # Tolerance between the patched eager path and the untouched sdpa path.
-# The rank-4 rewrite is bit-exact against upstream eager (v0.3実装記録
-# §6-6); what is left here is the eager-vs-sdpa kernel difference in FP32.
+# The rank-4 rewrite is bit-exact against upstream eager; what is left
+# here is the eager-vs-sdpa kernel difference in FP32.
 PATCH_ABS_TOLERANCE = 1e-4
 
 

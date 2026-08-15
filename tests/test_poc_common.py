@@ -1,4 +1,4 @@
-"""Tests for poc.common (T4: PoC common module, T2 of v0.2実装計画.md)."""
+"""Tests for poc.common."""
 
 from __future__ import annotations
 
@@ -149,7 +149,7 @@ def test_sigmoid_np_large_inputs_converge_without_overflow_warning() -> None:
 
 
 def test_load_rerank_queries_contents() -> None:
-    """load_rerank_queries must return the 9 hand-written queries (§4.5)."""
+    """load_rerank_queries must return the 9 hand-written queries."""
     queries = load_rerank_queries()
 
     assert len(queries) == 9
@@ -163,7 +163,7 @@ def test_load_rerank_queries_contents() -> None:
     not _RERANKER_AVAILABLE, reason="ruri-v3-reranker-310m model directory not found"
 )
 def test_tokenize_pairs_shape_and_pair_template() -> None:
-    """tokenize_pairs must produce the <s> q </s> <s> d </s> template (§4.4)."""
+    """tokenize_pairs must produce the <s> q </s> <s> d </s> template."""
     tokenizer = load_tokenizer(DEFAULT_RERANKER_DIR)
     seq_len = 64
     pairs = [

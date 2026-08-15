@@ -1,4 +1,4 @@
-"""Tests for eeane.compiler.sources (v0.6 T3, see 開発資料/v0.6実装計画.md §4.1, §4.10 C3)."""
+"""Tests for eeane.compiler.sources."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def test_resolve_source_returns_existing_directory(tmp_path: Path) -> None:
 
 
 def test_resolve_source_does_not_write_into_the_model_directory(tmp_path: Path) -> None:
-    """Resolution must leave a local model directory byte-for-byte untouched (§2-11)."""
+    """Resolution must leave a local model directory byte-for-byte untouched."""
     model_dir = tmp_path / "ruri-v3-310m"
     _make_snapshot(model_dir, ["config.json"])
     before = {p.name: p.stat().st_mtime_ns for p in model_dir.iterdir()}
@@ -145,7 +145,7 @@ def test_resolve_source_passes_revision_through(download_calls: dict[str, Any]) 
 
 
 def test_resolve_source_accepts_sharded_safetensors(download_calls: dict[str, Any]) -> None:
-    """A sharded checkpoint (index + shards) must be accepted (§4.10 C3)."""
+    """A sharded checkpoint (index + shards) must be accepted."""
     _make_snapshot(
         download_calls["snapshot"],
         [
@@ -162,7 +162,7 @@ def test_resolve_source_accepts_sharded_safetensors(download_calls: dict[str, An
 def test_resolve_source_rejects_snapshot_without_safetensors(
     download_calls: dict[str, Any],
 ) -> None:
-    """A bin-only repo downloads no weights and must raise a clear error (§4.10 C3)."""
+    """A bin-only repo downloads no weights and must raise a clear error."""
     _make_snapshot(download_calls["snapshot"], ["config.json"])
 
     with pytest.raises(sources.MissingSafetensorsError) as excinfo:

@@ -67,11 +67,11 @@ SANITY_COSINE_THRESHOLD = 0.99
 SANITY_SIGMOID_TOLERANCE = 0.02
 
 # Minimum cosine similarity between rows of a batch holding the same text
-# (embedding batch consistency check, R1).
+# (embedding batch consistency check).
 BATCH_CONSISTENCY_COSINE_THRESHOLD = 0.99999
 
 # Maximum tolerated |logit(row k) - logit(row 0)| between rows of a batch
-# holding the same pair (reranker batch consistency check, R1).
+# holding the same pair (reranker batch consistency check).
 BATCH_CONSISTENCY_LOGIT_TOLERANCE = 0.01
 
 # --- NE placement ---
@@ -405,7 +405,7 @@ def _check_batch_consistency_embedding(
     batch_size: int,
     output_key: str,
 ) -> dict[str, Any]:
-    """Verify that rows of one embedding batch do not influence each other (R1).
+    """Verify that rows of one embedding batch do not influence each other.
 
     Ported from ``poc/convert_embedding.py``'s ``check_batch_consistency``.
 
@@ -447,7 +447,7 @@ def _check_batch_consistency_reranker(
     batch_size: int,
     output_key: str,
 ) -> dict[str, Any]:
-    """Verify that rows of one reranker batch do not influence each other (R1).
+    """Verify that rows of one reranker batch do not influence each other.
 
     Ported from ``poc/convert_reranker.py``'s ``check_batch_consistency``.
 

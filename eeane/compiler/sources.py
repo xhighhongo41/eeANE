@@ -1,4 +1,4 @@
-"""Compile input resolution (v0.6実装計画.md §4.1, §4.10 C3).
+"""Compile input resolution.
 
 ``eeane compile <source>`` accepts either a local HuggingFace-format model
 directory or a Hub repo id (``org/name``). This module turns both into a
@@ -6,9 +6,8 @@ local directory path, downloading the latter into the *standard* Hugging
 Face cache (shared with every other HF tool) via
 ``huggingface_hub.snapshot_download``.
 
-Input model directories are strictly read-only (v0.6実装計画.md §2-11):
-nothing here writes to, modifies, or deletes anything inside a resolved
-model directory.
+Input model directories are strictly read-only: nothing here writes to,
+modifies, or deletes anything inside a resolved model directory.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from pathlib import Path
 
 # Files fetched for a Hub repo id. Weights are restricted to safetensors on
 # purpose: ``.bin`` checkpoints need ``torch.load``, whose security
-# implications are out of scope for v0.6 (§4.10 C3).
+# implications are out of scope here.
 HF_ALLOW_PATTERNS: tuple[str, ...] = (
     "config.json",
     "*.safetensors",
@@ -67,8 +66,8 @@ def resolve_source(source: str, revision: str | None = None) -> Path:
 
     An existing path wins over the Hub interpretation, so a local
     ``models/ruri-v3-310m`` is never mistaken for a repo id. Nothing is
-    written into the resolved directory (v0.6実装計画.md §2-11); Hub
-    downloads only add files to the standard Hugging Face cache.
+    written into the resolved directory; Hub downloads only add files to
+    the standard Hugging Face cache.
 
     Args:
         source: Local directory path or Hub repo id (``org/name``).
@@ -172,7 +171,7 @@ def _require_safetensors(snapshot_dir: Path, repo_id: str) -> None:
     ):
         return
     raise MissingSafetensorsError(
-        f"no .safetensors weights were downloaded for '{repo_id}'. eeANE v0.6 only "
+        f"no .safetensors weights were downloaded for '{repo_id}'. eeANE only "
         "supports safetensors checkpoints; models distributed as .bin only are not "
-        "supported (see 開発資料/v0.6実装計画.md §4.10 C3)"
+        "supported"
     )

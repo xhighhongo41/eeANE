@@ -1,4 +1,4 @@
-"""Tests for eeane.cli (v0.5 T3, see 開発資料/v0.5実装計画.md §4.3-§4.4)."""
+"""Tests for eeane.cli."""
 
 from __future__ import annotations
 

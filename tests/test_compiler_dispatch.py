@@ -1,4 +1,4 @@
-"""Tests for eeane.compiler.dispatch (v0.6 T3, see 開発資料/v0.6実装計画.md §4.2, §4.9)."""
+"""Tests for eeane.compiler.dispatch."""
 
 from __future__ import annotations
 

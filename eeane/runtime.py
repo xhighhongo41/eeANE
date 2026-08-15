@@ -1,4 +1,4 @@
-"""Runtime helpers for the eeANE server (v0.4実装計画.md §4.3, v0.6 §4.6).
+"""Runtime helpers for the eeANE server.
 
 Everything here depends only on numpy and the ``tokenizers`` library, so
 it can be unit-tested without loading a Core ML model -- and, since v0.6,
@@ -11,7 +11,7 @@ compose these helpers with the actual model artifacts.
 Apart from :func:`load_frozen_tokenizer` (which reads a file) the
 functions are pure with one caveat: encoding mutates the Rust-side
 padding/truncation state of the tokenizer it is given, so callers must
-serialize them with the engine's tokenizer lock (v0.4実装記録 §3-1).
+serialize them with the engine's tokenizer lock.
 """
 
 from __future__ import annotations

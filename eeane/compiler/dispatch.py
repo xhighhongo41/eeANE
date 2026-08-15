@@ -1,4 +1,4 @@
-"""Compile backend dispatch (v0.6実装計画.md §4.2).
+"""Compile backend dispatch.
 
 Reads the ``config.json`` of a HuggingFace-format model directory and
 decides (a) which compile backend implements that architecture and (b)

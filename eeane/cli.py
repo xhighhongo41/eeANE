@@ -1,4 +1,4 @@
-"""Command-line interface for eeANE (v0.5実装計画.md §4.3, v0.6実装計画.md §4.1).
+"""Command-line interface for eeANE.
 
 Provides three subcommands:
 
@@ -35,7 +35,7 @@ logger = logging.getLogger("eeane.cli")
 
 # Config file permission bits that indicate group/other read access. Used
 # to warn when a config file holding an api_key is not private (chmod 600
-# recommended), per 開発資料/v0.5実装計画.md §4.4.
+# recommended).
 _GROUP_OTHER_READABLE = 0o044
 
 _LOG_LEVEL_CHOICES = ("debug", "info", "warning", "error")
@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_compile_subparser(
     subparsers: argparse._SubParsersAction,  # type: ignore[type-arg]
 ) -> None:
-    """Add the ``compile`` subcommand (v0.6実装計画.md §4.1).
+    """Add the ``compile`` subcommand.
 
     ``compile`` is standalone: it does not read ``eeane.toml`` and has
     no ``--config`` option (unlike ``serve``/``check-config``).
@@ -318,11 +318,10 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     """Check ``[compile]`` dependencies and run model compilation (the ``compile`` subcommand).
 
     Unlike ``serve``/``check-config``, this does not read ``eeane.toml``:
-    ``eeane compile`` is a standalone conversion tool (v0.6実装計画.md
-    §4.1). ``eeane.compiler`` is imported here, not at module load time,
-    so that ``eeane serve``/``check-config`` keep working in
-    environments without the ``[compile]`` extra (torch/transformers)
-    installed.
+    ``eeane compile`` is a standalone conversion tool. ``eeane.compiler``
+    is imported here, not at module load time, so that ``eeane
+    serve``/``check-config`` keep working in environments without the
+    ``[compile]`` extra (torch/transformers) installed.
 
     Args:
         args: Parsed ``compile`` arguments (see

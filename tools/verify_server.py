@@ -1,10 +1,10 @@
 """Verification client for the eeANE server.
 
 Standard library only (``urllib.request``), with the eeANE package and a
-handful of read-only test-data loaders from ``poc/common.py`` imported for
-building inputs and computing the Core ML direct-predict baseline. Like
-``poc/benchmark_infinity_client.py``, every request is sent through an
-opener that explicitly bypasses the ``HTTP_PROXY``/``HTTPS_PROXY``
+handful of read-only test-data loaders from ``tools/corpus.py`` imported
+for building inputs and computing the Core ML direct-predict baseline.
+Like ``poc/benchmark_infinity_client.py``, every request is sent through
+an opener that explicitly bypasses the ``HTTP_PROXY``/``HTTPS_PROXY``
 environment variables: a proxy that silently swallows localhost traffic
 otherwise turns into a confusing "server is broken" report.
 
@@ -55,14 +55,14 @@ import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
-    # Allow `python tools/verify_server.py` to import the eeane/poc packages
+    # Allow `python tools/verify_server.py` to import the eeane package
     # regardless of the current working directory.
     sys.path.insert(0, str(_REPO_ROOT))
 
 from eeane import runtime  # noqa: E402
 from eeane.config import ModelEntry, load_config  # noqa: E402
 from eeane.engine import CoreMLEngine  # noqa: E402
-from poc.common import (  # noqa: E402
+from tools.corpus import (  # noqa: E402
     CORPUS_DIR,
     PREFIX_TEST_SENTENCES,
     PREFIXES,
@@ -81,7 +81,7 @@ CONFIG = load_config().config
 
 # (source work, corpus file, kokoro-only paragraph cap) in the exact file
 # order load_corpus_paragraphs() uses, so per-paragraph work tags can be
-# reconstructed alongside it (poc.common discards the work name).
+# reconstructed alongside it (tools.corpus discards the work name).
 _WORK_FILES: list[tuple[str, Path, int | None]] = [
     ("kumonoito", CORPUS_DIR / "kumonoito.txt", None),
     ("sangetsuki", CORPUS_DIR / "sangetsuki.txt", None),
@@ -174,7 +174,7 @@ def load_paragraph_works(min_chars: int = 40) -> list[str]:
     """Load the source-work tag of every paragraph in ``load_corpus_paragraphs()``.
 
     Rebuilds the paragraph list from the three corpus files using exactly
-    the same filter as ``poc.common.load_corpus_paragraphs`` (file order,
+    the same filter as ``tools.corpus.load_corpus_paragraphs`` (file order,
     ``min_chars``, kokoro capped at its first 30 filtered paragraphs), but
     keeps the source work name that the shared loader discards. The
     reconstructed paragraph texts are compared against
@@ -209,7 +209,7 @@ def load_paragraph_works(min_chars: int = 40) -> list[str]:
     expected = load_corpus_paragraphs()
     if paragraphs != expected:
         raise RuntimeError(
-            "load_paragraph_works() diverged from poc.common.load_corpus_paragraphs(): "
+            "load_paragraph_works() diverged from tools.corpus.load_corpus_paragraphs(): "
             f"got {len(paragraphs)} paragraphs, expected {len(expected)}"
         )
     return works
@@ -226,7 +226,7 @@ def _request_json(
 
     Args:
         opener: Opener built with ``ProxyHandler({})`` so localhost traffic
-            is never routed through an unrelated proxy (§4.7).
+            is never routed through an unrelated proxy.
         method: HTTP method (``"GET"`` or ``"POST"``).
         url: Full request URL.
         payload: JSON-serializable request body for POST; ``None`` for GET.
@@ -1138,7 +1138,7 @@ def _verify_rerank_model(
 
 
 def cmd_bench(args: argparse.Namespace, opener: urllib.request.OpenerDirector) -> bool:
-    """Measure HTTP round-trip latency for rerank and embedding (part of R5).
+    """Measure HTTP round-trip latency for rerank and embedding.
 
     No pass/fail judgment is made here (all reported measurements are
     informational); the return value is always ``True`` unless the server
