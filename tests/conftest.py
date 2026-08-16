@@ -187,6 +187,12 @@ class StubEngine:
         """Return the first-listed model id of ``kind``, or ``None``."""
         return self._defaults.get(kind)
 
+    def loaded(self, model_id: str) -> bool:
+        """Report every served model as in memory (KeyError if unknown)."""
+        if model_id not in self._buckets:
+            raise KeyError(model_id)
+        return True
+
     def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
         """Return :func:`stub_vector` for each text, counting 1 token per character."""
         resolved = self._resolve("embedding", model_id)

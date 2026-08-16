@@ -26,6 +26,7 @@ from conftest import (
 from fastapi.testclient import TestClient
 
 from eeane import runtime
+from eeane.config import EeaneConfig
 from eeane.engine import EmbeddingBatch, RerankBatch
 from eeane.server import HealthRateLimiter, create_app
 
@@ -76,6 +77,68 @@ class TruncatingStubEngine(StubEngine):
         batch.used_tokens = [512] * len(documents)
         batch.truncated_indices = list(range(len(documents)))
         return batch
+
+
+class LoadedStateStubEngine(StubEngine):
+    """Stub whose ``loaded()`` answer is set per model id by the test.
+
+    Attributes:
+        loaded_ids: Ids currently reported as in memory; every other
+            configured id is reported as not loaded.
+    """
+
+    def __init__(self, config: EeaneConfig, loaded_ids: set[str]) -> None:
+        """Register the configured models and remember which are loaded.
+
+        Args:
+            config: Deployment to mirror (forwarded to :class:`StubEngine`).
+            loaded_ids: Ids :meth:`loaded` must report ``True`` for.
+        """
+        super().__init__(config)
+        self.loaded_ids = loaded_ids
+
+    def loaded(self, model_id: str) -> bool:
+        """Report ``model_id in loaded_ids`` (``KeyError`` if unknown)."""
+        if model_id not in self._kinds:
+            raise KeyError(model_id)
+        return model_id in self.loaded_ids
+
+
+class CallCountingStubEngine(StubEngine):
+    """Stub counting every :meth:`embed`/:meth:`rerank` call it serves.
+
+    Used to prove an endpoint reads only state (``loaded()``, ``buckets()``)
+    without triggering inference.
+    """
+
+    def __init__(self, config: EeaneConfig) -> None:
+        """Register the configured models and start both counters at zero."""
+        super().__init__(config)
+        self.embed_calls = 0
+        self.rerank_calls = 0
+
+    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
+        """Count the call, then serve it as :class:`StubEngine` would."""
+        self.embed_calls += 1
+        return super().embed(texts, model_id)
+
+    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
+        """Count the call, then serve it as :class:`StubEngine` would."""
+        self.rerank_calls += 1
+        return super().rerank(query, documents, model_id)
+
+
+class CloseRecordingStubEngine(StubEngine):
+    """Stub recording whether :meth:`close` was called (lifespan-teardown test)."""
+
+    def __init__(self, config: EeaneConfig) -> None:
+        """Register the configured models and start unclosed."""
+        super().__init__(config)
+        self.closed = False
+
+    def close(self) -> None:
+        """Record that shutdown reached this engine."""
+        self.closed = True
 
 
 @pytest.fixture
@@ -155,9 +218,46 @@ def test_health_reports_status_version_and_buckets(client: TestClient) -> None:
     assert payload["status"] == "ok"
     assert isinstance(payload["version"], str) and payload["version"]
     assert payload["models"] == [
-        {"id": _EMBEDDING_ID, "kind": "embedding", "buckets": list(STUB_BUCKETS["embedding"])},
-        {"id": _RERANKER_ID, "kind": "reranker", "buckets": list(STUB_BUCKETS["reranker"])},
+        {
+            "id": _EMBEDDING_ID,
+            "kind": "embedding",
+            "buckets": list(STUB_BUCKETS["embedding"]),
+            "loaded": True,
+        },
+        {
+            "id": _RERANKER_ID,
+            "kind": "reranker",
+            "buckets": list(STUB_BUCKETS["reranker"]),
+            "loaded": True,
+        },
     ]
+
+
+def test_health_reports_the_loaded_state_of_each_model() -> None:
+    """/health must reflect the engine's per-model ``loaded()`` answer."""
+    config = make_config(normalize=False)
+    engine = LoadedStateStubEngine(config, loaded_ids={_EMBEDDING_ID})
+
+    with TestClient(create_app(config, engine=engine)) as test_client:
+        payload = test_client.get("/health").json()
+
+    loaded_by_id = {model["id"]: model["loaded"] for model in payload["models"]}
+    assert loaded_by_id == {_EMBEDDING_ID: True, _RERANKER_ID: False}
+
+
+def test_health_and_models_never_trigger_inference() -> None:
+    """/health and /models must only read state, never call embed()/rerank()."""
+    config = make_config(normalize=False)
+    engine = CallCountingStubEngine(config)
+
+    with TestClient(create_app(config, engine=engine)) as test_client:
+        health_response = test_client.get("/health")
+        models_response = test_client.get("/models")
+
+    assert health_response.status_code == 200
+    assert models_response.status_code == 200
+    assert engine.embed_calls == 0
+    assert engine.rerank_calls == 0
 
 
 def test_embeddings_accepts_single_string(client: TestClient) -> None:
@@ -503,6 +603,32 @@ def test_api_key_startup_log_never_leaks_the_key(caplog: pytest.LogCaptureFixtur
     assert all(_API_KEY not in message for message in messages)
 
 
+# --- lifespan teardown -----------------------------------------------------
+
+
+def test_lifespan_shutdown_closes_the_engine() -> None:
+    """Shutdown must call the injected engine's ``close()`` exactly once."""
+    config = make_config(normalize=False)
+    engine = CloseRecordingStubEngine(config)
+    app = create_app(config, engine=engine)
+
+    with TestClient(app):
+        assert engine.closed is False
+
+    assert engine.closed is True
+
+
+def test_lifespan_shutdown_tolerates_an_engine_without_close() -> None:
+    """An injected engine that defines no ``close`` must not break shutdown."""
+    config = make_config(normalize=False)
+    engine = StubEngine(config)
+    app = create_app(config, engine=engine)
+
+    assert not hasattr(engine, "close")
+    with TestClient(app):
+        pass
+
+
 # --- GET /models ----------------------------------------------------------
 
 
@@ -622,7 +748,12 @@ def test_health_lists_no_reranker_without_a_reranker(
     payload = embedding_only_client.get("/health").json()
 
     assert payload["models"] == [
-        {"id": _EMBEDDING_ID, "kind": "embedding", "buckets": list(STUB_BUCKETS["embedding"])}
+        {
+            "id": _EMBEDDING_ID,
+            "kind": "embedding",
+            "buckets": list(STUB_BUCKETS["embedding"]),
+            "loaded": True,
+        }
     ]
 
 
@@ -850,10 +981,30 @@ def test_health_lists_every_model_with_its_kind_and_buckets(
     payload = client.get("/health").json()
 
     assert payload["models"] == [
-        {"id": _EMBEDDING_ID, "kind": "embedding", "buckets": list(STUB_BUCKETS["embedding"])},
-        {"id": _RERANKER_ID, "kind": "reranker", "buckets": list(STUB_BUCKETS["reranker"])},
-        {"id": _SECOND_EMBEDDING_ID, "kind": "embedding", "buckets": list(_SECOND_BUCKETS)},
-        {"id": _SECOND_RERANKER_ID, "kind": "reranker", "buckets": list(_SECOND_BUCKETS)},
+        {
+            "id": _EMBEDDING_ID,
+            "kind": "embedding",
+            "buckets": list(STUB_BUCKETS["embedding"]),
+            "loaded": True,
+        },
+        {
+            "id": _RERANKER_ID,
+            "kind": "reranker",
+            "buckets": list(STUB_BUCKETS["reranker"]),
+            "loaded": True,
+        },
+        {
+            "id": _SECOND_EMBEDDING_ID,
+            "kind": "embedding",
+            "buckets": list(_SECOND_BUCKETS),
+            "loaded": True,
+        },
+        {
+            "id": _SECOND_RERANKER_ID,
+            "kind": "reranker",
+            "buckets": list(_SECOND_BUCKETS),
+            "loaded": True,
+        },
     ]
 
 
@@ -919,3 +1070,77 @@ def test_startup_stays_quiet_without_excluded_buckets(caplog: pytest.LogCaptureF
         pass
 
     assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
+
+def test_startup_logs_policy_and_keep_alive_for_on_demand_models(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An on-demand entry's start-up line must state its policy and idle-unload delay."""
+    on_demand_entry = make_model_entry(_SECOND_EMBEDDING_ID, buckets=_SECOND_BUCKETS).model_copy(
+        update={"load_policy": "on_demand", "keep_alive": 42}
+    )
+    config = make_config(normalize=False, extra_models=[on_demand_entry])
+    app = create_app(config, engine=StubEngine(config))
+
+    with caplog.at_level(logging.INFO, logger="eeane.server"), TestClient(app):
+        pass
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "eeane.server" and record.levelname == "INFO"
+    ]
+    assert any(
+        _SECOND_EMBEDDING_ID in message
+        and "policy=on_demand" in message
+        and "keep_alive=42s" in message
+        for message in messages
+    )
+
+
+def test_startup_logs_the_configured_memory_cap(caplog: pytest.LogCaptureFixture) -> None:
+    """A configured max_loaded_models cap must be reported once at start-up."""
+    config = make_config(normalize=False)
+    config.server.max_loaded_models = 2
+    app = create_app(config, engine=StubEngine(config))
+
+    with caplog.at_level(logging.INFO, logger="eeane.server"), TestClient(app):
+        pass
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "eeane.server" and record.levelname == "INFO"
+    ]
+    assert any("2" in message and "kept in memory" in message for message in messages)
+
+
+# --- disabled models --------------------------------------------------------
+
+
+def test_disabled_model_is_hidden_and_returns_404(caplog: pytest.LogCaptureFixture) -> None:
+    """A load_policy='disabled' entry must be unroutable and reported at start-up."""
+    disabled_entry = make_model_entry(_SECOND_EMBEDDING_ID, buckets=_SECOND_BUCKETS).model_copy(
+        update={"load_policy": "disabled"}
+    )
+    config = make_config(normalize=False, extra_models=[disabled_entry])
+    assert _SECOND_EMBEDDING_ID in config.disabled_models
+    app = create_app(config, engine=StubEngine(config))
+
+    with caplog.at_level(logging.INFO, logger="eeane.server"), TestClient(app) as test_client:
+        models_response = test_client.get("/models")
+        health_response = test_client.get("/health")
+        embeddings_response = test_client.post(
+            "/v1/embeddings", json={"input": "hello", "model": _SECOND_EMBEDDING_ID}
+        )
+
+    assert _SECOND_EMBEDDING_ID not in [card["id"] for card in models_response.json()["data"]]
+    assert _SECOND_EMBEDDING_ID not in [model["id"] for model in health_response.json()["models"]]
+    assert embeddings_response.status_code == 404
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "eeane.server" and record.levelname == "INFO"
+    ]
+    assert any(_SECOND_EMBEDDING_ID in message and "disabled" in message for message in messages)

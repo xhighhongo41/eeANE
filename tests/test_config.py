@@ -187,6 +187,9 @@ def test_minimal_toml_fills_in_defaults(tmp_path: Path) -> None:
     assert embedding.normalize is True
     assert embedding.output_name == "embedding"
     assert embedding.buckets == (256,)
+    assert embedding.load_policy is None
+    assert embedding.keep_alive is None
+    assert loaded.config.disabled_models == ()
     assert loaded.config.reranker_model is None
     assert loaded.api_key_source is None
 
@@ -1255,3 +1258,293 @@ tokenizer = "models/emb/tokenizer.json"
 
     with pytest.raises(ConfigError, match="kind"):
         load_config(explicit_path=config_path, env={})
+
+
+# --- load policy / keep_alive: defaults, field constraints, resolved accessors --
+
+
+def test_server_config_load_policy_defaults() -> None:
+    """ServerConfig's load-policy fields must default to on_demand/300/unlimited."""
+    server = ServerConfig()
+
+    assert server.default_load_policy == "on_demand"
+    assert server.keep_alive == 300
+    assert server.max_loaded_models is None
+
+
+def test_model_entry_load_policy_defaults() -> None:
+    """A ModelEntry's load_policy/keep_alive must default to None (inherit from server)."""
+    entry = _explicit_entry("m", "embedding")
+
+    assert entry.load_policy is None
+    assert entry.keep_alive is None
+
+
+def test_server_default_load_policy_cannot_be_disabled(tmp_path: Path) -> None:
+    """server.default_load_policy is restricted to resident/on_demand, not disabled."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", '[server]\ndefault_load_policy = "disabled"\n\n[[models]]', 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="default_load_policy"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_negative_server_keep_alive_raises_config_error(tmp_path: Path) -> None:
+    """A negative server.keep_alive must be rejected (0 is the smallest valid value)."""
+    content = _MINIMAL_TOML.replace("[[models]]", "[server]\nkeep_alive = -1\n\n[[models]]", 1)
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="keep_alive"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_zero_max_loaded_models_raises_config_error(tmp_path: Path) -> None:
+    """max_loaded_models=0 must be rejected (None means unlimited, not zero)."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\nmax_loaded_models = 0\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="max_loaded_models"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_negative_model_keep_alive_raises_config_error(tmp_path: Path) -> None:
+    """A negative per-model keep_alive must be rejected."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+keep_alive = -1
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="keep_alive"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_resolved_accessors_inherit_server_defaults_when_unset() -> None:
+    """resolved_load_policy/resolved_keep_alive must fall back to the server defaults."""
+    server = ServerConfig(default_load_policy="resident", keep_alive=120)
+    entry = _explicit_entry("m", "embedding")
+    config = EeaneConfig(server=server, models=[entry])
+
+    assert config.resolved_load_policy(entry) == "resident"
+    assert config.resolved_keep_alive(entry) == 120
+
+
+def test_resolved_accessors_use_the_per_model_override_when_set() -> None:
+    """resolved_load_policy/resolved_keep_alive must prefer a per-model override."""
+    server = ServerConfig(default_load_policy="resident", keep_alive=120)
+    entry = ModelEntry(
+        id="m",
+        kind="embedding",
+        tokenizer=Path("m/tokenizer.json"),
+        artifacts={128: Path("m/s128.mlmodelc")},
+        load_policy="on_demand",
+        keep_alive=45,
+    )
+    config = EeaneConfig(server=server, models=[entry])
+
+    assert config.resolved_load_policy(entry) == "on_demand"
+    assert config.resolved_keep_alive(entry) == 45
+
+
+# --- disabled model entries -------------------------------------------------
+
+
+def test_disabled_entry_is_removed_from_models_and_recorded(tmp_path: Path) -> None:
+    """A load_policy='disabled' entry must leave models and land in disabled_models."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[[models]]
+id = "rr"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+load_policy = "disabled"
+
+[models.artifacts]
+512 = "compiled/rr/s512.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert [entry.id for entry in loaded.config.models] == ["emb"]
+    assert loaded.config.disabled_models == ("rr",)
+    assert loaded.config.reranker_model is None
+
+
+def test_disabled_entry_does_not_affect_default_model_selection(tmp_path: Path) -> None:
+    """A disabled entry listed before an active one must not become the default."""
+    toml_content = """
+[[models]]
+id = "emb-disabled"
+kind = "embedding"
+tokenizer = "models/emb-disabled/tokenizer.json"
+load_policy = "disabled"
+
+[models.artifacts]
+128 = "compiled/emb-disabled/s128.mlmodelc"
+
+[[models]]
+id = "emb-active"
+kind = "embedding"
+tokenizer = "models/emb-active/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb-active/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.embedding_model.id == "emb-active"
+    assert loaded.config.disabled_models == ("emb-disabled",)
+
+
+def test_id_only_disabled_entry_does_not_require_a_compiled_model_cache(tmp_path: Path) -> None:
+    """A disabled id-only entry must be skipped before cache auto-resolution runs."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[[models]]
+id = "never-compiled"
+load_policy = "disabled"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    # No compiled-model cache exists anywhere for "never-compiled"; loading
+    # must still succeed because the entry is filtered out before the cache
+    # is ever consulted.
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.disabled_models == ("never-compiled",)
+    assert [entry.id for entry in loaded.config.models] == ["emb"]
+
+
+def test_all_embeddings_disabled_raises_config_error(tmp_path: Path) -> None:
+    """If every embedding entry is disabled, the embedding>=1 rule must still apply."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+load_policy = "disabled"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="embedding"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_disabled_and_active_entry_sharing_an_id_raises_config_error(tmp_path: Path) -> None:
+    """A disabled entry's id must still be checked for uniqueness against active entries."""
+    toml_content = """
+[[models]]
+id = "same-id"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[[models]]
+id = "same-id"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+load_policy = "disabled"
+
+[models.artifacts]
+512 = "compiled/rr/s512.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="duplicate"):
+        load_config(explicit_path=config_path, env={})
+
+
+# --- max_loaded_models vs resident-policy entries ---------------------------
+
+
+def test_resident_count_exceeding_max_loaded_models_raises_config_error(tmp_path: Path) -> None:
+    """More resident-policy entries than max_loaded_models must be rejected at load time."""
+    toml_content = """
+[server]
+max_loaded_models = 1
+
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+load_policy = "resident"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[[models]]
+id = "rr"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+load_policy = "resident"
+
+[models.artifacts]
+512 = "compiled/rr/s512.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="max_loaded_models"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_resident_count_equal_to_max_loaded_models_is_accepted(tmp_path: Path) -> None:
+    """A resident count exactly at the limit must be accepted (the boundary is inclusive)."""
+    toml_content = """
+[server]
+max_loaded_models = 2
+
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+load_policy = "resident"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[[models]]
+id = "rr"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+load_policy = "resident"
+
+[models.artifacts]
+512 = "compiled/rr/s512.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert [entry.id for entry in loaded.config.models] == ["emb", "rr"]

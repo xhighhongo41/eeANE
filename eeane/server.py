@@ -179,15 +179,32 @@ def _log_served_models(config: EeaneConfig) -> None:
 
     Args:
         config: Resolved configuration. Every entry is reported at INFO
-            with its kind and buckets; an entry whose compiled-model cache
-            recommends against some of its buckets also gets a WARNING, so
-            an operator sees why a bucket is not in service.
+            with its kind, buckets and effective load policy: a resident
+            entry's model is loaded right away, while an on-demand
+            entry's line also states its idle-unload delay, since that
+            model is only loaded once a request first needs it. An entry
+            whose compiled-model cache recommends against some of its
+            buckets also gets a WARNING, so an operator sees why a bucket
+            is not in service. Ids configured with ``load_policy =
+            "disabled"`` and a configured ``max_loaded_models`` cap are
+            each reported in one extra INFO line, if set.
     """
     for entry in config.models:
         details = f"buckets={list(entry.buckets)}"
         if entry.kind == "embedding":
             details += f", normalize={entry.normalize}"
-        logger.info("serving %s model '%s' (%s)", entry.kind, entry.id, details)
+        if config.resolved_load_policy(entry) == "resident":
+            details += ", policy=resident"
+            logger.info("serving %s model '%s' (%s)", entry.kind, entry.id, details)
+        else:
+            keep_alive = config.resolved_keep_alive(entry)
+            details += f", policy=on_demand, keep_alive={keep_alive}s"
+            logger.info(
+                "serving %s model '%s' on demand, loaded on first request (%s)",
+                entry.kind,
+                entry.id,
+                details,
+            )
         if entry.excluded_buckets:
             logger.warning(
                 "model '%s': the compiled-model cache recommends against buckets %s, "
@@ -196,6 +213,15 @@ def _log_served_models(config: EeaneConfig) -> None:
                 entry.id,
                 list(entry.excluded_buckets),
             )
+
+    if config.disabled_models:
+        logger.info("configured but disabled: %s", ", ".join(config.disabled_models))
+
+    if config.server.max_loaded_models is not None:
+        logger.info(
+            "at most %d model(s) kept in memory at once (max_loaded_models)",
+            config.server.max_loaded_models,
+        )
 
 
 def _format_buckets(buckets: Sequence[int]) -> str:
@@ -333,7 +359,14 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        """Load the engine once at startup and keep it for the process' life."""
+        """Build the engine at startup and stop its background work at shutdown.
+
+        The engine itself decides what "stop" means: :class:`CoreMLEngine`
+        stops its idle-unload sweeper thread but leaves whatever is loaded
+        in memory, since the process is about to exit anyway. An injected
+        engine that defines no ``close`` (as test stubs typically do) is
+        left untouched.
+        """
         _log_startup_security(config)
         if engine is None:
             started = time.perf_counter()
@@ -348,6 +381,9 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         app.state.started_at = int(time.time())
         app.state.health_limiter = HealthRateLimiter(config.server.health_rate_limit)
         yield
+        close = getattr(active_engine, "close", None)
+        if callable(close):
+            close()
 
     app = FastAPI(title="eeANE", version=__version__, lifespan=lifespan)
 
@@ -380,6 +416,7 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
                     id=entry.id,
                     kind=str(entry.kind),
                     buckets=list(engine_impl.buckets(entry.id)),
+                    loaded=engine_impl.loaded(entry.id),
                 )
                 for entry in config.models
             ],

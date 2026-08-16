@@ -175,8 +175,8 @@ def test_health_response_construction() -> None:
         status="ok",
         version="0.5.0.dev0",
         models=[
-            HealthModel(id="emb", kind="embedding", buckets=[128, 512, 1024]),
-            HealthModel(id="rr", kind="reranker", buckets=[512]),
+            HealthModel(id="emb", kind="embedding", buckets=[128, 512, 1024], loaded=True),
+            HealthModel(id="rr", kind="reranker", buckets=[512], loaded=False),
         ],
     )
 
