@@ -8,7 +8,7 @@ Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **Status: early development (v0.7).**
+> **Status: early development (v0.8).**
 > v0.1–v0.3 proved the concept:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (a Japanese ModernBERT embedding model) and
@@ -51,6 +51,22 @@ and most of your unified memory free for other work.
 > field, `eeane compile` records a per-machine calibration in the
 > artifact cache, and a `[[models]]` config entry can be just an
 > `id = "..."` line — everything else is resolved from that cache.
+> **v0.8 adds on-demand loading and idle unload**: `on_demand` is now
+> the default `load_policy` for a `[[models]]` entry (`[server]
+> default_load_policy` can change the default), so the server starts
+> without loading any model and loads one the moment a request first
+> needs it -- well under a second once its artifacts have loaded before
+> (0.3-0.8 s measured on a development Mac), except for the very first
+> load of a freshly compiled artifact, which can take tens of seconds
+> while macOS builds its Neural Engine cache for it (later loads, even
+> after a restart, are fast again). An on-demand model idle past its
+> `keep_alive` (`[server] keep_alive`, default 300 s, per-model
+> override) is unloaded automatically and reloaded on demand;
+> `load_policy = "resident"` keeps a model always loaded as before v0.8,
+> and `load_policy = "disabled"` removes an entry from service while
+> leaving it in the config. `[server] max_loaded_models` caps how many
+> models stay in memory at once, evicting the longest-idle on-demand
+> model first. `GET /health` now reports each model's `loaded` state.
 > Packaged one-command installs arrive in later milestones.
 
 ## Requirements
@@ -141,6 +157,37 @@ name one. Reranker entries may be omitted entirely for an
 embedding-only server (`/rerank` then answers 503).
 `uv run python -m eeane.server` remains as an alias for `eeane serve`.
 
+### Model loading
+
+Since v0.8 the default `load_policy` for a `[[models]]` entry is
+`"on_demand"` (`[server] default_load_policy` can change the default;
+see `eeane.example.toml` for the setting): the server does not load
+any model at start-up, and loads one the moment a request first needs
+it. Once a model's artifacts have loaded once, a load is well under a
+second (0.3-0.8 s measured on a development Mac); the exception is the
+very first load of an artifact right after `eeane compile` produced
+it, which can take tens of seconds while macOS builds its Neural
+Engine cache for it — a one-time cost that later loads, even after a
+server restart, do not pay again. That wait is included in the
+response time of whichever request triggers it.
+
+An on-demand model that has answered no request for `keep_alive`
+seconds (`[server] keep_alive`, default 300, overridable per model;
+`0` unloads it as soon as it goes idle) is unloaded automatically and
+reloaded on the next request that needs it. Set `load_policy =
+"resident"` on an entry to load it at start-up and keep it in memory
+for the server's whole run, matching the pre-v0.8 default. Set
+`load_policy = "disabled"` to keep an entry in the config file without
+serving it: it is absent from `GET /models` and `GET /health`, and a
+request naming its id gets a 404.
+
+`[server] max_loaded_models` caps how many models may be in memory at
+once (unset means no limit). When loading a model would exceed it,
+the longest-idle `on_demand` model is unloaded to make room;
+`resident` models and models currently handling a request are never
+evicted this way, so a configuration whose `resident` entries alone
+exceed the cap is rejected at start-up.
+
 ### Serving beyond localhost
 
 Binding to a non-loopback address (`--host` or `server.host`) exposes
@@ -157,8 +204,7 @@ LAN/VPN, put the server behind a reverse proxy or firewall.
 ### Endpoints
 
 - `GET /health` — status and one entry per served model (`id`, `kind`,
-  buckets in service; the per-model list format is new in v0.7),
-  unauthenticated, rate-limited
+  buckets in service, `loaded`), unauthenticated, rate-limited
 - `GET /models` (alias: `GET /v1/models`) — OpenAI-compatible listing
   of every served model
 - `POST /v1/embeddings` (alias: `POST /embeddings`) — OpenAI-compatible

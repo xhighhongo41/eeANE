@@ -18,6 +18,16 @@ log_level = "info"          # debug | info | warning | error
 # health_rate_limit = 60    # /health requests per minute per client IP. 0 disables.
 # cache_root = "~/.cache/eeane"  # Compiled-model cache used to resolve minimal
                                  # [[models]] entries. Matches `eeane compile --out-dir`.
+# default_load_policy = "on_demand"  # resident | on_demand, applied to any [[models]]
+                                      # entry that omits load_policy. Default: on_demand
+                                      # (no model loads at start-up; each one loads on its
+                                      # first request and unloads again once idle).
+# keep_alive = 300           # Seconds an idle on_demand model stays loaded before it is
+                              # unloaded automatically; 0 unloads it as soon as it is idle.
+                              # Applied to [[models]] entries that omit their own keep_alive.
+# max_loaded_models = 2      # Cap on models held in memory at once. Unset: no limit.
+                              # Loading a model beyond the cap unloads the longest-idle
+                              # on_demand model first; resident models are never evicted.
 
 # Any number of [[models]] entries may be listed; at least one embedding
 # model is required, rerankers are optional (without one, /rerank answers
@@ -32,6 +42,10 @@ log_level = "info"          # debug | info | warning | error
 [[models]]
 id = "cl-nagoya/ruri-v3-310m"
 # normalize = true           # L2-normalize embeddings (the default). Embedding only.
+# load_policy = "resident"   # resident | on_demand | disabled, overriding
+                              # server.default_load_policy for this model only.
+                              # "disabled" keeps the entry here without serving it.
+# keep_alive = 60            # Overrides server.keep_alive for this model only.
 
 [[models]]
 id = "cl-nagoya/ruri-v3-reranker-310m"
