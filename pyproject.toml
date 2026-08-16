@@ -1,6 +1,6 @@
 [project]
 name = "eeane"
-version = "0.9.0.dev0"
+version = "0.10.0.dev0"
 description = "Embedding engine for Apple Neural Engine"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -20,6 +20,13 @@ compile = [
     "sentencepiece>=0.2",
 ]
 
+[project.scripts]
+eeane = "eeane.cli:main"
+
+[project.urls]
+Repository = "https://github.com/xhighhongo41/eeANE"
+Issues = "https://github.com/xhighhongo41/eeANE/issues"
+
 [dependency-groups]
 dev = [
     "pytest>=8",
@@ -28,8 +35,12 @@ dev = [
     "sentence-transformers>=5.0,<6",
 ]
 
-[tool.uv]
-package = false
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
 
 [tool.ruff]
 line-length = 100

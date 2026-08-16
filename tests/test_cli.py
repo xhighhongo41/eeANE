@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from eeane import cli
+from eeane import __version__, cli
 
 # --- fixtures / helpers --------------------------------------------------
 
@@ -182,6 +184,46 @@ def test_main_with_unknown_subcommand_raises_system_exit() -> None:
         cli.main(["unknown"])
 
     assert excinfo.value.code == 2
+
+
+# --- --version -----------------------------------------------------------
+
+
+def test_main_version_flag_prints_version_and_exits_0(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """--version must raise SystemExit(0) and print "eeane <version>" to stdout."""
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--version"])
+
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"eeane {__version__}\n"
+
+
+def test_python_m_eeane_version_matches_package_version() -> None:
+    """`python -m eeane --version` (subprocess) must print the same version string."""
+    result = subprocess.run(
+        [sys.executable, "-m", "eeane", "--version"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == f"eeane {__version__}\n"
+
+
+def test_python_m_eeane_help_still_lists_subcommands() -> None:
+    """`python -m eeane --help` (subprocess) must still list the serve/compile subcommands."""
+    result = subprocess.run(
+        [sys.executable, "-m", "eeane", "--help"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "serve" in result.stdout
+    assert "compile" in result.stdout
 
 
 # --- serve -------------------------------------------------------------
