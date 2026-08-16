@@ -30,6 +30,7 @@ import gc
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -85,6 +86,16 @@ _Batch = TypeVar("_Batch", EmbeddingBatch, RerankBatch)
 # Identity two requests must share to be served from one computation:
 # the model kind, the model id and the digest of the request's texts.
 _RequestKey = tuple[str, str, str]
+
+# Seconds the engine goes on holding an input array it has stopped handing
+# to Core ML before it lets go of it (see
+# :meth:`CoreMLEngine._retain_inputs`). It only has to outlast Core ML's
+# own deferred release of the feature values wrapping that array, which
+# happens seconds after the prediction, so the margin is generous on
+# purpose: what is held is one small int32 pair of arrays per compiled
+# model plus whatever this grace period's worth of replaced ones adds, a
+# few megabytes at most under any realistic load.
+_INPUT_RETENTION_SECONDS = 30.0
 
 
 def _load_compiled(path: Path) -> Any:
@@ -202,7 +213,7 @@ class CoreMLEngine:
     is honoured while the request waits, and no longer once its first
     prediction has started.
 
-    Four locks are held, and the order they may be taken in is fixed to
+    Five locks are held, and the order they may be taken in is fixed to
     keep the engine deadlock-free:
 
     * ``load_lock`` (one per model) guards that model's loads and is the
@@ -222,6 +233,10 @@ class CoreMLEngine:
       never across a load, a tokenization or a prediction, so no other
       lock can ever be taken while holding it and it needs no place in
       the order above.
+    * ``_retention_lock`` (one per engine) guards the inputs kept
+      referenced for Core ML (see :meth:`_retain_inputs`). It is a leaf
+      lock too: it is held for a handful of dict and deque operations and
+      for nothing else, so it also needs no place in the order above.
 
     Tokenizer calls take one lock per model instead, since the mutable
     state they protect belongs to a single tokenizer. That holds for the
@@ -326,6 +341,14 @@ class CoreMLEngine:
         }
         self._lock = threading.Lock()
         self._state_lock = threading.Lock()
+        # Last inputs handed to each compiled model, and the ones that are
+        # waiting out their grace period before being let go of; see
+        # :meth:`_retain_inputs`. Both are guarded by their own lock: they
+        # are touched by every predicting thread and by the sweeper, and
+        # neither the prediction lock nor the state lock is held for them.
+        self._retained_inputs: dict[int, dict[str, np.ndarray]] = {}
+        self._retired_inputs: deque[tuple[float, dict[str, np.ndarray]]] = deque()
+        self._retention_lock = threading.Lock()
         self._inflight: dict[_RequestKey, _InflightRequest] = {}
         self._inflight_lock = threading.Lock()
         self._stopping = threading.Event()
@@ -1149,7 +1172,12 @@ class CoreMLEngine:
             if served is not None:
                 return served
 
-            _reclaim_memory(self._begin_load(managed))
+            evicted = self._begin_load(managed)
+            for victim in evicted:
+                # Before the artifacts go: Core ML may still hold the
+                # inputs of their last prediction.
+                self._retire_model_inputs(victim)
+            _reclaim_memory(evicted)
             started = self._clock()
             try:
                 # Run outside the state lock: loading takes seconds, and
@@ -1341,6 +1369,10 @@ class CoreMLEngine:
                     dropped.append(served)
 
         unloaded = len(dropped)
+        for idle in dropped:
+            # Before the artifacts go: Core ML may still hold the inputs
+            # of their last prediction.
+            self._retire_model_inputs(idle)
         _reclaim_memory(dropped)
         return unloaded
 
@@ -1368,6 +1400,11 @@ class CoreMLEngine:
         # whole interval.
         while not self._stopping.wait(self._sweep_interval):
             self._sweep_idle(self._clock())
+            # Swept here too, so an engine nobody is predicting with still
+            # empties its quarantine instead of holding what it retired
+            # until the next request.
+            with self._retention_lock:
+                self._purge_retired_locked(time.monotonic())
 
     def _known_width(self, managed: _ManagedModel) -> int:
         """Return the embedding width known for ``managed``, or ``0``.
@@ -1495,5 +1532,76 @@ class CoreMLEngine:
             prediction = model.predict(inputs)
         finally:
             self._lock.release()
+            # Also after a failed prediction: Core ML may already have
+            # wrapped the inputs before whatever went wrong.
+            self._retain_inputs(model, inputs)
         key = _resolve_output_key(prediction, output_name)
         return prediction[key], key
+
+    def _retain_inputs(self, model: Any, inputs: dict[str, np.ndarray]) -> None:
+        """Keep the arrays just handed to Core ML referenced past the call.
+
+        Core ML wraps a prediction's inputs in feature values it releases
+        from an internal dispatch queue, seconds after the prediction and
+        from a thread that carries no Python thread state. On CPython
+        3.12+ a *final* release of the numpy buffers behind them from such
+        a thread reaches the object allocator through a thread state it
+        does not have, and takes the process down with it. Holding the
+        most recent inputs of every compiled model, and quarantining the
+        ones they replace for :data:`_INPUT_RETENTION_SECONDS`, leaves
+        every final release to a Python thread that holds the GIL: Core
+        ML's own release only ever drops a reference that is not the last
+        one.
+
+        Args:
+            model: Compiled model the inputs were handed to. Its identity
+                keys the retention, so every bucket -- and every batch
+                size within a bucket -- keeps its own last inputs.
+            inputs: The arrays handed to that model's ``predict``.
+        """
+        now = time.monotonic()
+        with self._retention_lock:
+            previous = self._retained_inputs.get(id(model))
+            self._retained_inputs[id(model)] = inputs
+            # Replaced rather than released: Core ML releases the feature
+            # values of the previous prediction on its own queue, and it
+            # may not have done so yet.
+            if previous is not None and previous is not inputs:
+                self._retired_inputs.append((now, previous))
+            self._purge_retired_locked(now)
+
+    def _retire_model_inputs(self, served: _ServedModel) -> None:
+        """Quarantine the inputs held for a model that is being unloaded.
+
+        Called just before the last reference to a model's artifacts is
+        dropped: Core ML's deferred release outlives the unload, so the
+        inputs of that model's last prediction have to outlive it too (see
+        :meth:`_retain_inputs`).
+
+        Args:
+            served: Artifacts about to be dropped, whose compiled models
+                stop being predicted with.
+        """
+        now = time.monotonic()
+        with self._retention_lock:
+            for model in (*served.compiled.values(), *served.compiled_batch.values()):
+                retired = self._retained_inputs.pop(id(model), None)
+                # None once the artifact has served no prediction -- and
+                # once it has already been retired, which is what an
+                # artifact serving several buckets at once looks like.
+                if retired is not None:
+                    self._retired_inputs.append((now, retired))
+
+    def _purge_retired_locked(self, now: float) -> None:
+        """Let go of every quarantined input whose grace period has passed.
+
+        Must be called with the retention lock held.
+
+        Args:
+            now: Current ``time.monotonic()`` reading.
+        """
+        while self._retired_inputs and now - self._retired_inputs[0][0] > _INPUT_RETENTION_SECONDS:
+            # Dropped here, on a thread that holds the GIL, which is the
+            # whole point of the quarantine: this is where the buffers
+            # behind these arrays are finally released.
+            self._retired_inputs.popleft()

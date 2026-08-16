@@ -29,6 +29,7 @@ from pathlib import Path
 
 import uvicorn
 
+from eeane import __version__
 from eeane.config import CliOverrides, ConfigError, LoadedConfig, load_config
 
 logger = logging.getLogger("eeane.cli")
@@ -48,6 +49,9 @@ _COMPILE_ATTN_CHOICES = ("eager", "sdpa")
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``eeane`` argument parser (``serve`` / ``check-config`` / ``compile``).
 
+    Also accepts a top-level ``--version`` flag, which prints the
+    installed package version and exits.
+
     Returns:
         A configured :class:`argparse.ArgumentParser`. Invalid arguments
         (unknown subcommand, bad ``--log-level`` choice, non-int
@@ -55,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
         exit with code 2, which is argparse's standard behaviour.
     """
     parser = argparse.ArgumentParser(prog="eeane", description="eeANE embedding/reranker server.")
+    parser.add_argument("--version", action="version", version=f"eeane {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     serve_parser = subparsers.add_parser(

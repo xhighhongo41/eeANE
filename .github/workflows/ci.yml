@@ -1,9 +1,13 @@
-# Minimal CI for eeANE (v0.5実装計画.md §4.7).
+# CI for eeANE.
 #
-# Runs lint + unit tests on a macOS runner. The stub-engine test
-# structure keeps every unit test runnable without an ANE; tests that
-# need real model artifacts skip themselves automatically. ANE
-# on-device and performance testing stays local by policy.
+# The "check" job runs lint + unit tests on a macOS runner. The
+# stub-engine test structure keeps every unit test runnable without an
+# ANE; tests that need real model artifacts skip themselves
+# automatically. ANE on-device and performance testing stays local by
+# policy.
+#
+# The "install" job builds the package and verifies it installs and
+# runs cleanly from a wheel, from pip, and from a git URL.
 name: CI
 
 on:
@@ -40,3 +44,65 @@ jobs:
 
       - name: Unit tests (pytest)
         run: uv run pytest -q
+
+  # The [compile] extra pulls in torch, which is a large download; its
+  # dependency resolution is already exercised by "uv sync --extra
+  # compile" in the check job above, so this job does not install it.
+  install:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Check wheel contents
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          import sys
+          import zipfile
+
+          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel in dist/, found {len(wheels)}: {wheels}")
+          wheel = wheels[0]
+
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+
+          def is_allowed(top: str) -> bool:
+              return top == "eeane" or (top.startswith("eeane-") and top.endswith(".dist-info"))
+
+          bad = [name for name in names if not is_allowed(name.split("/", 1)[0])]
+          if bad:
+              sys.exit("wheel contains unexpected top-level entries:\n" + "\n".join(bad))
+
+          print(f"OK: {wheel.name} contains only eeane/ and *.dist-info/ entries")
+          EOF
+
+      - name: Smoke-test the wheel in an isolated environment
+        run: uv run --isolated --no-project --python 3.12 --with dist/*.whl -- eeane --version
+
+      - name: Set up Python for pip installs
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install with pip into a fresh venv
+        run: |
+          python -m venv "$RUNNER_TEMP/eeane-pip-venv"
+          "$RUNNER_TEMP/eeane-pip-venv/bin/pip" install .
+          "$RUNNER_TEMP/eeane-pip-venv/bin/eeane" --version
+
+      - name: Install from a git URL with pip
+        run: |
+          python -m venv "$RUNNER_TEMP/eeane-git-venv"
+          "$RUNNER_TEMP/eeane-git-venv/bin/pip" install "eeane @ git+file://${GITHUB_WORKSPACE}@${GITHUB_SHA}"
+          "$RUNNER_TEMP/eeane-git-venv/bin/eeane" --version

@@ -24,7 +24,7 @@ model's width, buckets or retrieval quality.
 
 Exit codes: 0 = every check passed, 1 = at least one check failed, 2 = the
 server could not be reached at all (start it first with
-``uv run python -m eeane.server``).
+``uv run eeane serve``).
 
 Usage:
     uv run python tools/verify_server.py health
@@ -1318,7 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
             passed = cmd_all(args, opener)
     except ServerUnreachable as exc:
         print(str(exc))
-        print("Start the eeANE server first: uv run python -m eeane.server")
+        print("Start the eeANE server first: uv run eeane serve")
         return 2
 
     return 0 if passed else 1

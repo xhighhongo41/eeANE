@@ -8,7 +8,7 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 コンパイル済みモデルは数秒でロードでき、ANE上で推論するため、GPUと
 ユニファイドメモリの大部分を他の作業のために空けておけます。
 
-> **開発状況: 初期開発中 (v0.9)。**
+> **開発状況: 初期開発中 (v0.10)。**
 > v0.1〜v0.3で概念実証を完了:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (日本語ModernBERT埋め込みモデル)と
@@ -80,36 +80,94 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 > を追加コンパイル(`eeane compile <model> --buckets <S> --batch 2`)
 > すると約25%スループットが向上します(開発機実測。id-onlyエントリ
 > では自動解決され、同一リクエスト内の同バケツ入力を2件ずつまとめて
-> 推論します)。パッケージ配布は後のマイルストーンで実装
-> 予定です。
+> 推論します)。**v0.10でGitHubから直接インストールできるように
+> なりました**: `uv`・`pipx`・`pip`のいずれからもこのリポジトリから
+> 直接インストールでき(下記のインストール節を参照)、`eeane`
+> コンソールコマンドが使えるようになりました(`python -m eeane`に
+> 代わるものです)。
 
 ## 動作要件
 
 - Apple Siliconマック (M1以降)
 - macOS 13以降
+- Python 3.11または3.12(3.13以降は未対応)。`uv`は対応するPythonを
+  自動的に解決します。pipxやpip+venvでインストールする場合は、対応
+  バージョンのPythonを自分で用意する必要があります。
 - Xcodeコマンドラインツール (`xcode-select --install`) — `eeane compile`
   が`xcrun coremlcompiler`を使用します
-- [uv](https://docs.astral.sh/uv/) (開発環境用)
+- [uv](https://docs.astral.sh/uv/) — eeANEのインストールに推奨(下記
+  インストール節を参照)。開発環境の構築にも必要です
+
+## インストール
+
+eeANEは以下のいずれかの方法で、このGitHubリポジトリから直接
+インストールできます。
+
+### uv (推奨)
+
+以下の1コマンドで`[compile]`エクストラ(torch/transformers)も
+含めてインストールされるため、同じ環境でモデルのコンパイルと
+サーバー起動の両方ができます:
+
+```sh
+uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+```
+
+タグを指定する`@v0.10.0`(最新リリース)は再現性のあるインストールに、
+`@main`は最新の開発版を追いたい場合に使います。アップグレードする
+ときは、新しいタグを指定した上で`--force`を付けて同じコマンドを
+実行し、既存のインストールを入れ替えてください。
+
+### pipx
+
+```sh
+pipx install --python python3.12 "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+```
+
+pipxの既定Pythonが3.13以降だとeeANEの動作要件を満たさないため、
+`--python`にはマシン上にあるPython 3.11/3.12の実行ファイル名
+(例: `python3.11`)またはフルパスを指定してください。
+
+### pip + venv
+
+```sh
+python3.12 -m venv eeane-env
+eeane-env/bin/pip install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+```
+
+対応するPythonが`python3.11`しかない場合はそちらに読み替えてください。
+
+### 軽量インストール(サーバーのみ)
+
+`[compile]`エクストラが導入するtorchとtransformersが必要になるのは
+`eeane compile`(モデルをCore ML形式に変換するコマンド)を実行する
+ときだけで、サーバー本体はこれらを一切importしません。常設環境に
+含めておいてもディスクを数GB消費するだけでメモリ面への影響はない
+ため、上記のuvによる一括インストール(compile込み)のままで実害は
+ありません。それでも常設環境をeeANEのランタイム依存5つだけに保ち
+たい場合は、`[compile]`なしでeeANEをインストールし、`eeane compile`
+だけを使い捨ての一時環境から実行してください:
+
+```sh
+uv tool install "eeane @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+uvx --from "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0" eeane compile <model>
+```
 
 ## モデルのコンパイルとサーバー起動
 
 ```sh
-git clone https://github.com/xhighhongo41/eeANE.git
-cd eeANE
-uv sync --extra compile   # torch/transformersはコンパイル時のみ必要
-
 # Hugging FaceのモデルID(自動ダウンロード)またはHF配布形式のローカル
 # ディレクトリから直接コンパイルします。初回のみ。成果物は
 # ~/.cache/eeane/ 配下に生成され、1バケツあたり約30〜100秒です:
-uv run python -m eeane compile cl-nagoya/ruri-v3-310m
-uv run python -m eeane compile cl-nagoya/ruri-v3-reranker-310m
-uv run python -m eeane compile intfloat/multilingual-e5-base
+eeane compile cl-nagoya/ruri-v3-310m
+eeane compile cl-nagoya/ruri-v3-reranker-310m
+eeane compile intfloat/multilingual-e5-base
 
 # 各実行の最後に[[models]]のTOMLスニペットが標準出力に表示されます。
 # v0.7以降のスニペットは最小形(基本はモデルidのみ)です — 残りの情報は
 # サーバーがコンパイル済みキャッシュから自動解決します。スニペットを
 # ./eeane.toml に貼り付けて(eeane.example.toml参照)、サーバーを起動します:
-uv run python -m eeane serve
+eeane serve
 ```
 
 `eeane compile`はモデルの`config.json`からバックエンドを自動選択します。
@@ -146,12 +204,12 @@ embeddingモデルはモデルディレクトリが宣言するmean/CLSプーリ
 ファイルより優先されます。
 
 ```sh
-uv run python -m eeane serve --config /path/to/eeane.toml
-uv run python -m eeane serve --host 192.168.1.20 --port 7997
+eeane serve --config /path/to/eeane.toml
+eeane serve --host 192.168.1.20 --port 7997
 
 # 設定ファイルを検証し、解決後の有効設定を表示します (サーバーは起動
 # しません。APIキーの値は表示されません):
-uv run python -m eeane check-config --config /path/to/eeane.toml
+eeane check-config --config /path/to/eeane.toml
 ```
 
 設定ファイルにはサービングするモデルを列挙します — embedding/reranker
@@ -164,8 +222,9 @@ uv run python -m eeane check-config --config /path/to/eeane.toml
 固定できます。各kindの中では設定に最初に書いたエントリが既定モデルに
 なり、`model`未指定のリクエストを処理します。rerankerエントリは省略
 可能で、その場合はembedding専用サーバーになります(`/rerank`は503を
-返します)。`uv run python -m eeane.server`は`eeane serve`の
-エイリアスとして引き続き使えます。
+返します)。`python -m eeane.server`と`python -m eeane <サブコマンド>`は、
+それぞれ`eeane serve`と`eeane`コマンドの後方互換エイリアスとして
+引き続き使えます(開発環境では両方とも`uv run`を先頭に付けます)。
 
 ### バケツごとのバッチ2成果物 (embeddingリクエスト向け)
 
@@ -280,15 +339,6 @@ rerankingエンジンをExternalにしてURLを`http://127.0.0.1:7997/rerank`に
 reranker APIキー欄にそのキーを入力してください — Open WebUIはeeANEが
 期待する`Authorization`ヘッダとして送信します。
 
-起動中のサーバーの検証(Core ML直接推論との一致・API互換・レイテンシ)は:
-
-```sh
-uv run python tools/verify_server.py all
-# 特定のサービング中モデルをCore ML直接推論と突き合わせる場合:
-uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
-uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
-```
-
 ### 既知の制限
 
 eeANEはApple Neural Engineでの実行を前提としており、コンパイル済み
@@ -318,7 +368,37 @@ compiled model may have run on an unsupported compute path`)。この
   意味します。リクエストを処理したマシンでNeural Engineが利用可能か
   確認してください。
 
-## PoCを試す (歴史的な開発スナップショット)
+## 開発
+
+eeANE自体の開発や、以下のリポジトリ前提のツールを使う場合は、
+リポジトリをcloneし、インストール済みパッケージの代わりに`uv run`
+でチェックアウトから直接コマンドを実行します:
+
+```sh
+git clone https://github.com/xhighhongo41/eeANE.git
+cd eeANE
+uv sync --extra compile   # torch/transformersはコンパイル時のみ必要
+uv run eeane compile cl-nagoya/ruri-v3-310m
+uv run eeane serve
+```
+
+`uv run eeane <サブコマンド>`は、上記で説明した`compile`/`serve`/
+`check-config`と同じサブコマンドを、インストール済みパッケージでは
+なくチェックアウトから実行します。
+
+起動中のサーバーの検証(Core ML直接推論との一致・API互換・レイテンシ)、
+およびlint・テストの一括実行は、いずれもリポジトリのチェックアウトが
+前提です:
+
+```sh
+uv run python tools/verify_server.py all
+# 特定のサービング中モデルをCore ML直接推論と突き合わせる場合:
+uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
+uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
+./tools/check.sh   # ruff lint + フォーマットチェック + pytest を一括実行
+```
+
+### PoCを試す (歴史的な開発スナップショット)
 
 `poc/`のスクリプトはv0.1〜v0.3の研究記録として凍結されています。
 公式の変換手段は上記の`eeane compile`です。ベンチマーク用途では

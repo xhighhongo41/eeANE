@@ -30,6 +30,7 @@ _TARGET_GLOBS: tuple[str, ...] = (
     "tools/**/*.sh",
     "tests/**/*.py",
     "docs/**/*",
+    ".github/**/*.yml",
 )
 
 # Individual files (relative to the repo root) that fall outside the glob

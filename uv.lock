@@ -173,8 +173,8 @@ wheels = [
 
 [[package]]
 name = "eeane"
-version = "0.9.0.dev0"
-source = { virtual = "." }
+version = "0.10.0"
+source = { editable = "." }
 dependencies = [
     { name = "coremltools" },
     { name = "fastapi" },
