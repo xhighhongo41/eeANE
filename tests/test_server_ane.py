@@ -44,15 +44,30 @@ def client() -> Iterator[TestClient]:
 
 
 def test_health_lists_the_real_buckets(client: TestClient) -> None:
-    """/health must expose every configured model with the buckets it loaded."""
+    """/health must expose every configured model with the buckets it serves.
+
+    Must run before any test that embeds/reranks: the default configuration
+    leaves both models on the "on_demand" policy, so neither is loaded yet
+    at this point.
+    """
     response = client.get("/health")
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["models"] == [
-        {"id": _EMBEDDING.id, "kind": "embedding", "buckets": list(_EMBEDDING.buckets)},
-        {"id": _RERANKER.id, "kind": "reranker", "buckets": list(_RERANKER.buckets)},
+        {
+            "id": _EMBEDDING.id,
+            "kind": "embedding",
+            "buckets": list(_EMBEDDING.buckets),
+            "loaded": False,
+        },
+        {
+            "id": _RERANKER.id,
+            "kind": "reranker",
+            "buckets": list(_RERANKER.buckets),
+            "loaded": False,
+        },
     ]
 
 

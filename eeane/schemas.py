@@ -214,11 +214,16 @@ class HealthModel(BaseModel):
         id: Model id requests route by (``[[models]] id``).
         kind: Either ``"embedding"`` or ``"reranker"``.
         buckets: Ascending sequence-length buckets the model serves.
+        loaded: Whether the model's artifacts are in memory right now.
+            Always ``True`` for a resident model; an on-demand model
+            reports ``False`` until a request first loads it (or after an
+            idle unload), and back to ``True`` while it is in memory.
     """
 
     id: str
     kind: str
     buckets: list[int]
+    loaded: bool
 
 
 class HealthResponse(BaseModel):
