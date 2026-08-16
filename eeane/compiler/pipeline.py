@@ -9,7 +9,11 @@ described by a metadata JSON file. Once every bucket is done, the
 per-bucket self-checks are aggregated into the model-level
 ``model_info.json`` (``recommended_buckets``, ``calibration``,
 ``embedding_dim``), which is what :mod:`eeane.config` reads back to
-auto-resolve a ``[[models]]`` entry that only names an ``id``.
+auto-resolve a ``[[models]]`` entry that only names an ``id``. That
+record always describes the batch-1 artifacts, which is what serving is
+built on, and names the batched ones separately when the cache holds
+any -- so runs of either batch size complete one record between them
+rather than overwriting each other's half of it.
 
 Everything is written under the cache root (``--out-dir``, default
 ``~/.cache/eeane``); the input model directory is strictly read-only.
@@ -76,6 +80,22 @@ from eeane.compiler.tokenizer_freeze import (
 # Reasons recorded when no self-check result is produced.
 SELFCHECK_REASON_OPTION = "--skip-selfcheck was given"
 SELFCHECK_REASON_UNAVAILABLE = "no self-check implementation was provided"
+
+# Batch size a server predicts one input at a time with. It is what
+# ``model_info.json`` records as the model's artifacts -- and what its
+# calibration is aggregated over -- whatever batch size a run compiled,
+# since that is the family serving is built on.
+SERVING_BATCH_SIZE = 1
+
+# Batch size whose artifacts are recorded alongside them, for the buckets
+# one was compiled for, so a server can predict several inputs of one
+# request together where that is configured.
+BATCHED_BATCH_SIZE = 2
+
+# Key the batched artifacts are recorded under, as a table keyed by batch
+# size (a string, JSON object keys being strings) so a record can describe
+# more than one of them later on.
+BATCH_ARTIFACTS_RECORD_KEY = "batch_artifacts"
 
 # Building block of the long tokenizer-verification input. The gate inputs
 # must be self-contained (a user's machine has no repository test data),
@@ -310,23 +330,42 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     cache_artifacts = dict(existing)
     cache_artifacts.update({plan.seq_len: plan.mlmodelc_path for plan in plans})
 
+    # model_info.json describes every batch size the cache holds, whatever
+    # this run compiled, so runs of different batch sizes complete the
+    # same record instead of overwriting each other's half of it.
+    families = _artifact_families(context, batch_size, cache_artifacts)
+    served_artifacts = families[SERVING_BATCH_SIZE]
+    batched_artifacts = families[BATCHED_BATCH_SIZE]
+    if not served_artifacts:
+        _progress(
+            f"      WARNING: no batch-{SERVING_BATCH_SIZE} artifact was found for this model, "
+            "so the recorded artifact table is empty and the model cannot be served; "
+            f"serving requires batch-{SERVING_BATCH_SIZE} artifacts -- compile them first "
+            f"with '--batch {SERVING_BATCH_SIZE}'"
+        )
+
     # Aggregated across the whole cache, not just this invocation: adding
     # one bucket must re-derive recommended_buckets/embedding_dim from
-    # every same-family bucket, not overwrite them with this run's alone.
+    # every served bucket, not overwrite them with this run's alone. This
+    # run's own reports only describe the family it compiled, so a run of
+    # another batch size contributes none of them.
     calibration, recommended_buckets, embedding_dim = aggregate_calibration(
-        context.kind, cache_artifacts, run_reports
+        context.kind,
+        served_artifacts,
+        run_reports if batch_size == SERVING_BATCH_SIZE else {},
     )
 
     write_json_record(
         context.model_root / MODEL_INFO_FILENAME,
         _build_model_info(
             context,
-            cache_artifacts,
+            served_artifacts,
             freeze_info,
             freeze_report,
             calibration,
             recommended_buckets,
             embedding_dim,
+            batched_artifacts,
         ),
     )
 
@@ -337,10 +376,11 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
         model_id=context.model_id,
         kind=context.kind,
         tokenizer_path=context.tokenizer_path,
-        artifacts=cache_artifacts,
+        artifacts=served_artifacts,
+        batch_artifacts=batched_artifacts,
         cache_root_hint=cache_root_hint,
     )
-    _progress(_calibration_summary(cache_artifacts, recommended_buckets, calibration))
+    _progress(_calibration_summary(served_artifacts, recommended_buckets, calibration))
     _progress("[6/6] Done.")
     if args.emit_config is not None:
         write_config_snippet(args.emit_config, snippet)
@@ -348,6 +388,41 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     _progress("      add the following to your eeane.toml:")
     print(snippet, end="")
     return 0
+
+
+def _artifact_families(
+    context: _CompileContext, batch_size: int, cache_artifacts: Mapping[int, Path]
+) -> dict[int, dict[int, Path]]:
+    """Collect the artifacts of every batch size the record describes.
+
+    This run's own family is known already (it holds what was just
+    compiled, plus what earlier runs left); the other one is read back
+    from the cache directory, so a record written by a run of either
+    batch size describes both instead of overwriting the other's half.
+
+    Args:
+        context: Per-invocation state.
+        batch_size: Batch size this invocation compiled for.
+        cache_artifacts: This run's family: every one of its buckets now
+            present in the cache.
+
+    Returns:
+        Bucket -> ``.mlmodelc`` path for :data:`SERVING_BATCH_SIZE` and
+        :data:`BATCHED_BATCH_SIZE` (empty for a batch size the cache holds
+        nothing for), plus this run's own family when it compiled neither.
+    """
+    families = {batch_size: dict(cache_artifacts)}
+    for recorded in (SERVING_BATCH_SIZE, BATCHED_BATCH_SIZE):
+        if recorded in families:
+            continue
+        families[recorded] = discover_variants(
+            context.model_root,
+            batch_size=recorded,
+            attn=context.args.attn,
+            target=context.args.target,
+            precision=context.args.precision,
+        )
+    return families
 
 
 def _calibration_summary(
@@ -787,14 +862,16 @@ def _build_model_info(
     calibration: Mapping[str, Any],
     recommended_buckets: Sequence[int],
     embedding_dim: int | None,
+    batch_artifacts: Mapping[int, Path] | None = None,
 ) -> dict[str, Any]:
     """Assemble the model-level ``model_info.json`` record.
 
     Args:
         context: Per-invocation state.
-        artifacts: Bucket -> ``.mlmodelc`` path of every same-family
-            variant now present in the cache (this run's plus the ones
-            kept from earlier runs).
+        artifacts: Bucket -> ``.mlmodelc`` path of every
+            :data:`SERVING_BATCH_SIZE` variant now present in the cache
+            (this run's, when it compiled that family, plus the ones kept
+            from earlier runs). This is the table serving is built on.
         freeze_info: Result of ``freeze_tokenizer``.
         freeze_report: Result of ``verify_frozen_tokenizer``.
         calibration: Result of :func:`eeane.compiler.artifacts.
@@ -804,12 +881,19 @@ def _build_model_info(
             buckets ``eeane.config`` should load by default.
         embedding_dim: That call's third element: the shared embedding
             width, or ``None`` for a reranker or an unmeasured cache.
+        batch_artifacts: Bucket -> ``.mlmodelc`` path of every
+            :data:`BATCHED_BATCH_SIZE` variant in the cache. Recorded
+            under :data:`BATCH_ARTIFACTS_RECORD_KEY` when there is any,
+            and left out of the record entirely otherwise, so a cache
+            without them reads exactly as it did before.
 
     Returns:
         A JSON-serializable summary; the input ``eeane.config``'s cache
-        auto-resolution reads, hence the ``format_version``.
+        auto-resolution reads, hence the ``format_version``. The batched
+        table is an addition a reader that does not know it simply
+        ignores, so it needs no new ``format_version``.
     """
-    return {
+    record: dict[str, Any] = {
         "format_version": MODEL_INFO_FORMAT_VERSION,
         "id": context.model_id,
         "kind": context.kind,
@@ -833,6 +917,13 @@ def _build_model_info(
         "calibration": dict(calibration),
         "eeane_version": __version__,
     }
+    if batch_artifacts:
+        record[BATCH_ARTIFACTS_RECORD_KEY] = {
+            str(BATCHED_BATCH_SIZE): {
+                str(seq_len): path.name for seq_len, path in sorted(batch_artifacts.items())
+            }
+        }
+    return record
 
 
 def _recorded_args(

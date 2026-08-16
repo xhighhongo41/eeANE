@@ -52,6 +52,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # so it is rejected instead of guessed at.
 MAX_MODEL_INFO_FORMAT_VERSION = 2
 
+# Optional table of batched artifacts in a cache record, keyed by batch
+# size (as a string, since JSON object keys are strings) so one record
+# can describe several of them, and the one batch size a served entry can
+# use. A record that carries none simply serves one input per prediction.
+BATCH_ARTIFACTS_RECORD_KEY = "batch_artifacts"
+BATCH_ARTIFACT_BATCH_SIZE = 2
+
 
 class ConfigError(Exception):
     """Raised when a config file or the resolved configuration is invalid.
@@ -212,10 +219,11 @@ class ModelEntry(BaseModel):
             where one is available; ``None`` when none is configured.
             Coerced from string TOML keys the same way as ``artifacts``.
             Only valid for ``kind="embedding"`` entries; every key must
-            already be one of ``artifacts``' buckets; and setting this
-            field requires ``artifacts`` itself to be stated explicitly
-            (it cannot be combined with an id-only entry resolved from
-            the compiled-model cache).
+            already be one of ``artifacts``' buckets; and stating this
+            field in the config file requires ``artifacts`` itself to be
+            stated explicitly. An id-only entry cannot pin one, but it is
+            filled in from the compiled-model cache when the record names
+            batched artifacts for the buckets it loads.
         normalize: Whether to L2-normalize embedding output. Only valid
             for ``kind="embedding"``; explicitly setting this on a
             ``kind="reranker"`` entry is a configuration error.
@@ -916,6 +924,12 @@ def _fill_entry_from_cache(entry: dict[str, Any], model_id: str, cache_root: Pat
             without also stating ``artifacts`` explicitly. Messages are
             written without the config-file context, which the caller
             adds.
+
+    Note:
+        An entry whose artifacts come from the cache also gains the
+        batched artifacts the record names for the buckets it loads, so a
+        model compiled for both is served with both without the config
+        file having to spell anything out.
     """
     model_dir = model_cache_dir(cache_root, model_id)
     try:
@@ -971,6 +985,12 @@ def _fill_entry_from_cache(entry: dict[str, Any], model_id: str, cache_root: Pat
         artifacts, excluded = _cached_artifacts(info, model_dir)
         entry["artifacts"] = artifacts
         entry["excluded_buckets"] = excluded
+        # Batched artifacts are served for embedding models only, and only
+        # for the buckets that are actually loaded, so a bucket the record
+        # recommends against is dropped here rather than rejected later.
+        batched = _cached_batch_artifacts(info, model_dir, artifacts) if kind == "embedding" else {}
+        if batched:
+            entry["batch_artifacts"] = batched
 
     if entry.get("output_name") is None:
         output_name = info.get("output_name")
@@ -1049,6 +1069,65 @@ def _cached_artifacts(
             f"compiled (available: {sorted(artifacts)})"
         )
     return selected, sorted(set(artifacts) - set(selected))
+
+
+def _cached_batch_artifacts(
+    info: Mapping[str, Any], model_dir: Path, artifacts: Mapping[int, Path]
+) -> dict[int, Path]:
+    """Pick the batched artifacts to load from a cache record.
+
+    Args:
+        info: Parsed ``model_info.json`` contents.
+        model_dir: Directory the record lives in; artifact file names are
+            recorded relative to it.
+        artifacts: Artifacts the entry is served with, i.e. the buckets a
+            batched artifact can be paired with.
+
+    Returns:
+        Bucket -> batched artifact path for every recorded bucket that is
+        among ``artifacts``' own. Empty when the record carries no batched
+        table at all, and when none of its buckets is loaded: a batched
+        artifact only ever accelerates a bucket that is served anyway.
+
+    Raises:
+        ConfigError: If the recorded table is not a table of bucket
+            lengths, or names a file outside the record's own directory.
+    """
+    record = f"'{model_dir / MODEL_INFO_FILENAME}'"
+    recorded = info.get(BATCH_ARTIFACTS_RECORD_KEY)
+    if recorded is None:
+        return {}
+    if not isinstance(recorded, dict):
+        raise ConfigError(f"{record} has an unusable '{BATCH_ARTIFACTS_RECORD_KEY}' table")
+
+    family = recorded.get(str(BATCH_ARTIFACT_BATCH_SIZE))
+    if family is None:
+        # The record describes other batch sizes only (or none): nothing
+        # this release can serve, which is not an error.
+        return {}
+    if not isinstance(family, dict):
+        raise ConfigError(
+            f"{record} has an unusable '{BATCH_ARTIFACTS_RECORD_KEY}' entry for batch size "
+            f"{BATCH_ARTIFACT_BATCH_SIZE}"
+        )
+
+    batched: dict[int, Path] = {}
+    for raw_key, raw_name in family.items():
+        try:
+            bucket = int(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"{record} has {BATCH_ARTIFACTS_RECORD_KEY} key '{raw_key}', which is not a "
+                "bucket length"
+            ) from exc
+        if bucket not in artifacts:
+            # A bucket that is not loaded (e.g. one the record recommends
+            # against) has nothing to accelerate.
+            continue
+        batched[bucket] = _cache_relative_path(
+            model_dir, raw_name, field=BATCH_ARTIFACTS_RECORD_KEY
+        )
+    return batched
 
 
 def _cache_relative_path(model_dir: Path, value: Any, *, field: str) -> Path:

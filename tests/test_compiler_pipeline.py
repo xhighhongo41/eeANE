@@ -248,6 +248,27 @@ def _commented_buckets(snippet: str) -> list[str]:
     ]
 
 
+def _commented_table(snippet: str, header: str) -> dict[str, Any]:
+    """TOML-parse the entries of one commented-out table of a snippet.
+
+    The explicit form is written as comments, so a table is a
+    ``# [<header>]`` line followed by its own ``# <key> = <value>`` lines,
+    up to the next table header. This is how a test tells the entries of
+    one table from another's when both are keyed by bucket.
+    """
+    entries: dict[str, Any] = {}
+    collecting = False
+    for line in snippet.splitlines():
+        if line.startswith("# ["):
+            collecting = line == f"# [{header}]"
+            continue
+        if not collecting or not line.startswith("# ") or " = " not in line:
+            continue
+        key, _, value = line[2:].partition(" = ")
+        entries[key] = tomllib.loads(f"value = {value}")["value"]
+    return entries
+
+
 def test_config_snippet_minimal_form_only_sets_id_and_normalize(tmp_path: Path) -> None:
     """The active (uncommented) part of an embedding snippet must be id + normalize."""
     snippet = artifacts.build_config_snippet(
@@ -311,6 +332,75 @@ def test_config_snippet_omits_normalize_for_a_reranker(tmp_path: Path) -> None:
     entry = _parse_snippet(snippet)
     assert entry == {"id": "ruri-v3-reranker-310m"}
     assert _commented_value(snippet, "kind") == "reranker"
+
+
+def test_config_snippet_comments_the_batched_artifacts_of_an_embedding_model(
+    tmp_path: Path,
+) -> None:
+    """Batched artifacts must be offered as their own commented table, absolutely."""
+    snippet = artifacts.build_config_snippet(
+        model_id="emb",
+        kind="embedding",
+        tokenizer_path=tmp_path / "tokenizer.json",
+        artifacts={128: tmp_path / "s128.mlmodelc", 512: tmp_path / "s512.mlmodelc"},
+        batch_artifacts={128: tmp_path / "s128_b2.mlmodelc"},
+    )
+
+    # The active entry stays minimal: the cache resolves the rest.
+    assert _parse_snippet(snippet) == {"id": "emb", "normalize": True}
+    assert sorted(_commented_table(snippet, "models.artifacts")) == ["128", "512"]
+    assert _commented_table(snippet, "models.batch_artifacts") == {
+        "128": str((tmp_path / "s128_b2.mlmodelc").resolve())
+    }
+
+
+def test_config_snippet_batched_artifacts_are_accepted_by_the_config_schema(
+    tmp_path: Path,
+) -> None:
+    """Uncommenting both tables must build a valid ModelEntry, not a rejected one."""
+    snippet = artifacts.build_config_snippet(
+        model_id="emb",
+        kind="embedding",
+        tokenizer_path=tmp_path / "tokenizer.json",
+        artifacts={128: tmp_path / "s128.mlmodelc", 512: tmp_path / "s512.mlmodelc"},
+        batch_artifacts={128: tmp_path / "s128_b2.mlmodelc"},
+    )
+
+    entry = ModelEntry(
+        **_parse_snippet(snippet),
+        kind=_commented_value(snippet, "kind"),
+        tokenizer=_commented_value(snippet, "tokenizer"),
+        artifacts=_commented_table(snippet, "models.artifacts"),
+        batch_artifacts=_commented_table(snippet, "models.batch_artifacts"),
+    )
+
+    assert entry.buckets == (128, 512)
+    assert entry.batch_artifacts == {128: (tmp_path / "s128_b2.mlmodelc").resolve()}
+
+
+def test_config_snippet_omits_the_batched_artifacts_for_a_reranker(tmp_path: Path) -> None:
+    """A reranker is served one input at a time, so its snippet must offer no such table."""
+    snippet = artifacts.build_config_snippet(
+        model_id="rr",
+        kind="reranker",
+        tokenizer_path=tmp_path / "tokenizer.json",
+        artifacts={512: tmp_path / "s512.mlmodelc"},
+        batch_artifacts={512: tmp_path / "s512_b2.mlmodelc"},
+    )
+
+    assert "batch_artifacts" not in snippet
+
+
+def test_config_snippet_without_batched_artifacts_offers_no_such_table(tmp_path: Path) -> None:
+    """A model compiled for one batch size only must produce the snippet it always did."""
+    snippet = artifacts.build_config_snippet(
+        model_id="emb",
+        kind="embedding",
+        tokenizer_path=tmp_path / "tokenizer.json",
+        artifacts={128: tmp_path / "s128.mlmodelc"},
+    )
+
+    assert "batch_artifacts" not in snippet
 
 
 def test_config_snippet_absolutizes_relative_paths() -> None:
@@ -1451,3 +1541,255 @@ def test_e2e_incremental_bucket_keeps_earlier_buckets(
     # Neither self-check ran (no --skip-selfcheck override here, but no
     # selfcheck_fn either): both buckets stay recommended (unmeasured).
     assert model_info["recommended_buckets"] == [E2E_SEQ_LEN, second_bucket]
+
+
+# --- batch families in the record and the snippet ----------------------------
+
+# Bucket the stub-driven runs of this section compile, small enough to
+# keep the (stubbed) artifacts trivial.
+_FAMILY_SEQ_LEN = 16
+
+
+class _FamilyBackend(_StubBackend):
+    """Stub backend answering every question a whole ``run()`` asks.
+
+    Extends the conversion-level stub with the resolution-level answers
+    (output name, sequence-length limit, sanity fixtures), so a complete
+    pipeline run needs neither torch weights nor ``xcrun``.
+    """
+
+    supported_kinds: tuple[str, ...] = ("embedding", "reranker")
+
+    def __init__(self) -> None:
+        """Register a backend that applies no patch at all."""
+        super().__init__({})
+
+    def output_name(self, kind: str) -> str:
+        """Return the graph output name of ``kind``."""
+        return "logits" if kind == "reranker" else "embedding"
+
+    def max_seq_len(self, model_dir: Path) -> int | None:
+        """Report no known limit, so every requested bucket is compiled."""
+        return None
+
+    def sanity_spec(self, kind: str) -> Any:
+        """Return the fixtures the tokenizer verification is built from."""
+        inputs: list[Any] = [("q", "d")] if kind == "reranker" else ["hello"]
+        return SimpleNamespace(inputs=inputs)
+
+    def trace_example(self, kind: str) -> Any:
+        """Return the fixed trace example of ``kind``."""
+        return ("q", "d") if kind == "reranker" else "example"
+
+
+def _install_family_stubs(monkeypatch: pytest.MonkeyPatch, kind: str = "embedding") -> None:
+    """Stub dispatch, tokenizer freezing and conversion for a whole run.
+
+    Args:
+        monkeypatch: Fixture the stubs are installed with.
+        kind: Model kind the stub dispatch reports.
+    """
+
+    class _StubDispatch:
+        """Dispatch result pointing at the family backend stub."""
+
+        architecture = "StubModel"
+        backend_name = "Stub"
+
+        def __init__(self, dispatched_kind: str) -> None:
+            self.kind = dispatched_kind
+
+        def load_backend(self) -> Any:
+            """Return the stub backend instance."""
+            return _FamilyBackend()
+
+    def _fake_freeze(model_dir: Path, tokenizer_path: Path) -> dict[str, Any]:
+        tokenizer_path.write_text("{}", encoding="utf-8")
+        return {
+            "tokenizer_class": "StubTokenizer",
+            "pad_id": 0,
+            "pad_token": "<pad>",
+            "padding_direction": "right",
+        }
+
+    def _fake_verify(
+        model_dir: Path,
+        tokenizer_path: Path,
+        texts: list[str],
+        pairs: list[tuple[str, str]],
+        buckets: list[int],
+    ) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "buckets": list(buckets),
+            "n_texts": len(texts),
+            "n_pairs": len(pairs),
+            "n_comparisons": len(texts) * len(buckets),
+        }
+
+    monkeypatch.setattr(pipeline, "resolve_dispatch", lambda model_dir, asked: _StubDispatch(kind))
+    monkeypatch.setattr(pipeline, "freeze_tokenizer", _fake_freeze)
+    monkeypatch.setattr(pipeline, "verify_frozen_tokenizer", _fake_verify)
+    _install_stub_conversion(monkeypatch)
+
+
+def _stub_source(tmp_path: Path) -> Path:
+    """Create the minimal model directory a run resolves its source to."""
+    source = tmp_path / "stub-model"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "config.json").write_text(
+        json.dumps({"architectures": ["StubModel"]}), encoding="utf-8"
+    )
+    return source
+
+
+def _run_stub_compile(
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+    out_dir: Path,
+    *,
+    batch: int = 1,
+    buckets: int = _FAMILY_SEQ_LEN,
+    kind: str = "embedding",
+) -> int:
+    """Run the whole pipeline against the stubs and return its exit code."""
+    _install_family_stubs(monkeypatch, kind=kind)
+    return pipeline.run(
+        _compile_args(
+            str(source),
+            "--buckets",
+            str(buckets),
+            "--batch",
+            str(batch),
+            "--out-dir",
+            str(out_dir),
+        )
+    )
+
+
+def _stub_model_info(out_dir: Path, source: Path) -> dict[str, Any]:
+    """Read back the record a stub-driven run wrote."""
+    path = out_dir / "compiled" / source.name / artifacts.MODEL_INFO_FILENAME
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_batch_1_run_records_no_batched_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache holding one batch size only must read exactly as it always did."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    info = _stub_model_info(out_dir, source)
+    assert info["artifacts"] == {
+        str(_FAMILY_SEQ_LEN): f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlmodelc"
+    }
+    assert "batch_artifacts" not in info
+    assert info["format_version"] == artifacts.MODEL_INFO_FORMAT_VERSION
+
+
+def test_a_batched_run_keeps_the_served_artifacts_and_records_the_batched_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batched run must add to the record, never overwrite the served table.
+
+    Regression test: the record used to describe whichever family the run
+    compiled, so a batched run replaced the artifacts an id-only entry is
+    served with -- which would feed single inputs to a batched artifact.
+    """
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=1) == 0
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=2) == 0
+
+    info = _stub_model_info(out_dir, source)
+    bucket = str(_FAMILY_SEQ_LEN)
+    assert info["artifacts"] == {bucket: f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlmodelc"}
+    assert info["batch_artifacts"] == {
+        "2": {bucket: f"s{_FAMILY_SEQ_LEN}_b2_eager_macos13.mlmodelc"}
+    }
+    assert info["buckets"] == [_FAMILY_SEQ_LEN]
+    # The calibration still describes the served family only.
+    assert info["recommended_buckets"] == [_FAMILY_SEQ_LEN]
+    assert sorted(info["calibration"]["buckets"]) == [bucket]
+
+
+def test_a_serving_run_after_a_batched_one_records_both_families(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whichever order the two runs happen in, the record must describe both."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=2) == 0
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=1) == 0
+
+    info = _stub_model_info(out_dir, source)
+    bucket = str(_FAMILY_SEQ_LEN)
+    assert info["artifacts"] == {bucket: f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlmodelc"}
+    assert info["batch_artifacts"] == {
+        "2": {bucket: f"s{_FAMILY_SEQ_LEN}_b2_eager_macos13.mlmodelc"}
+    }
+
+
+def test_a_batched_run_without_served_artifacts_warns_about_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Compiling only the batched family leaves nothing to serve, and must say so."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=2) == 0
+
+    stderr = capsys.readouterr().err
+    assert "WARNING" in stderr
+    assert "batch-1" in stderr
+    info = _stub_model_info(out_dir, source)
+    # The record is still written, so the batched artifacts are not lost.
+    assert info["artifacts"] == {}
+    assert info["recommended_buckets"] == []
+    assert info["batch_artifacts"] == {
+        "2": {str(_FAMILY_SEQ_LEN): f"s{_FAMILY_SEQ_LEN}_b2_eager_macos13.mlmodelc"}
+    }
+
+
+def test_the_snippet_of_a_model_with_batched_artifacts_names_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """An embedding snippet must offer the batched table once the cache holds one."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=1) == 0
+    capsys.readouterr()
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=2) == 0
+
+    snippet = capsys.readouterr().out
+    model_root = out_dir / "compiled" / source.name
+    assert _commented_table(snippet, "models.artifacts") == {
+        str(_FAMILY_SEQ_LEN): str(model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlmodelc")
+    }
+    assert _commented_table(snippet, "models.batch_artifacts") == {
+        str(_FAMILY_SEQ_LEN): str(model_root / f"s{_FAMILY_SEQ_LEN}_b2_eager_macos13.mlmodelc")
+    }
+
+
+def test_a_reranker_snippet_never_names_batched_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A reranker is served one pair at a time, whatever its cache happens to hold."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=1, kind="reranker") == 0
+    capsys.readouterr()
+    assert _run_stub_compile(monkeypatch, source, out_dir, batch=2, kind="reranker") == 0
+
+    captured = capsys.readouterr()
+    assert "batch_artifacts" not in captured.out
+    # The record still describes the cache truthfully; only the served
+    # configuration leaves the batched family out.
+    assert "batch_artifacts" in _stub_model_info(out_dir, source)

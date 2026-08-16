@@ -20,11 +20,17 @@ from typing import Any, Protocol
 import numpy as np
 
 from eeane import runtime
-from eeane.config import ModelEntry
+from eeane.config import BATCH_ARTIFACT_BATCH_SIZE, ModelEntry
 
 # Conversion command quoted in the "missing artifact" errors, so the
 # operator can regenerate what is missing without reading the docs.
 _COMPILE_COMMAND = "eeane compile <model> --buckets {buckets}"
+
+# Same command for a batched artifact, which is produced by a run of its
+# own rather than by the batch-1 one. The batch size it is quoted with is
+# the one a served entry's batched artifacts are compiled for, i.e. the
+# number of inputs of one request they predict at a time.
+_COMPILE_BATCH_COMMAND = _COMPILE_COMMAND + " --batch {batch}"
 
 # Output tensor name assumed for a model whose entry does not state one.
 _DEFAULT_OUTPUT_NAMES = {"embedding": "embedding", "reranker": "logits"}
@@ -219,6 +225,11 @@ class _ServedModel:
         compiled: Loaded ``CompiledMLModel`` per sequence-length bucket.
         buckets: Ascending sequence-length buckets, i.e. the keys of
             :attr:`compiled`.
+        compiled_batch: Loaded batched ``CompiledMLModel`` per bucket, for
+            the buckets one is configured for; empty when none is, which
+            is what an entry without batched artifacts is served with.
+            Inputs of one request that share such a bucket are predicted
+            together instead of one at a time.
         output_name: Output tensor name requested at conversion time.
         normalize: The entry's ``normalize`` flag, recorded so callers can
             inspect the served model. The engine always returns raw
@@ -239,6 +250,7 @@ class _ServedModel:
     output_name: str
     normalize: bool
     embedding_dim: int | None
+    compiled_batch: dict[int, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -395,6 +407,38 @@ def _as_row(output: Any, name: str) -> np.ndarray:
     return row
 
 
+def _as_rows(output: Any, name: str, rows: int) -> np.ndarray:
+    """Shape a Core ML output into one float32 row per predicted input.
+
+    Args:
+        output: Tensor returned by ``predict`` (shape ``(rows, D)``, or
+            ``(rows, 1)`` for a single-value head).
+        name: Output key, used in the error messages only.
+        rows: Number of inputs the prediction carried, at least one.
+
+    Returns:
+        A ``(rows, D)`` float32 array, one row per input, in the order the
+        inputs were fed to the model.
+
+    Raises:
+        ValueError: If ``rows`` is not at least one.
+        RuntimeError: If the output holds no values, or holds a count of
+            values that is not a whole number of equally wide rows -- a
+            model whose output does not match the inputs it was given.
+    """
+    if rows < 1:
+        raise ValueError(f"a prediction carries at least one input, got {rows}")
+    values = np.asarray(output, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        raise RuntimeError(f"Core ML output {name!r} is empty")
+    if values.size % rows:
+        raise RuntimeError(
+            f"Core ML output {name!r} holds {values.size} values, which is not "
+            f"{rows} rows of equal width"
+        )
+    return values.reshape(rows, -1)
+
+
 def _require_complete(entry: ModelEntry) -> None:
     """Reject a model entry the engine cannot serve.
 
@@ -430,7 +474,9 @@ def _collect_missing(entry: ModelEntry) -> list[str]:
     Returns:
         One human-readable line per missing path, each naming the model it
         belongs to so a multi-model report stays readable. Empty when
-        every path exists.
+        every path exists. The batched artifacts of an entry that
+        configures any are checked too, since a deployment that asks for
+        them must fail at start-up rather than on a first request.
     """
     tokenizer_path = entry.tokenizer
     compiled = entry.artifacts or {}
@@ -448,6 +494,17 @@ def _collect_missing(entry: ModelEntry) -> list[str]:
     for seq_len, path in sorted(compiled.items()):
         if not path.exists():
             command = _COMPILE_COMMAND.format(buckets=seq_len)
+            problems.append(
+                f"model '{entry.id}': missing Core ML artifact {path}; generate it with: {command}"
+            )
+    # Batched artifacts are only ever served for an embedding model, so an
+    # entry of another kind is not held to them whatever it states.
+    batched = (entry.batch_artifacts or {}) if entry.kind == "embedding" else {}
+    for seq_len, path in sorted(batched.items()):
+        if not path.exists():
+            command = _COMPILE_BATCH_COMMAND.format(
+                buckets=seq_len, batch=BATCH_ARTIFACT_BATCH_SIZE
+            )
             problems.append(
                 f"model '{entry.id}': missing Core ML artifact {path}; generate it with: {command}"
             )

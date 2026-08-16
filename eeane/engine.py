@@ -43,7 +43,12 @@ from eeane.config import EeaneConfig, ModelEntry
 from eeane.engine_pipeline import (
     _TOKENIZE_THREAD_PREFIX,
     _TOKENIZE_WORKERS,
+    _InputGroup,
+    _InputRoute,
+    _plan_groups,
+    _Prepared,
     _TokenizeAhead,
+    _TokenizedGroup,
     _TokenizedInput,
 )
 from eeane.engine_types import _COMPILE_COMMAND as _COMPILE_COMMAND
@@ -57,6 +62,7 @@ from eeane.engine_types import (
     QueueTimeoutError,
     RerankBatch,
     _as_row,
+    _as_rows,
     _collect_missing,
     _InflightRequest,
     _ManagedModel,
@@ -98,6 +104,8 @@ def _load_entry(entry: ModelEntry) -> _ServedModel:
 
     Args:
         entry: Complete model entry whose artifacts are known to exist.
+            Its batched artifacts, if it configures any, are loaded
+            alongside the ordinary ones.
 
     Returns:
         The resident model serving that entry.
@@ -108,6 +116,9 @@ def _load_entry(entry: ModelEntry) -> _ServedModel:
     """
     kind = str(entry.kind)
     compiled = dict(entry.artifacts or {})
+    # Batched artifacts serve embedding requests only; a model of another
+    # kind is loaded batch-1 whatever the entry states.
+    batched = dict(entry.batch_artifacts or {}) if kind == "embedding" else {}
     tokenizer_path = entry.tokenizer
     if tokenizer_path is None:
         # Unreachable: every entry is checked before any of them is loaded.
@@ -118,6 +129,7 @@ def _load_entry(entry: ModelEntry) -> _ServedModel:
         tokenizer=runtime.load_frozen_tokenizer(tokenizer_path),
         tokenizer_lock=threading.Lock(),
         compiled={seq_len: _load_compiled(path) for seq_len, path in sorted(compiled.items())},
+        compiled_batch={seq_len: _load_compiled(path) for seq_len, path in sorted(batched.items())},
         buckets=tuple(sorted(compiled)),
         # output_name is derived during config validation; the fallback
         # only guards against a hand-built entry.
@@ -178,10 +190,13 @@ class CoreMLEngine:
     entry's artifacts are checked in ``__init__`` whatever its policy, so
     a broken deployment fails at start-up rather than on a first request.
 
-    Requests are served one input at a time, with the next input of a
-    request tokenized on a worker thread while the current one is being
-    predicted, so all but its first tokenization happen while the compute
-    unit is busy. Identical requests -- same kind, same model, same texts
+    Requests are served one input at a time -- or, for an embedding model
+    served with batched artifacts, with the inputs of one request that
+    share such a bucket predicted together -- and the next unit of a
+    request is tokenized on a worker thread while the current one is
+    being predicted, so all but its first tokenization happen while the
+    compute unit is busy. A request never waits for another one to fill a
+    group. Identical requests -- same kind, same model, same texts
     in the same order -- that overlap in time are served from a single
     computation when coalescing is on. A request may carry a deadline: it
     is honoured while the request waits, and no longer once its first
@@ -493,8 +508,46 @@ class CoreMLEngine:
     ) -> EmbeddingBatch:
         """Embed one non-empty request's texts against ``managed``.
 
+        The model decides how: one served with batched artifacts predicts
+        the request's inputs in groups where it can, one served without
+        them predicts each input on its own.
+
         Args:
             managed: Model the request routed to.
+            texts: Input texts in request order, at least one.
+            deadline: Clock reading the wait for the first prediction is
+                bounded by, or ``None``.
+
+        Returns:
+            The request's embeddings and token accounting, in request
+            order either way.
+
+        Raises:
+            QueueTimeoutError: If ``deadline`` passes before the first
+                prediction starts.
+            NonFiniteOutputError: If a prediction is not finite.
+        """
+        served = self._acquire(managed)
+        try:
+            if served.compiled_batch:
+                batch = self._embed_grouped(served, texts, deadline)
+            else:
+                batch = self._embed_one_by_one(served, texts, deadline)
+        finally:
+            self._release(managed)
+
+        # Remember the width the model really produces, so a later empty
+        # request can keep the (0, D) shape.
+        self._record_width(managed, int(batch.vectors.shape[1]))
+        return batch
+
+    def _embed_one_by_one(
+        self, served: _ServedModel, texts: list[str], deadline: float | None
+    ) -> EmbeddingBatch:
+        """Embed one request's texts one input per prediction.
+
+        Args:
+            served: Loaded model serving the request.
             texts: Input texts in request order, at least one.
             deadline: Clock reading the wait for the first prediction is
                 bounded by, or ``None``.
@@ -512,46 +565,110 @@ class CoreMLEngine:
         orig_tokens: list[int] = []
         buckets: list[int] = []
         truncated_indices: list[int] = []
-        served = self._acquire(managed)
-        try:
-            # Inside the acquired model and left before it is released, so
-            # no worker can be tokenizing against a model this request has
-            # already let go of -- however the request ends.
-            with self._tokenize_ahead(
-                lambda index: self._tokenize_text(served, texts[index]), len(texts)
-            ) as ahead:
-                for index in range(len(texts)):
-                    current = ahead.take()
-                    output = self._predict(
-                        served.compiled[current.bucket],
-                        current.inputs,
-                        served.output_name,
-                        lock_timeout=self._lock_timeout(deadline, index),
-                    )
-                    # Checked outside the prediction lock: an unusable answer
-                    # must not hold up the requests queueing behind it.
-                    _require_finite(output, served.id, current.bucket)
-                    rows.append(output)
-                    # attention_mask counts the tokens the model really
-                    # consumed, i.e. n_tokens capped at the bucket size.
-                    used_tokens.append(int(current.inputs["attention_mask"].sum()))
-                    orig_tokens.append(current.n_tokens)
-                    buckets.append(current.bucket)
-                    if current.truncated:
-                        truncated_indices.append(index)
-        finally:
-            self._release(managed)
+        # Inside the acquired model and left before it is released, so no
+        # worker can be tokenizing against a model this request has
+        # already let go of -- however the request ends.
+        with self._tokenize_ahead(
+            lambda index: self._tokenize_text(served, texts[index]), len(texts)
+        ) as ahead:
+            for index in range(len(texts)):
+                current = ahead.take()
+                output = self._predict(
+                    served.compiled[current.bucket],
+                    current.inputs,
+                    served.output_name,
+                    lock_timeout=self._lock_timeout(deadline, index),
+                )
+                # Checked outside the prediction lock: an unusable answer
+                # must not hold up the requests queueing behind it.
+                _require_finite(output, served.id, current.bucket)
+                rows.append(output)
+                # attention_mask counts the tokens the model really
+                # consumed, i.e. n_tokens capped at the bucket size.
+                used_tokens.append(int(current.inputs["attention_mask"].sum()))
+                orig_tokens.append(current.n_tokens)
+                buckets.append(current.bucket)
+                if current.truncated:
+                    truncated_indices.append(index)
 
-        vectors = np.stack(rows)
-        # Remember the width the model really produces, so a later empty
-        # request can keep the (0, D) shape.
-        self._record_width(managed, int(vectors.shape[1]))
         return EmbeddingBatch(
-            vectors=vectors,
+            vectors=np.stack(rows),
             used_tokens=used_tokens,
             orig_tokens=orig_tokens,
             buckets=buckets,
             truncated_indices=truncated_indices,
+        )
+
+    def _embed_grouped(
+        self, served: _ServedModel, texts: list[str], deadline: float | None
+    ) -> EmbeddingBatch:
+        """Embed one request's texts, predicting grouped inputs together.
+
+        Every input is routed first, in one pass over the request, so the
+        inputs that share a bucket a batched artifact is loaded for can be
+        grouped; the groups are then tokenized one prediction ahead and
+        predicted in turn, exactly as single inputs are. Results are
+        placed back at the position of the input that produced them, so
+        grouping never reorders a request's answer.
+
+        Args:
+            served: Loaded model serving the request, with at least one
+                batched artifact.
+            texts: Input texts in request order, at least one.
+            deadline: Clock reading the wait for the first prediction is
+                bounded by, or ``None``.
+
+        Returns:
+            The request's embeddings and token accounting, in request
+            order.
+
+        Raises:
+            QueueTimeoutError: If ``deadline`` passes before the first
+                prediction starts.
+            NonFiniteOutputError: If a prediction is not finite.
+        """
+        routes = self._route_texts(served, texts)
+        groups = _plan_groups(routes, served.compiled_batch)
+        rows: dict[int, np.ndarray] = {}
+        used_tokens = [0] * len(texts)
+        with self._tokenize_ahead(
+            lambda position: self._tokenize_group(served, texts, groups[position]), len(groups)
+        ) as ahead:
+            for position in range(len(groups)):
+                current = ahead.take()
+                group = current.group
+                # A group of one is the ordinary artifact's job: the
+                # batched one could not take a single row.
+                model = (
+                    served.compiled_batch[group.bucket]
+                    if len(group.indices) > 1
+                    else served.compiled[group.bucket]
+                )
+                output = self._predict_rows(
+                    model,
+                    current.inputs,
+                    served.output_name,
+                    len(group.indices),
+                    lock_timeout=self._lock_timeout(deadline, position),
+                )
+                # Checked outside the prediction lock, as in the
+                # one-at-a-time path, and over every row of the group.
+                _require_finite(output, served.id, group.bucket)
+                mask = current.inputs["attention_mask"]
+                for row, index in enumerate(group.indices):
+                    rows[index] = output[row]
+                    # Counted per row: the inputs of one group are padded
+                    # to the same length but carry their own token counts.
+                    used_tokens[index] = int(mask[row].sum())
+
+        # Every index belongs to exactly one group, so the request order is
+        # restored simply by reading the rows back in index order.
+        return EmbeddingBatch(
+            vectors=np.stack([rows[index] for index in range(len(texts))]),
+            used_tokens=used_tokens,
+            orig_tokens=[route.n_tokens for route in routes],
+            buckets=[route.bucket for route in routes],
+            truncated_indices=[index for index, route in enumerate(routes) if route.truncated],
         )
 
     def rerank(
@@ -674,22 +791,23 @@ class CoreMLEngine:
         )
 
     def _tokenize_ahead(
-        self, tokenize: Callable[[int], _TokenizedInput], count: int
-    ) -> _TokenizeAhead:
-        """Build the read-ahead one request takes its tokenized inputs from.
+        self, tokenize: Callable[[int], _Prepared], count: int
+    ) -> _TokenizeAhead[_Prepared]:
+        """Build the read-ahead one request takes its tokenized units from.
 
         Args:
-            tokenize: Tokenizes the request's input at the index it is
-                given.
-            count: Number of inputs the request carries, at least one.
+            tokenize: Tokenizes the request's unit -- one input, or one
+                group of them -- at the index it is given.
+            count: Number of units the request is predicted in, at least
+                one.
 
         Returns:
-            A read-ahead over those inputs, to be used as a context
+            A read-ahead over those units, to be used as a context
             manager so a pending tokenization is always finished or given
             up before the request releases its model.
         """
-        # A single-input request has nothing to read ahead of: it is
-        # served inline, which spares it a hand-off it could not profit
+        # A request predicted in one go has nothing to read ahead of: it
+        # is served inline, which spares it a hand-off it could not profit
         # from and keeps the common one-text request thread-free.
         executor = self._tokenize_pool if count > 1 else None
         return _TokenizeAhead(tokenize, count, executor)
@@ -712,6 +830,52 @@ class CoreMLEngine:
             bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
             inputs = runtime.tokenize_texts(served.tokenizer, [text], bucket)
         return _TokenizedInput(inputs=inputs, bucket=bucket, n_tokens=n_tokens, truncated=truncated)
+
+    def _route_texts(self, served: _ServedModel, texts: Sequence[str]) -> list[_InputRoute]:
+        """Count and route every input of one request, before predicting any.
+
+        Grouping needs to know which bucket each input goes to before the
+        first prediction, so this pass is what the one-at-a-time path does
+        per input, done for the whole request in one hold of the
+        tokenizer lock.
+
+        Args:
+            served: Loaded model serving the request.
+            texts: Input texts in request order.
+
+        Returns:
+            One routing decision per input, in request order.
+        """
+        routes: list[_InputRoute] = []
+        with served.tokenizer_lock:
+            for text in texts:
+                n_tokens = runtime.count_text_tokens(served.tokenizer, text)
+                bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
+                routes.append(_InputRoute(bucket=bucket, n_tokens=n_tokens, truncated=truncated))
+        return routes
+
+    def _tokenize_group(
+        self, served: _ServedModel, texts: Sequence[str], group: _InputGroup
+    ) -> _TokenizedGroup:
+        """Tokenize one group's inputs into a single set of model inputs.
+
+        Runs on a read-ahead worker or on the request's own thread, under
+        the model's tokenizer lock either way. The routing is already
+        decided (see :meth:`_route_texts`), so this only encodes.
+
+        Args:
+            served: Loaded model serving the request.
+            texts: Every input text of the request, in request order.
+            group: Inputs to tokenize together and the bucket they share.
+
+        Returns:
+            The group's model inputs, one row per index of the group.
+        """
+        with served.tokenizer_lock:
+            inputs = runtime.tokenize_texts(
+                served.tokenizer, [texts[index] for index in group.indices], group.bucket
+            )
+        return _TokenizedGroup(group=group, inputs=inputs)
 
     def _tokenize_pair(self, served: _ServedModel, query: str, document: str) -> _TokenizedInput:
         """Route and tokenize one rerank pair under its tokenizer lock.
@@ -1257,6 +1421,67 @@ class CoreMLEngine:
             QueueTimeoutError: If the prediction lock could not be taken
                 within ``lock_timeout``.
         """
+        output, key = self._predict_output(model, inputs, output_name, lock_timeout=lock_timeout)
+        return _as_row(output, key)
+
+    def _predict_rows(
+        self,
+        model: Any,
+        inputs: dict[str, np.ndarray],
+        output_name: str,
+        rows: int,
+        *,
+        lock_timeout: float | None = None,
+    ) -> np.ndarray:
+        """Run one prediction over ``rows`` inputs under the process-wide lock.
+
+        Args:
+            model: Loaded ``CompiledMLModel`` for the selected bucket,
+                compiled for exactly ``rows`` inputs.
+            inputs: ``input_ids``/``attention_mask`` arrays of shape
+                ``(rows, S)``, dtype int32.
+            output_name: Output name requested at conversion time.
+            rows: Number of inputs the arrays carry, at least one.
+            lock_timeout: Bounded wait for the prediction lock; see
+                :meth:`_predict`.
+
+        Returns:
+            The prediction as a ``(rows, D)`` float32 array, one row per
+            input, in the order the inputs were given.
+
+        Raises:
+            QueueTimeoutError: If the prediction lock could not be taken
+                within ``lock_timeout``.
+            RuntimeError: If the model answered with a number of values
+                that is not one row per input.
+        """
+        output, key = self._predict_output(model, inputs, output_name, lock_timeout=lock_timeout)
+        return _as_rows(output, key, rows)
+
+    def _predict_output(
+        self,
+        model: Any,
+        inputs: dict[str, np.ndarray],
+        output_name: str,
+        *,
+        lock_timeout: float | None,
+    ) -> tuple[Any, str]:
+        """Take the prediction lock, predict once and pick the output tensor.
+
+        Args:
+            model: Loaded ``CompiledMLModel`` for the selected bucket.
+            inputs: Model inputs, already shaped for that artifact.
+            output_name: Output name requested at conversion time.
+            lock_timeout: Bounded wait for the prediction lock; see
+                :meth:`_predict`.
+
+        Returns:
+            Tuple of the raw output tensor and the key it was read from.
+
+        Raises:
+            QueueTimeoutError: If the prediction lock could not be taken
+                within ``lock_timeout``.
+        """
         if lock_timeout is None:
             self._lock.acquire()
         elif lock_timeout <= 0 or not self._lock.acquire(timeout=lock_timeout):
@@ -1271,4 +1496,4 @@ class CoreMLEngine:
         finally:
             self._lock.release()
         key = _resolve_output_key(prediction, output_name)
-        return _as_row(prediction[key], key)
+        return prediction[key], key

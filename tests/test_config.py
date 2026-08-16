@@ -1826,3 +1826,133 @@ def test_batch_artifacts_key_for_an_excluded_bucket_raises_config_error() -> Non
             excluded_buckets=(128, 1024),
             batch_artifacts={128: Path("s128_b2.mlmodelc")},
         )
+
+
+# --- batch_artifacts: resolution from the compiled-model cache -----------
+
+
+def _batched_record(*buckets: int, batch: str = "2") -> dict[str, Any]:
+    """Build the ``batch_artifacts`` block a cache record carries.
+
+    Args:
+        buckets: Buckets a batched artifact was compiled for.
+        batch: Batch size the block is keyed by, as a record spells it.
+
+    Returns:
+        The record key's value, ready to be merged into a cache entry.
+    """
+    return {
+        batch: {str(bucket): f"s{bucket}_b{batch}_eager_macos13.mlmodelc" for bucket in buckets}
+    }
+
+
+def test_id_only_entry_gains_the_batch_artifacts_of_its_cache_record(tmp_path: Path) -> None:
+    """A cached model compiled for two batch sizes must be served with both."""
+    model_dir = _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128, 512),
+        overrides={"batch_artifacts": _batched_record(128)},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.batch_artifacts == {128: model_dir / "s128_b2_eager_macos13.mlmodelc"}
+    assert entry.batch_artifacts[128].is_absolute()
+    # The served artifacts are untouched by the batched ones.
+    assert entry.buckets == (128, 512)
+
+
+def test_cached_batch_artifacts_are_limited_to_the_loaded_buckets(tmp_path: Path) -> None:
+    """A batched artifact of a bucket that is not loaded has nothing to accelerate."""
+    model_dir = _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128, 512),
+        recommended_buckets=(512,),
+        overrides={"batch_artifacts": _batched_record(128, 512)},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.buckets == (512,)
+    assert entry.excluded_buckets == (128,)
+    assert entry.batch_artifacts == {512: model_dir / "s512_b2_eager_macos13.mlmodelc"}
+
+
+def test_a_cache_record_without_batch_artifacts_leaves_the_entry_without_any(
+    tmp_path: Path,
+) -> None:
+    """A model compiled for one batch size only must be served exactly as before."""
+    _write_cached_model(tmp_path / "cache", "org/emb", buckets=(128,))
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.embedding_model.batch_artifacts is None
+
+
+def test_batch_artifacts_of_an_unknown_batch_size_are_ignored(tmp_path: Path) -> None:
+    """A record describing only batch sizes this release cannot serve is not an error."""
+    _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128,),
+        overrides={"batch_artifacts": _batched_record(128, batch="4")},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.embedding_model.batch_artifacts is None
+
+
+def test_batch_artifacts_of_a_cached_reranker_are_ignored(tmp_path: Path) -> None:
+    """A reranker is served one pair at a time, whatever its record happens to name."""
+    _write_cached_model(tmp_path / "cache", "org/emb", buckets=(128,))
+    _write_cached_model(
+        tmp_path / "cache",
+        "rr",
+        kind="reranker",
+        buckets=(512,),
+        overrides={"batch_artifacts": _batched_record(512)},
+    )
+    config_path = _write_toml(
+        tmp_path / "eeane.toml", _CACHE_ROOT_TOML + '\n[[models]]\nid = "rr"\n'
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    reranker = loaded.config.reranker_model
+    assert reranker is not None
+    assert reranker.batch_artifacts is None
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        "s128_b2.mlmodelc",
+        {"2": "s128_b2.mlmodelc"},
+        {"2": {"tiny": "s128_b2.mlmodelc"}},
+        {"2": {"128": "../outside.mlmodelc"}},
+        {"2": {"128": "/absolute/s128_b2.mlmodelc"}},
+    ],
+)
+def test_an_unusable_batch_artifacts_record_raises_config_error(
+    tmp_path: Path, recorded: Any
+) -> None:
+    """A corrupt batched table must be reported, not silently half-applied."""
+    _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128,),
+        overrides={"batch_artifacts": recorded},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="batch_artifacts"):
+        load_config(explicit_path=config_path, env={})
