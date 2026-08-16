@@ -26,321 +26,34 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import coremltools as ct
 import numpy as np
 
 from eeane import runtime
 from eeane.config import EeaneConfig, ModelEntry
+from eeane.engine_types import _COMPILE_COMMAND as _COMPILE_COMMAND
+from eeane.engine_types import (
+    _DEFAULT_OUTPUT_NAMES,
+    _LOADED,
+    _LOADING,
+    _UNLOADED,
+    EmbeddingBatch,
+    ModelPolicy,
+    RerankBatch,
+    _as_row,
+    _collect_missing,
+    _ManagedModel,
+    _require_complete,
+    _resolve_output_key,
+    _ServedModel,
+)
+from eeane.engine_types import _LOAD_POLICIES as _LOAD_POLICIES
+from eeane.engine_types import InferenceEngine as InferenceEngine
 
 logger = logging.getLogger("eeane.engine")
-
-# Conversion command quoted in the "missing artifact" errors, so the
-# operator can regenerate what is missing without reading the docs.
-_COMPILE_COMMAND = "eeane compile <model> --buckets {buckets}"
-
-# Output tensor name assumed for a model whose entry does not state one.
-_DEFAULT_OUTPUT_NAMES = {"embedding": "embedding", "reranker": "logits"}
-
-# Load policies the engine can act on. ``"disabled"`` is a configuration
-# level decision: such an entry never reaches the engine.
-_LOAD_POLICIES = ("resident", "on_demand")
-
-# States one served model moves through. Only a "loaded" model can answer
-# a request, and only a "loaded" one can be unloaded.
-_UNLOADED = "unloaded"
-_LOADING = "loading"
-_LOADED = "loaded"
-
-
-@dataclass
-class EmbeddingBatch:
-    """Result of embedding one request's worth of texts.
-
-    Attributes:
-        vectors: Raw (un-normalized) embeddings of shape ``(N, D)``,
-            dtype float32, in request order.
-        used_tokens: Per-input token count actually fed to the model
-            (sum of ``attention_mask``, i.e. after truncation).
-        orig_tokens: Per-input token count before truncation.
-        buckets: Per-input sequence-length bucket used for inference.
-        truncated_indices: Indices of the inputs that did not fit into the
-            largest bucket and were truncated.
-    """
-
-    vectors: np.ndarray
-    used_tokens: list[int]
-    orig_tokens: list[int]
-    buckets: list[int]
-    truncated_indices: list[int]
-
-
-@dataclass
-class RerankBatch:
-    """Result of scoring one request's worth of (query, document) pairs.
-
-    Attributes:
-        logits: Raw cross-encoder logits of shape ``(N,)``, dtype float32,
-            in request order (sigmoid mapping is the caller's choice).
-        used_tokens: Per-pair token count actually fed to the model.
-        orig_tokens: Per-pair token count before truncation.
-        truncated_indices: Indices of the pairs that were truncated.
-    """
-
-    logits: np.ndarray
-    used_tokens: list[int]
-    orig_tokens: list[int]
-    truncated_indices: list[int]
-
-
-@dataclass(frozen=True)
-class ModelPolicy:
-    """How one served model is loaded and how long it stays in memory.
-
-    Attributes:
-        load_policy: ``"resident"`` (loaded at start-up, never unloaded)
-            or ``"on_demand"`` (loaded on first use, unloaded once idle).
-        keep_alive: Seconds an idle ``"on_demand"`` model stays in memory
-            before it is unloaded. ``0`` unloads it as soon as it is
-            found idle. Ignored for a resident model.
-    """
-
-    load_policy: str = "resident"
-    keep_alive: int = 300
-
-    def __post_init__(self) -> None:
-        """Reject a policy the engine could not act on.
-
-        Raises:
-            ValueError: If ``load_policy`` is not one of the supported
-                values, or ``keep_alive`` is negative.
-        """
-        if self.load_policy not in _LOAD_POLICIES:
-            raise ValueError(
-                f"unsupported load policy {self.load_policy!r}, expected one of "
-                + ", ".join(repr(name) for name in _LOAD_POLICIES)
-            )
-        if self.keep_alive < 0:
-            raise ValueError(f"keep_alive must not be negative, got {self.keep_alive}")
-
-
-class InferenceEngine(Protocol):
-    """Interface the HTTP layer depends on.
-
-    Implementations serve zero or more models per kind and route by model
-    id. The HTTP layer resolves the client-supplied id against the
-    configuration before calling in, so these methods only have to defend
-    themselves against an id that does not exist.
-    """
-
-    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
-        """Embed ``texts`` in request order with the given embedding model."""
-        ...
-
-    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
-        """Score every ``(query, document)`` pair with the given reranker."""
-        ...
-
-    def buckets(self, model_id: str) -> tuple[int, ...]:
-        """Return the ascending sequence-length buckets served by ``model_id``."""
-        ...
-
-    def default_model_id(self, kind: str) -> str | None:
-        """Return the id used when a request names no model of ``kind``."""
-        ...
-
-    def loaded(self, model_id: str) -> bool:
-        """Report whether ``model_id``'s artifacts are in memory, loading nothing."""
-        ...
-
-
-@dataclass
-class _ServedModel:
-    """One loaded model: its tokenizer, its compiled artifacts and its metadata.
-
-    Attributes:
-        id: Model id requests route by.
-        kind: Either ``"embedding"`` or ``"reranker"``.
-        tokenizer: Frozen tokenizer the model is served with.
-        tokenizer_lock: Serializes encodes on :attr:`tokenizer`. Fast
-            tokenizers keep mutable padding/truncation state, so every
-            model needs its own lock; sharing one across models would
-            serialize unrelated requests for nothing.
-        compiled: Loaded ``CompiledMLModel`` per sequence-length bucket.
-        buckets: Ascending sequence-length buckets, i.e. the keys of
-            :attr:`compiled`.
-        output_name: Output tensor name requested at conversion time.
-        normalize: The entry's ``normalize`` flag, recorded so callers can
-            inspect the served model. The engine always returns raw
-            vectors; normalization is the HTTP layer's decision.
-        embedding_dim: Width of the embedding vectors as stated by the
-            configuration, or ``None`` when it states none (and always
-            ``None`` for a reranker). The width measured at run time is
-            tracked outside this record, which is discarded on every
-            unload.
-    """
-
-    id: str
-    kind: str
-    tokenizer: runtime.FrozenTokenizer
-    tokenizer_lock: threading.Lock
-    compiled: dict[int, Any]
-    buckets: tuple[int, ...]
-    output_name: str
-    normalize: bool
-    embedding_dim: int | None
-
-
-@dataclass
-class _ManagedModel:
-    """One served model's lifecycle state, whether or not it is in memory.
-
-    Exists for the engine's whole life, so everything a request needs
-    before any artifact is touched (routing, buckets, the empty-request
-    width) survives an unload.
-
-    Every mutable attribute (:attr:`state`, :attr:`served`,
-    :attr:`last_used`, :attr:`in_flight`, :attr:`embedding_dim`) is read
-    and written under the engine's state lock only. The immutable ones
-    need no lock at all.
-
-    Attributes:
-        entry: Configuration entry this model serves, the source of its
-            id, kind and artifact paths.
-        policy: Load policy and idle delay applied to this model.
-        buckets: Ascending sequence-length buckets, derived from the
-            entry, so they can be reported while the model is unloaded.
-        load_lock: Serializes this model's loads. Concurrent first
-            requests therefore load it once, and a load never blocks
-            another model's requests.
-        state: ``"unloaded"``, ``"loading"`` or ``"loaded"``.
-        served: The loaded artifacts while :attr:`state` is ``"loaded"``,
-            ``None`` otherwise.
-        last_used: Engine clock reading of the last request completion,
-            i.e. what the idle delay is measured from.
-        in_flight: Number of requests currently being served by this
-            model. A model with requests in flight is never unloaded.
-        embedding_dim: Width of the embedding vectors when known: taken
-            from the configuration, then filled in from the first real
-            prediction. Kept here rather than on :attr:`served` so an
-            unload cannot lose it, since an empty request must keep
-            answering with the ``(0, D)`` shape. Always ``None`` for a
-            reranker.
-    """
-
-    entry: ModelEntry
-    policy: ModelPolicy
-    buckets: tuple[int, ...]
-    embedding_dim: int | None
-    load_lock: threading.Lock = field(default_factory=threading.Lock)
-    state: str = _UNLOADED
-    served: _ServedModel | None = None
-    last_used: float = 0.0
-    in_flight: int = 0
-
-
-def _resolve_output_key(prediction: dict[str, Any], preferred: str) -> str:
-    """Pick the output key of a ``predict`` result dict.
-
-    Prefers the name chosen at conversion time but tolerates a renamed
-    single output.
-
-    Args:
-        prediction: Dict returned by ``CompiledMLModel.predict``.
-        preferred: Output name requested at conversion time.
-
-    Returns:
-        Key to read the output tensor from.
-
-    Raises:
-        RuntimeError: If the model returned no outputs at all.
-    """
-    keys = list(prediction)
-    if not keys:
-        raise RuntimeError("Core ML model returned no outputs")
-    return preferred if preferred in keys else keys[0]
-
-
-def _as_row(output: Any, name: str) -> np.ndarray:
-    """Flatten a batch-of-one Core ML output into a 1-D float32 row.
-
-    Args:
-        output: Tensor returned by ``predict`` (shape ``(1, D)`` or
-            ``(1, 1)`` for a reranker).
-        name: Output key, used in the error message only.
-
-    Returns:
-        1-D float32 view of ``output``.
-
-    Raises:
-        RuntimeError: If the output holds no values.
-    """
-    row = np.asarray(output, dtype=np.float32).reshape(-1)
-    if row.size == 0:
-        raise RuntimeError(f"Core ML output {name!r} is empty")
-    return row
-
-
-def _require_complete(entry: ModelEntry) -> None:
-    """Reject a model entry the engine cannot serve.
-
-    Configuration validation already guarantees complete entries, so this
-    only guards against a hand-built :class:`~eeane.config.ModelEntry`.
-
-    Args:
-        entry: Model entry about to be loaded.
-
-    Raises:
-        ValueError: If the entry has no supported kind, no tokenizer, no
-            compiled artifact, or a non-positive embedding width (which
-            would shape an empty response as ``(0, -n)``).
-    """
-    if entry.kind not in _DEFAULT_OUTPUT_NAMES:
-        raise ValueError(f"model '{entry.id}': unsupported model kind {entry.kind!r}")
-    if entry.tokenizer is None:
-        raise ValueError(f"model '{entry.id}': no tokenizer file configured")
-    if not entry.artifacts:
-        raise ValueError(f"model '{entry.id}': no compiled artifact configured")
-    if entry.embedding_dim is not None and entry.embedding_dim <= 0:
-        raise ValueError(
-            f"model '{entry.id}': embedding_dim must be positive, got {entry.embedding_dim}"
-        )
-
-
-def _collect_missing(entry: ModelEntry) -> list[str]:
-    """Describe the artifacts of one entry that are not on disk.
-
-    Args:
-        entry: Complete model entry (see :func:`_require_complete`).
-
-    Returns:
-        One human-readable line per missing path, each naming the model it
-        belongs to so a multi-model report stays readable. Empty when
-        every path exists.
-    """
-    tokenizer_path = entry.tokenizer
-    compiled = entry.artifacts or {}
-    problems: list[str] = []
-    if tokenizer_path is not None and not tokenizer_path.is_file():
-        # Quote every bucket: the tokenizer is written by the same
-        # `eeane compile` run that produces the artifacts.
-        all_buckets = ",".join(str(bucket) for bucket in sorted(compiled))
-        command = _COMPILE_COMMAND.format(buckets=all_buckets)
-        problems.append(
-            f"model '{entry.id}': missing tokenizer file {tokenizer_path}; "
-            f"generate it with: {command}"
-        )
-    # Sorted so the reported order is deterministic across runs.
-    for seq_len, path in sorted(compiled.items()):
-        if not path.exists():
-            command = _COMPILE_COMMAND.format(buckets=seq_len)
-            problems.append(
-                f"model '{entry.id}': missing Core ML artifact {path}; generate it with: {command}"
-            )
-    return problems
 
 
 def _load_compiled(path: Path) -> Any:
