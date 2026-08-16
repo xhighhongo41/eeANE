@@ -8,7 +8,7 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 コンパイル済みモデルは数秒でロードでき、ANE上で推論するため、GPUと
 ユニファイドメモリの大部分を他の作業のために空けておけます。
 
-> **開発状況: 初期開発中 (v0.8)。**
+> **開発状況: 初期開発中 (v0.9)。**
 > v0.1〜v0.3で概念実証を完了:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (日本語ModernBERT埋め込みモデル)と
@@ -64,7 +64,23 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 > へのリクエストは404)。`[server] max_loaded_models`は同時にメモリへ
 > 保持するモデル数の上限で、超過時は最も長くアイドルなon_demand
 > モデルから追い出されます。`GET /health`は各モデルの`loaded`状態を
-> 返すようになりました。パッケージ配布は後のマイルストーンで実装
+> 返すようになりました。**v0.9で高負荷時の堅牢性を強化しました**:
+> 推論リクエストは受付制御を通るようになり、`[server]
+> max_pending_requests`(既定500)を超えた分は即座に429と
+> `Retry-After`ヘッダで拒否され、順番待ちが`[server] queue_timeout`
+> (既定600秒)を超えたリクエストは待ち続ける代わりに503で応答され
+> ます(推論が始まったリクエストは必ず完走します。シャットダウン
+> 時も処理中のリクエストは完遂まで待たれ、`graceful_shutdown_timeout`
+> で待ち時間の上限を設定できます)。同一内容のリクエストが処理中の
+> ものと重なった場合は計算を1回にして結果を共有します
+> (`coalesce_requests`、既定on。同一8リクエストの実測で約7倍高速)。
+> モデル出力にNaN/無限大が含まれる場合(サポート外の計算経路で実行
+> された兆候)は、壊れた数値を黙って返す代わりに明確な500エラーに
+> なります。短い入力を多数含むembeddingリクエストは、バッチ2成果物
+> を追加コンパイル(`eeane compile <model> --buckets <S> --batch 2`)
+> すると約25%スループットが向上します(開発機実測。id-onlyエントリ
+> では自動解決され、同一リクエスト内の同バケツ入力を2件ずつまとめて
+> 推論します)。パッケージ配布は後のマイルストーンで実装
 > 予定です。
 
 ## 動作要件
@@ -151,6 +167,23 @@ uv run python -m eeane check-config --config /path/to/eeane.toml
 返します)。`uv run python -m eeane.server`は`eeane serve`の
 エイリアスとして引き続き使えます。
 
+### バケツごとのバッチ2成果物 (embeddingリクエスト向け)
+
+embeddingモデル(reranker除く)は任意で、バケツごとに2件目の成果物を
+追加コンパイルできます。1回のNeural Engine呼び出しで2件の入力を
+まとめて処理する成果物です:
+`eeane compile <model> --buckets <S> --batch 2`を、通常のバッチ1
+コンパイルと合わせて実行します。サービングは任意選択で、`[[models]]`
+エントリの`[models.batch_artifacts]`(`[models.artifacts]`と同じ形の
+バケツ→成果物パスのテーブル)で有効化します。1リクエスト内で2件以上
+の入力が同じバケツにルーティングされた場合、1件ずつではなくバッチ2
+成果物でまとめて2件ずつ推論され、短い入力を多数含むリクエストで手元
+計測では約25%スループットが向上しました。id-onlyエントリは、バッチ2
+成果物がキャッシュにコンパイル済みであれば`batch_artifacts`を自動
+解決します。明示形式(`[models.artifacts]`を明示するもの)では
+`[models.batch_artifacts]`も明示する必要があり、単独では設定できません。
+バッチ2成果物が無い構成の動作は従来と完全に同一です。
+
 ### モデルのロード
 
 v0.8から`[[models]]`エントリの既定`load_policy`は`"on_demand"`です
@@ -180,6 +213,31 @@ on_demandモデルは、`keep_alive`秒(`[server] keep_alive`、既定300、
 を確保します。residentモデルと現在リクエストを処理中のモデルは追い
 出し対象になりません。したがって、residentエントリの数だけで上限を
 超える設定は起動時にエラーになります。
+
+### リクエストの受付・キューイング・シャットダウン
+
+`server.max_pending_requests`は、サーバーが同時に受け付ける推論
+リクエスト数の上限です(処理中+待機中の合計。既定500、`0`は無制限)。
+上限に達した後に届いたリクエストは、`Retry-After`ヘッダ付きの
+`429 Too Many Requests`で即座に拒否されます。
+
+`server.queue_timeout`は、受理されたリクエストが推論開始まで待って
+よい時間の上限です(既定600秒、`0`はタイムアウト無効)。この上限を
+超えて待ったリクエストは、`Retry-After`ヘッダ付きの
+`503 Service Unavailable`で打ち切られます。推論が開始した後の
+リクエストは、どれだけ時間がかかってもこのタイムアウトで中断される
+ことはありません。いずれの場合も`Retry-After`は、クライアントに
+何秒後の再試行を推奨するかを伝えます。
+
+`server.coalesce_requests`(既定`true`)は、処理中のリクエストと
+内容が同一(同一モデル・同一入力)の新規リクエストが届いた場合に、
+推論を2回実行する代わりに新規リクエストを処理中のリクエストへ
+併合し、完了時に同じ結果を共有します。
+
+`server.graceful_shutdown_timeout`は、SIGTERMやCtrl-Cを受けたときに
+in-flightリクエストの完了をサーバーが待つ時間の上限です(既定は
+未設定=全件完了まで無期限に待つ。待っている間は新規接続を受け付け
+ません)。秒数を指定すると、その待ち時間に上限をかけられます。
 
 ### localhost外への公開
 
@@ -230,6 +288,35 @@ uv run python tools/verify_server.py all
 uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
 uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
 ```
+
+### 既知の制限
+
+eeANEはApple Neural Engineでの実行を前提としており、コンパイル済み
+モデルをCPUのみの計算経路で実行することはサポートしていません。
+Neural Engineが実際には利用できないマシンや構成でコンパイル済み
+モデルを実行すると、推論結果が非有限値(NaN/Inf)になることが実測で
+確認されています — これは対応する全アーキテクチャで発生し、発生
+頻度はアーキテクチャと入力の系列長に依存します。サーバーはこの
+ような結果を黙って返す代わりに、実行時に非有限値の出力を検出した
+場合`500 Internal Server Error`を返します(エラーメッセージ例:
+`model '<id>' produced a non-finite output for bucket <N>; the
+compiled model may have run on an unsupported compute path`)。この
+エラーが出た場合、実行環境でNeural Engineが実際には使えていない
+可能性が高いです。詳しくは下記のトラブルシューティングを参照して
+ください。
+
+### トラブルシューティング
+
+- **`404 model not found`**: クライアントが送る`model`フィールドは、
+  サーバー側で設定した`id`と完全に一致している必要があります。
+  `GET /models`でeeANEが実際にサービングしているid一覧を確認して
+  ください。旧バージョンからの移行クライアントは、以前は`model`
+  フィールドが完全に無視されていたため任意の名前(または未指定)で
+  動作していた点に注意してください — その挙動はなくなりました。
+- **`500 ... produced a non-finite output ...`**: 上記「既知の制限」
+  を参照してください。モデルがNeural Engine上で動作していないことを
+  意味します。リクエストを処理したマシンでNeural Engineが利用可能か
+  確認してください。
 
 ## PoCを試す (歴史的な開発スナップショット)
 
