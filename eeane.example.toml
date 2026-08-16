@@ -28,6 +28,19 @@ log_level = "info"          # debug | info | warning | error
 # max_loaded_models = 2      # Cap on models held in memory at once. Unset: no limit.
                               # Loading a model beyond the cap unloads the longest-idle
                               # on_demand model first; resident models are never evicted.
+# max_pending_requests = 500  # Cap on inference requests admitted at once (running +
+                               # waiting); 0 means unlimited. Requests beyond the cap get 429
+                               # immediately, with a Retry-After header.
+# queue_timeout = 600         # Seconds an admitted request may wait its turn before it is
+                               # abandoned with 503 and a Retry-After header; 0 disables the
+                               # timeout. A request that has already started inference is
+                               # never interrupted by this.
+# coalesce_requests = true    # Merge an incoming request with an identical one (same model,
+                               # same input) already running instead of computing it twice.
+# graceful_shutdown_timeout = 30  # Seconds to wait for in-flight requests to finish on
+                                   # SIGTERM/Ctrl-C before exiting. Unset (default): wait for
+                                   # all of them to finish, however long that takes; no new
+                                   # connections are accepted meanwhile.
 
 # Any number of [[models]] entries may be listed; at least one embedding
 # model is required, rerankers are optional (without one, /rerank answers
@@ -67,3 +80,14 @@ id = "cl-nagoya/ruri-v3-reranker-310m"
 # [models.artifacts]
 # 128 = "models/compiled/my-model/s128_b1_eager_macos13.mlmodelc"
 # 512 = "models/compiled/my-model/s512_b1_eager_macos13.mlmodelc"
+
+# Optional, embedding models only: pairs a bucket with a second compiled artifact that infers
+# two inputs per Neural Engine call instead of one. Produced by `eeane compile <model>
+# --buckets <S> --batch 2`, run alongside the normal batch-1 compile; raised throughput by
+# about 25% on our test machine for requests with many short inputs. An id-only entry
+# resolves this automatically once a batch-2 artifact is in the cache; the explicit form must
+# spell it out here, and requires [models.artifacts] to be explicit too. No batch-2 artifacts
+# configured: behavior is unchanged.
+# [models.batch_artifacts]
+# 128 = "models/compiled/my-model/s128_b2_eager_macos13.mlmodelc"
+# 512 = "models/compiled/my-model/s512_b2_eager_macos13.mlmodelc"

@@ -1548,3 +1548,411 @@ load_policy = "resident"
     loaded = load_config(explicit_path=config_path, env={})
 
     assert [entry.id for entry in loaded.config.models] == ["emb", "rr"]
+
+
+# --- request-handling settings: defaults, boundaries, typo detection ------
+
+
+def test_server_config_request_handling_defaults() -> None:
+    """ServerConfig's request-handling fields must default per spec."""
+    server = ServerConfig()
+
+    assert server.max_pending_requests == 500
+    assert server.queue_timeout == 600
+    assert server.coalesce_requests is True
+    assert server.graceful_shutdown_timeout is None
+
+
+def test_zero_max_pending_requests_is_accepted(tmp_path: Path) -> None:
+    """max_pending_requests=0 (unlimited) must be accepted."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\nmax_pending_requests = 0\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.server.max_pending_requests == 0
+
+
+def test_negative_max_pending_requests_raises_config_error(tmp_path: Path) -> None:
+    """A negative max_pending_requests must be rejected (0 means unlimited, not negative)."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\nmax_pending_requests = -1\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="max_pending_requests"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_zero_queue_timeout_is_accepted(tmp_path: Path) -> None:
+    """queue_timeout=0 (no timeout) must be accepted."""
+    content = _MINIMAL_TOML.replace("[[models]]", "[server]\nqueue_timeout = 0\n\n[[models]]", 1)
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.server.queue_timeout == 0
+
+
+def test_negative_queue_timeout_raises_config_error(tmp_path: Path) -> None:
+    """A negative queue_timeout must be rejected (0 means no timeout, not negative)."""
+    content = _MINIMAL_TOML.replace("[[models]]", "[server]\nqueue_timeout = -1\n\n[[models]]", 1)
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="queue_timeout"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_zero_graceful_shutdown_timeout_raises_config_error(tmp_path: Path) -> None:
+    """graceful_shutdown_timeout=0 must be rejected (None means unlimited, not zero)."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\ngraceful_shutdown_timeout = 0\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="graceful_shutdown_timeout"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_negative_graceful_shutdown_timeout_raises_config_error(tmp_path: Path) -> None:
+    """A negative graceful_shutdown_timeout must be rejected."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\ngraceful_shutdown_timeout = -1\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="graceful_shutdown_timeout"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_positive_graceful_shutdown_timeout_is_accepted(tmp_path: Path) -> None:
+    """A positive graceful_shutdown_timeout must be accepted."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\ngraceful_shutdown_timeout = 30\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.server.graceful_shutdown_timeout == 30
+
+
+def test_coalesce_requests_can_be_disabled(tmp_path: Path) -> None:
+    """coalesce_requests=false must be honored."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\ncoalesce_requests = false\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.server.coalesce_requests is False
+
+
+def test_typo_in_max_pending_requests_raises_config_error(tmp_path: Path) -> None:
+    """A typo'd request-handling key must be rejected by extra='forbid', not silently ignored."""
+    content = _MINIMAL_TOML.replace(
+        "[[models]]", "[server]\nmax_pending_request = 10\n\n[[models]]", 1
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", content)
+
+    with pytest.raises(ConfigError, match="max_pending_request"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_cli_override_preserves_request_handling_settings(tmp_path: Path) -> None:
+    """New server fields must survive re-validation after a CLI override (regression test)."""
+    toml_content = """
+[server]
+max_pending_requests = 10
+queue_timeout = 5
+coalesce_requests = false
+graceful_shutdown_timeout = 20
+
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+    overrides = CliOverrides(port=9001)
+
+    loaded = load_config(explicit_path=config_path, overrides=overrides, env={})
+
+    assert loaded.config.server.port == 9001
+    assert loaded.config.server.max_pending_requests == 10
+    assert loaded.config.server.queue_timeout == 5
+    assert loaded.config.server.coalesce_requests is False
+    assert loaded.config.server.graceful_shutdown_timeout == 20
+
+
+# --- batch_artifacts: coercion, kind restriction, bucket subset, paths ----
+
+
+def test_batch_artifacts_string_keys_are_coerced_and_resolved(tmp_path: Path) -> None:
+    """batch_artifacts' TOML string keys must be coerced to int and its paths absolutized."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+512 = "compiled/emb/s512.mlmodelc"
+
+[models.batch_artifacts]
+128 = "compiled/emb/s128_b2.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.batch_artifacts == {128: tmp_path / "compiled" / "emb" / "s128_b2.mlmodelc"}
+
+
+def test_relative_config_path_still_yields_absolute_batch_artifact_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CWD-relative --config path must still absolutize batch_artifacts paths.
+
+    Regression guard: a v0.5-era bug left relative model paths unresolved
+    when --config itself was given as a relative path.
+    """
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[models.batch_artifacts]
+128 = "compiled/emb/s128_b2.mlmodelc"
+"""
+    _write_toml(tmp_path / "eeane.toml", toml_content)
+    monkeypatch.chdir(tmp_path)
+
+    loaded = load_config(explicit_path=Path("eeane.toml"), env={})
+
+    batch_artifacts = loaded.config.embedding_model.batch_artifacts
+    assert batch_artifacts is not None
+    assert batch_artifacts[128].is_absolute()
+    assert batch_artifacts[128] == tmp_path / "compiled" / "emb" / "s128_b2.mlmodelc"
+
+
+def test_batch_artifacts_on_reranker_entry_raises_config_error(tmp_path: Path) -> None:
+    """batch_artifacts is embedding-only; setting it on a reranker entry must be rejected."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[[models]]
+id = "rr"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+
+[models.artifacts]
+512 = "compiled/rr/s512.mlmodelc"
+
+[models.batch_artifacts]
+512 = "compiled/rr/s512_b2.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="batch_artifacts"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_batch_artifacts_on_id_only_entry_raises_config_error(tmp_path: Path) -> None:
+    """batch_artifacts requires explicit artifacts; an id-only entry must be rejected."""
+    _write_cached_model(tmp_path / "cache", "org/emb", buckets=(128, 512))
+    toml_content = """
+[server]
+cache_root = "cache"
+
+[[models]]
+id = "org/emb"
+
+[models.batch_artifacts]
+128 = "extra/s128_b2.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="batch_artifacts"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_batch_artifacts_bucket_outside_artifacts_raises_config_error(tmp_path: Path) -> None:
+    """A batch_artifacts key that is not one of artifacts' buckets must be rejected."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[models.batch_artifacts]
+256 = "compiled/emb/s256_b2.mlmodelc"
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="batch_artifacts"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_batch_artifacts_key_for_an_excluded_bucket_raises_config_error() -> None:
+    """A batch_artifacts key naming a bucket left out of artifacts (excluded) must be rejected."""
+    with pytest.raises(ValidationError, match="batch_artifacts"):
+        ModelEntry(
+            id="m",
+            kind="embedding",
+            tokenizer=Path("m/tokenizer.json"),
+            artifacts={512: Path("s512.mlmodelc")},
+            excluded_buckets=(128, 1024),
+            batch_artifacts={128: Path("s128_b2.mlmodelc")},
+        )
+
+
+# --- batch_artifacts: resolution from the compiled-model cache -----------
+
+
+def _batched_record(*buckets: int, batch: str = "2") -> dict[str, Any]:
+    """Build the ``batch_artifacts`` block a cache record carries.
+
+    Args:
+        buckets: Buckets a batched artifact was compiled for.
+        batch: Batch size the block is keyed by, as a record spells it.
+
+    Returns:
+        The record key's value, ready to be merged into a cache entry.
+    """
+    return {
+        batch: {str(bucket): f"s{bucket}_b{batch}_eager_macos13.mlmodelc" for bucket in buckets}
+    }
+
+
+def test_id_only_entry_gains_the_batch_artifacts_of_its_cache_record(tmp_path: Path) -> None:
+    """A cached model compiled for two batch sizes must be served with both."""
+    model_dir = _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128, 512),
+        overrides={"batch_artifacts": _batched_record(128)},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.batch_artifacts == {128: model_dir / "s128_b2_eager_macos13.mlmodelc"}
+    assert entry.batch_artifacts[128].is_absolute()
+    # The served artifacts are untouched by the batched ones.
+    assert entry.buckets == (128, 512)
+
+
+def test_cached_batch_artifacts_are_limited_to_the_loaded_buckets(tmp_path: Path) -> None:
+    """A batched artifact of a bucket that is not loaded has nothing to accelerate."""
+    model_dir = _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128, 512),
+        recommended_buckets=(512,),
+        overrides={"batch_artifacts": _batched_record(128, 512)},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.embedding_model
+    assert entry.buckets == (512,)
+    assert entry.excluded_buckets == (128,)
+    assert entry.batch_artifacts == {512: model_dir / "s512_b2_eager_macos13.mlmodelc"}
+
+
+def test_a_cache_record_without_batch_artifacts_leaves_the_entry_without_any(
+    tmp_path: Path,
+) -> None:
+    """A model compiled for one batch size only must be served exactly as before."""
+    _write_cached_model(tmp_path / "cache", "org/emb", buckets=(128,))
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.embedding_model.batch_artifacts is None
+
+
+def test_batch_artifacts_of_an_unknown_batch_size_are_ignored(tmp_path: Path) -> None:
+    """A record describing only batch sizes this release cannot serve is not an error."""
+    _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128,),
+        overrides={"batch_artifacts": _batched_record(128, batch="4")},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.embedding_model.batch_artifacts is None
+
+
+def test_batch_artifacts_of_a_cached_reranker_are_ignored(tmp_path: Path) -> None:
+    """A reranker is served one pair at a time, whatever its record happens to name."""
+    _write_cached_model(tmp_path / "cache", "org/emb", buckets=(128,))
+    _write_cached_model(
+        tmp_path / "cache",
+        "rr",
+        kind="reranker",
+        buckets=(512,),
+        overrides={"batch_artifacts": _batched_record(512)},
+    )
+    config_path = _write_toml(
+        tmp_path / "eeane.toml", _CACHE_ROOT_TOML + '\n[[models]]\nid = "rr"\n'
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    reranker = loaded.config.reranker_model
+    assert reranker is not None
+    assert reranker.batch_artifacts is None
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        "s128_b2.mlmodelc",
+        {"2": "s128_b2.mlmodelc"},
+        {"2": {"tiny": "s128_b2.mlmodelc"}},
+        {"2": {"128": "../outside.mlmodelc"}},
+        {"2": {"128": "/absolute/s128_b2.mlmodelc"}},
+    ],
+)
+def test_an_unusable_batch_artifacts_record_raises_config_error(
+    tmp_path: Path, recorded: Any
+) -> None:
+    """A corrupt batched table must be reported, not silently half-applied."""
+    _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        buckets=(128,),
+        overrides={"batch_artifacts": recorded},
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="batch_artifacts"):
+        load_config(explicit_path=config_path, env={})

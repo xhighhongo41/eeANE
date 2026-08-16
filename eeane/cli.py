@@ -288,7 +288,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     # so a top-level import here would create an import cycle.
     from eeane.server import create_app
 
-    uvicorn.run(create_app(config), host=config.server.host, port=config.server.port)
+    uvicorn.run(
+        create_app(config),
+        host=config.server.host,
+        port=config.server.port,
+        timeout_graceful_shutdown=config.server.graceful_shutdown_timeout,
+    )
     return 0
 
 

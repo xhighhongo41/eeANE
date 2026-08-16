@@ -8,7 +8,7 @@ Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **Status: early development (v0.8).**
+> **Status: early development (v0.9).**
 > v0.1–v0.3 proved the concept:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (a Japanese ModernBERT embedding model) and
@@ -67,6 +67,25 @@ and most of your unified memory free for other work.
 > leaving it in the config. `[server] max_loaded_models` caps how many
 > models stay in memory at once, evicting the longest-idle on-demand
 > model first. `GET /health` now reports each model's `loaded` state.
+> **v0.9 hardens the server under load**: inference requests now pass
+> admission control — `[server] max_pending_requests` (default 500)
+> caps how many are accepted at once and the excess is rejected
+> immediately with `429` plus a `Retry-After` header, while a request
+> that waits longer than `[server] queue_timeout` (default 600 s) for
+> its turn is answered with `503` instead of waiting forever (a
+> request whose inference has started always runs to completion, and
+> shutdown drains in-flight requests, bounded by
+> `graceful_shutdown_timeout` if set). Identical concurrent requests
+> are served from a single computation (`coalesce_requests`, on by
+> default; 8 identical requests measured ~7x faster than without it),
+> and a model output containing NaN or infinite values — the sign of
+> an unsupported compute path — is reported as a clear `500` error
+> instead of being passed on. Embedding throughput for requests full
+> of short inputs can be raised ~25% (measured on a development Mac)
+> by compiling a batch-2 artifact (`eeane compile <model> --buckets
+> <S> --batch 2`), which the server picks up automatically for
+> id-only entries and uses to predict two same-bucket inputs of one
+> request together.
 > Packaged one-command installs arrive in later milestones.
 
 ## Requirements
@@ -157,6 +176,24 @@ name one. Reranker entries may be omitted entirely for an
 embedding-only server (`/rerank` then answers 503).
 `uv run python -m eeane.server` remains as an alias for `eeane serve`.
 
+### Batch-2 artifacts for embedding requests
+
+Embedding models (not rerankers) may optionally be compiled with a
+second artifact per bucket that packs two inputs into one Neural Engine
+call: `eeane compile <model> --buckets <S> --batch 2`, run alongside
+the normal batch-1 compile. Serving it is opt-in through
+`[models.batch_artifacts]` on a `[[models]]` entry — a bucket ->
+artifact-path table mirroring `[models.artifacts]`. When a request
+routes two or more of its inputs to the same bucket, they are paired up
+and inferred through the batch-2 artifact instead of one at a time,
+which raised throughput by about 25% on our test machine for requests
+carrying many short inputs. An id-only entry resolves
+`batch_artifacts` automatically from the compiled-model cache once a
+batch-2 artifact has been compiled for it; the explicit form (which
+spells out `[models.artifacts]`) must spell out
+`[models.batch_artifacts]` too — it cannot be set on its own. A
+configuration without any batch-2 artifacts behaves exactly as before.
+
 ### Model loading
 
 Since v0.8 the default `load_policy` for a `[[models]]` entry is
@@ -187,6 +224,33 @@ the longest-idle `on_demand` model is unloaded to make room;
 `resident` models and models currently handling a request are never
 evicted this way, so a configuration whose `resident` entries alone
 exceed the cap is rejected at start-up.
+
+### Request admission, queueing and shutdown
+
+`server.max_pending_requests` caps how many inference requests the
+server admits at once, counting both requests currently running and
+requests still waiting their turn (default 500; `0` means unlimited).
+A request that arrives once the cap is reached is rejected immediately
+with `429 Too Many Requests` and a `Retry-After` header.
+
+`server.queue_timeout` caps how long an admitted request may wait
+between being accepted and actually starting inference (default 600
+seconds; `0` disables the timeout). A request that waits past this
+limit is abandoned with `503 Service Unavailable` and a `Retry-After`
+header. Once a request has started inference it is never interrupted
+by this timeout, however long it runs. Either way, `Retry-After` tells
+the client how long to wait before retrying.
+
+`server.coalesce_requests` (default `true`) merges an incoming request
+with an identical one (same model, same input) that is already being
+processed: instead of running inference twice, the second request
+attaches to the first and receives the same result once it completes.
+
+`server.graceful_shutdown_timeout` bounds how long the server waits
+for in-flight requests to finish when it receives SIGTERM or Ctrl-C
+(default: unset, meaning it waits for all of them to finish however
+long that takes; no new connections are accepted while it waits). Set
+it to a number of seconds to cap that wait instead.
 
 ### Serving beyond localhost
 
@@ -239,6 +303,35 @@ uv run python tools/verify_server.py all
 uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
 uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
 ```
+
+### Known limitations
+
+eeANE targets the Apple Neural Engine; running a compiled model on a
+CPU-only compute path is not supported. On a machine or configuration
+where the Neural Engine is not actually available to a compiled model,
+inference can produce non-finite (NaN/Inf) output — this has been
+observed across every architecture eeANE supports, with how often it
+happens depending on the architecture and the input's sequence length.
+Rather than silently return such a result, the server detects
+non-finite output at inference time and answers with `500 Internal
+Server Error` (for example: `model '<id>' produced a non-finite output
+for bucket <N>; the compiled model may have run on an unsupported
+compute path`). Seeing this error is a strong signal that the Neural
+Engine is not actually being used in your environment; see
+Troubleshooting below.
+
+### Troubleshooting
+
+- **`404 model not found`**: the `model` field a client sends must
+  match a served model's configured `id` exactly. Check the ids eeANE
+  actually serves with `GET /models`. Clients migrated from an older
+  eeANE version should note that the `model` field used to be ignored
+  entirely, so a request naming anything (or nothing) used to succeed
+  — that leniency is gone.
+- **`500 ... produced a non-finite output ...`**: see "Known
+  limitations" above. This means the model ran off the Neural Engine;
+  verify Neural Engine availability on the machine serving the
+  request.
 
 ## Trying the PoC (historical development snapshot)
 

@@ -486,18 +486,19 @@ def build_config_snippet(
     kind: str,
     tokenizer_path: Path,
     artifacts: Mapping[int, Path],
+    batch_artifacts: Mapping[int, Path] | None = None,
     normalize: bool = True,
     cache_root_hint: Path | None = None,
 ) -> str:
     """Build the minimal ``[[models]]`` TOML snippet for a compiled model.
 
     The minimal form sets only ``id`` (plus ``normalize`` for an embedding
-    entry): ``kind``, ``tokenizer`` and ``artifacts`` are then resolved
-    automatically from the compiled-model cache at server start, so the
-    snippet keeps working across recompiles that add or drop buckets. The
-    explicit equivalent -- what a user would write to pin those fields
-    instead, e.g. to point at artifacts moved out of the cache -- is
-    included as a comment.
+    entry): ``kind``, ``tokenizer``, ``artifacts`` and any batched
+    artifacts are then resolved automatically from the compiled-model
+    cache at server start, so the snippet keeps working across recompiles
+    that add or drop buckets. The explicit equivalent -- what a user would
+    write to pin those fields instead, e.g. to point at artifacts moved
+    out of the cache -- is included as a comment.
 
     Paths are absolutized because the snippet is meant to be pasted into
     a config file living somewhere else entirely (eeANE resolves relative
@@ -508,6 +509,11 @@ def build_config_snippet(
         kind: ``"embedding"`` or ``"reranker"``.
         tokenizer_path: Frozen ``tokenizer.json``.
         artifacts: Bucket length -> compiled ``.mlmodelc`` path.
+        batch_artifacts: Bucket length -> batched ``.mlmodelc`` path, for
+            the buckets one was compiled for. Listed in the explicit
+            block only, and only for an embedding model: the config
+            schema accepts the table on an embedding entry that pins its
+            ``artifacts``, and resolves it from the cache otherwise.
         normalize: ``normalize`` value for an embedding entry. Never
             emitted for a reranker: the config schema rejects it there.
         cache_root_hint: The cache root the artifacts were compiled into,
@@ -542,6 +548,12 @@ def build_config_snippet(
         f"# {bucket} = {_toml_string(str(Path(artifacts[bucket]).resolve()))}"
         for bucket in sorted(artifacts)
     ]
+    if kind == "embedding" and batch_artifacts:
+        lines.append("# [models.batch_artifacts]")
+        lines += [
+            f"# {bucket} = {_toml_string(str(Path(batch_artifacts[bucket]).resolve()))}"
+            for bucket in sorted(batch_artifacts)
+        ]
     return "\n".join(lines) + "\n"
 
 

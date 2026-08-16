@@ -52,6 +52,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # so it is rejected instead of guessed at.
 MAX_MODEL_INFO_FORMAT_VERSION = 2
 
+# Optional table of batched artifacts in a cache record, keyed by batch
+# size (as a string, since JSON object keys are strings) so one record
+# can describe several of them, and the one batch size a served entry can
+# use. A record that carries none simply serves one input per prediction.
+BATCH_ARTIFACTS_RECORD_KEY = "batch_artifacts"
+BATCH_ARTIFACT_BATCH_SIZE = 2
+
 
 class ConfigError(Exception):
     """Raised when a config file or the resolved configuration is invalid.
@@ -97,6 +104,29 @@ class ServerConfig(BaseModel):
             guaranteed to be loaded at all times; keeping on-demand
             entries within the limit at runtime is the serving engine's
             responsibility.
+        max_pending_requests: Maximum number of inference requests the
+            serving engine admits at once, counting requests currently
+            being processed and requests still waiting for their turn.
+            ``0`` means "unlimited". Enforcing this cap is the serving
+            engine's responsibility; this field only holds and validates
+            the configured value.
+        queue_timeout: Maximum number of seconds a request may wait
+            between being admitted and starting inference before it is
+            abandoned. ``0`` means "no timeout". Enforcing this is the
+            serving engine's responsibility; this field only holds and
+            validates the configured value.
+        coalesce_requests: Whether an incoming request with the same
+            content as one already being processed is served by
+            attaching to that in-flight request instead of running
+            inference again. Implementing the coalescing itself is the
+            serving engine's responsibility; this field only holds and
+            validates the configured value.
+        graceful_shutdown_timeout: Maximum number of seconds the server
+            waits for in-flight requests to finish while shutting down,
+            or ``None`` to wait for them indefinitely (the same default
+            behavior as the underlying ASGI server). Implementing the
+            wait itself is the serving engine's responsibility; this
+            field only holds and validates the configured value.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -110,6 +140,57 @@ class ServerConfig(BaseModel):
     default_load_policy: Literal["resident", "on_demand"] = "on_demand"
     keep_alive: int = Field(default=300, ge=0)
     max_loaded_models: int | None = Field(default=None, ge=1)
+    max_pending_requests: int = Field(default=500, ge=0)
+    queue_timeout: int = Field(default=600, ge=0)
+    coalesce_requests: bool = True
+    graceful_shutdown_timeout: int | None = Field(default=None, ge=1)
+
+
+def _coerce_bucket_path_map(value: Any, *, entry_id: str, field: str) -> dict[int, Path] | None:
+    """Coerce a TOML bucket-length-to-path table's string keys to positive ints.
+
+    Shared by :class:`ModelEntry`'s ``artifacts`` and ``batch_artifacts``
+    before-validators: TOML tables always have string keys, so this is
+    coerced explicitly rather than relying on pydantic's implicit
+    coercion.
+
+    Args:
+        value: Raw field value as parsed from TOML (or as re-supplied by
+            :func:`load_config` during re-validation). ``None`` means
+            "not configured" and is passed through unchanged.
+        entry_id: The owning entry's ``id``, for error messages.
+        field: Name of the field being coerced (``"artifacts"`` or
+            ``"batch_artifacts"``), for error messages.
+
+    Returns:
+        A dict mapping positive bucket-length ints to ``Path``, or
+        ``None``.
+
+    Raises:
+        ValueError: If ``value`` is not a non-empty mapping, or any key
+            is not a positive integer.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"model '{entry_id}': '{field}' must be a table of bucket lengths")
+    if not value:
+        raise ValueError(f"model '{entry_id}': '{field}' must not be empty")
+
+    coerced: dict[int, Path] = {}
+    for raw_key, raw_path in value.items():
+        try:
+            bucket = int(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"model '{entry_id}': {field} key '{raw_key}' is not a valid integer bucket length"
+            ) from exc
+        if bucket <= 0:
+            raise ValueError(
+                f"model '{entry_id}': {field} key '{raw_key}' must be a positive bucket length"
+            )
+        coerced[bucket] = Path(raw_path)
+    return coerced
 
 
 class ModelEntry(BaseModel):
@@ -133,6 +214,16 @@ class ModelEntry(BaseModel):
             artifact path (``.mlmodelc``). TOML tables always have string
             keys, so this is coerced to ``int`` explicitly rather than
             relying on pydantic's implicit coercion.
+        batch_artifacts: Map of fixed sequence-length bucket to a Core ML
+            artifact compiled for a batch size of two, for the buckets
+            where one is available; ``None`` when none is configured.
+            Coerced from string TOML keys the same way as ``artifacts``.
+            Only valid for ``kind="embedding"`` entries; every key must
+            already be one of ``artifacts``' buckets; and stating this
+            field in the config file requires ``artifacts`` itself to be
+            stated explicitly. An id-only entry cannot pin one, but it is
+            filled in from the compiled-model cache when the record names
+            batched artifacts for the buckets it loads.
         normalize: Whether to L2-normalize embedding output. Only valid
             for ``kind="embedding"``; explicitly setting this on a
             ``kind="reranker"`` entry is a configuration error.
@@ -169,6 +260,7 @@ class ModelEntry(BaseModel):
     kind: Literal["embedding", "reranker"] | None = None
     tokenizer: Path | None = None
     artifacts: dict[int, Path] | None = None
+    batch_artifacts: dict[int, Path] | None = None
     normalize: bool = True
     output_name: str | None = None
     embedding_dim: int | None = Field(default=None, gt=0)
@@ -199,40 +291,47 @@ class ModelEntry(BaseModel):
                 key is not a positive integer.
         """
         entry_id = info.data.get("id", "<unknown>")
+        return _coerce_bucket_path_map(value, entry_id=entry_id, field="artifacts")
 
-        if value is None:
-            return None
-        if not isinstance(value, dict):
-            raise ValueError(f"model '{entry_id}': 'artifacts' must be a table of bucket lengths")
-        if not value:
-            raise ValueError(f"model '{entry_id}': 'artifacts' must not be empty")
+    @field_validator("batch_artifacts", mode="before")
+    @classmethod
+    def _coerce_batch_artifact_keys(
+        cls, value: Any, info: ValidationInfo
+    ) -> dict[int, Path] | None:
+        """Coerce TOML string bucket-length keys to positive ints, like ``artifacts``.
 
-        coerced: dict[int, Path] = {}
-        for raw_key, raw_path in value.items():
-            try:
-                bucket = int(raw_key)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"model '{entry_id}': artifacts key '{raw_key}' is not a valid integer "
-                    "bucket length"
-                ) from exc
-            if bucket <= 0:
-                raise ValueError(
-                    f"model '{entry_id}': artifacts key '{raw_key}' must be a positive "
-                    "bucket length"
-                )
-            coerced[bucket] = Path(raw_path)
-        return coerced
+        Args:
+            value: Raw ``batch_artifacts`` value as parsed from TOML (or
+                as re-supplied by :func:`load_config` during
+                re-validation). ``None`` means "not configured" and is
+                passed through unchanged.
+            info: Validation context; used to look up the entry's ``id``
+                (already validated, since it is declared earlier in the
+                model) for error messages.
+
+        Returns:
+            A dict mapping positive bucket-length ints to ``Path``, or
+            ``None``.
+
+        Raises:
+            ValueError: If ``value`` is not a non-empty mapping, or any
+                key is not a positive integer.
+        """
+        entry_id = info.data.get("id", "<unknown>")
+        return _coerce_bucket_path_map(value, entry_id=entry_id, field="batch_artifacts")
 
     @model_validator(mode="after")
     def _finalize(self) -> ModelEntry:
-        """Check completeness, reject reranker-with-``normalize``, derive ``output_name``.
+        """Check completeness, cross-field constraints, and derive ``output_name``.
 
         Raises:
             ValueError: If ``kind``/``tokenizer``/``artifacts`` are still
-                unset (neither configured nor resolved from the cache), or
-                if ``normalize`` was explicitly set on a
-                ``kind="reranker"`` entry.
+                unset (neither configured nor resolved from the cache); if
+                ``normalize`` was explicitly set on a ``kind="reranker"``
+                entry; if ``batch_artifacts`` was set on a
+                ``kind="reranker"`` entry; or if ``batch_artifacts``
+                contains a bucket that is not one of ``artifacts``'
+                buckets.
 
         Returns:
             ``self``, with ``output_name`` filled in from ``kind`` when it
@@ -252,6 +351,18 @@ class ModelEntry(BaseModel):
             raise ValueError(
                 f"model '{self.id}': 'normalize' may only be set on kind='embedding' entries"
             )
+        if self.batch_artifacts is not None:
+            if self.kind == "reranker":
+                raise ValueError(
+                    f"model '{self.id}': 'batch_artifacts' may only be set on "
+                    "kind='embedding' entries"
+                )
+            unknown_buckets = sorted(set(self.batch_artifacts) - set(self.buckets))
+            if unknown_buckets:
+                raise ValueError(
+                    f"model '{self.id}': batch_artifacts bucket(s) {unknown_buckets} are not "
+                    f"among the configured artifacts buckets {list(self.buckets)}"
+                )
         if self.output_name is None:
             self.output_name = "embedding" if self.kind == "embedding" else "logits"
         return self
@@ -722,6 +833,12 @@ def _resolve_relative_paths(raw: dict[str, Any], *, base_dir: Path) -> None:
                 if isinstance(artifact_path, str):
                     artifacts[bucket_key] = _resolve_one_path(base_dir, artifact_path)
 
+        batch_artifacts = entry.get("batch_artifacts")
+        if isinstance(batch_artifacts, dict):
+            for bucket_key, artifact_path in list(batch_artifacts.items()):
+                if isinstance(artifact_path, str):
+                    batch_artifacts[bucket_key] = _resolve_one_path(base_dir, artifact_path)
+
 
 def _resolve_one_path(base_dir: Path, value: str, *, expand_user: bool = False) -> Path:
     """Resolve a single possibly-relative path string against ``base_dir``.
@@ -802,9 +919,17 @@ def _fill_entry_from_cache(entry: dict[str, Any], model_id: str, cache_root: Pat
 
     Raises:
         ConfigError: If the model is not in the cache, its record is
-            unreadable/malformed, or the record contradicts a field the
-            entry states explicitly. Messages are written without the
-            config-file context, which the caller adds.
+            unreadable/malformed, the record contradicts a field the
+            entry states explicitly, or the entry sets ``batch_artifacts``
+            without also stating ``artifacts`` explicitly. Messages are
+            written without the config-file context, which the caller
+            adds.
+
+    Note:
+        An entry whose artifacts come from the cache also gains the
+        batched artifacts the record names for the buckets it loads, so a
+        model compiled for both is served with both without the config
+        file having to spell anything out.
     """
     model_dir = model_cache_dir(cache_root, model_id)
     try:
@@ -849,9 +974,23 @@ def _fill_entry_from_cache(entry: dict[str, Any], model_id: str, cache_root: Pat
         )
 
     if entry.get("artifacts") is None:
+        if entry.get("batch_artifacts") is not None:
+            # batch_artifacts pairs each bucket with a specific compiled
+            # artifact, so it only makes sense alongside an explicit
+            # artifacts table; an id-only entry cannot supply one.
+            raise ConfigError(
+                "'batch_artifacts' requires explicit 'artifacts' (an id-only entry resolved "
+                "from the compiled-model cache cannot use 'batch_artifacts')"
+            )
         artifacts, excluded = _cached_artifacts(info, model_dir)
         entry["artifacts"] = artifacts
         entry["excluded_buckets"] = excluded
+        # Batched artifacts are served for embedding models only, and only
+        # for the buckets that are actually loaded, so a bucket the record
+        # recommends against is dropped here rather than rejected later.
+        batched = _cached_batch_artifacts(info, model_dir, artifacts) if kind == "embedding" else {}
+        if batched:
+            entry["batch_artifacts"] = batched
 
     if entry.get("output_name") is None:
         output_name = info.get("output_name")
@@ -930,6 +1069,65 @@ def _cached_artifacts(
             f"compiled (available: {sorted(artifacts)})"
         )
     return selected, sorted(set(artifacts) - set(selected))
+
+
+def _cached_batch_artifacts(
+    info: Mapping[str, Any], model_dir: Path, artifacts: Mapping[int, Path]
+) -> dict[int, Path]:
+    """Pick the batched artifacts to load from a cache record.
+
+    Args:
+        info: Parsed ``model_info.json`` contents.
+        model_dir: Directory the record lives in; artifact file names are
+            recorded relative to it.
+        artifacts: Artifacts the entry is served with, i.e. the buckets a
+            batched artifact can be paired with.
+
+    Returns:
+        Bucket -> batched artifact path for every recorded bucket that is
+        among ``artifacts``' own. Empty when the record carries no batched
+        table at all, and when none of its buckets is loaded: a batched
+        artifact only ever accelerates a bucket that is served anyway.
+
+    Raises:
+        ConfigError: If the recorded table is not a table of bucket
+            lengths, or names a file outside the record's own directory.
+    """
+    record = f"'{model_dir / MODEL_INFO_FILENAME}'"
+    recorded = info.get(BATCH_ARTIFACTS_RECORD_KEY)
+    if recorded is None:
+        return {}
+    if not isinstance(recorded, dict):
+        raise ConfigError(f"{record} has an unusable '{BATCH_ARTIFACTS_RECORD_KEY}' table")
+
+    family = recorded.get(str(BATCH_ARTIFACT_BATCH_SIZE))
+    if family is None:
+        # The record describes other batch sizes only (or none): nothing
+        # this release can serve, which is not an error.
+        return {}
+    if not isinstance(family, dict):
+        raise ConfigError(
+            f"{record} has an unusable '{BATCH_ARTIFACTS_RECORD_KEY}' entry for batch size "
+            f"{BATCH_ARTIFACT_BATCH_SIZE}"
+        )
+
+    batched: dict[int, Path] = {}
+    for raw_key, raw_name in family.items():
+        try:
+            bucket = int(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"{record} has {BATCH_ARTIFACTS_RECORD_KEY} key '{raw_key}', which is not a "
+                "bucket length"
+            ) from exc
+        if bucket not in artifacts:
+            # A bucket that is not loaded (e.g. one the record recommends
+            # against) has nothing to accelerate.
+            continue
+        batched[bucket] = _cache_relative_path(
+            model_dir, raw_name, field=BATCH_ARTIFACTS_RECORD_KEY
+        )
+    return batched
 
 
 def _cache_relative_path(model_dir: Path, value: Any, *, field: str) -> Path:
