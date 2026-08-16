@@ -26,11 +26,14 @@ deterministic stub without touching ``eeane.server``.
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -72,6 +75,14 @@ _Batch = TypeVar("_Batch", EmbeddingBatch, RerankBatch)
 # Identity two requests must share to be served from one computation:
 # the model kind, the model id and the digest of the request's texts.
 _RequestKey = tuple[str, str, str]
+
+# Threads the engine tokenizes ahead on. One request reads one input
+# ahead, so two workers let two requests overlap their tokenization with
+# a prediction without the pool ever growing with the load.
+_TOKENIZE_WORKERS = 2
+
+# Name prefix of those threads, so they are recognizable in a stack dump.
+_TOKENIZE_THREAD_PREFIX = "eeane-tokenize"
 
 
 def _load_compiled(path: Path) -> Any:
@@ -140,6 +151,156 @@ def _reclaim_memory(dropped: list[_ServedModel]) -> None:
     gc.collect()
 
 
+@dataclass(frozen=True)
+class _TokenizedInput:
+    """One request input, tokenized and routed to its bucket.
+
+    Attributes:
+        inputs: ``input_ids``/``attention_mask`` arrays of shape
+            ``(1, S)``, dtype int32, padded to :attr:`bucket`.
+        bucket: Sequence-length bucket the input was routed to, i.e. the
+            compiled artifact that has to predict it.
+        n_tokens: Token count before truncation, as the request's token
+            accounting reports it.
+        truncated: Whether the input did not fit into the largest bucket.
+    """
+
+    inputs: dict[str, np.ndarray]
+    bucket: int
+    n_tokens: int
+    truncated: bool
+
+
+class _TokenizeAhead:
+    """Hands one request's inputs out tokenized, one prediction ahead.
+
+    A request is predicted one input at a time under the process-wide
+    prediction lock, so tokenizing inline leaves the tokenizer idle for
+    the whole of every prediction and makes every input pay for its own
+    tokenization. Here the tokenization of input ``i + 1`` is started on
+    a worker thread *before* input ``i`` is predicted, so every
+    tokenization of a request but the first runs while the compute unit
+    is busy.
+
+    The read-ahead depth is one: at most one tokenization is ever
+    pending, which is all a strictly ordered one-at-a-time prediction
+    loop can hide, and it keeps the extra memory a request holds down to
+    a single tokenized input. Inputs are handed out in request order and
+    each is tokenized exactly once, so a request's results are the ones
+    an inline loop would produce, prediction for prediction.
+
+    The worker takes the model's tokenizer lock, exactly as an inline
+    tokenization would, and takes no other lock; the request thread holds
+    no lock while waiting for a worker. The engine's lock order is
+    therefore untouched.
+
+    Instances are used as a context manager by the one thread serving the
+    request. Leaving the block gives up whatever is still pending, which
+    is what keeps a worker from touching the tokenizer of a model the
+    request has already let go of.
+    """
+
+    def __init__(
+        self,
+        tokenize: Callable[[int], _TokenizedInput],
+        count: int,
+        executor: Executor | None,
+    ) -> None:
+        """Register a read-ahead that has tokenized nothing yet.
+
+        Args:
+            tokenize: Tokenizes the input at the index it is given. It is
+                called once per input, from a worker thread while reading
+                ahead and from the request's own thread otherwise.
+            count: Number of inputs the request carries, at least one.
+            executor: Workers the tokenizations run on, or ``None`` to
+                tokenize every input inline, which is what a request with
+                nothing to read ahead of does.
+        """
+        self._tokenize = tokenize
+        self._count = count
+        self._executor = executor
+        # Index of the next input to hand out, and of the next one to
+        # start tokenizing: they differ by the one pending tokenization.
+        self._taken = 0
+        self._started = 0
+        self._pending: Future[_TokenizedInput] | None = None
+
+    def __enter__(self) -> _TokenizeAhead:
+        """Start the first input's tokenization and return the read-ahead."""
+        self._start_next()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Finish or give up the pending tokenization, whatever happened."""
+        self.close()
+
+    def take(self) -> _TokenizedInput:
+        """Return the next input in request order, tokenized.
+
+        Returns:
+            The tokenized input, once its tokenization has finished. The
+            input after it is started before returning, so it is
+            tokenized while the caller predicts this one.
+
+        Raises:
+            Exception: Whatever tokenizing this input raised, in the
+                caller's thread and at the point the input is needed, so
+                a failure reads exactly as an inline tokenization's does.
+        """
+        index = self._taken
+        self._taken += 1
+        pending = self._pending
+        if pending is None:
+            # Nothing was read ahead (no workers, or nothing left to read
+            # ahead of): tokenize here, as an inline loop would.
+            return self._tokenize(index)
+        self._pending = None
+        current = pending.result()
+        self._start_next()
+        return current
+
+    def close(self) -> None:
+        """Give up the tokenization that is still pending, if any.
+
+        A tokenization that has not started is cancelled; one that is
+        already running is waited for, because it holds the model's
+        tokenizer and the request must not let go of the model while a
+        worker is still using it. Whatever a given-up tokenization raised
+        is dropped: nothing will ever look at its result, and it must not
+        mask the reason the request is being torn down.
+
+        Idempotent, so a request can close a read-ahead it has already
+        drained.
+        """
+        pending = self._pending
+        self._pending = None
+        # Nothing may be started from here on: this is the point after
+        # which the request is free to release the model.
+        self._started = self._count
+        if pending is None:
+            return
+        if not pending.cancel():
+            with contextlib.suppress(BaseException):
+                pending.result()
+
+    def _start_next(self) -> None:
+        """Start tokenizing the input after the ones already started."""
+        if self._executor is None or self._started >= self._count:
+            return
+        index = self._started
+        try:
+            self._pending = self._executor.submit(self._tokenize, index)
+        except RuntimeError:
+            # The workers were stopped (the engine was closed, possibly
+            # underneath this request): fall back to tokenizing inline,
+            # which serves the request exactly as an unpipelined loop
+            # would, just without hiding the tokenization.
+            self._executor = None
+            return
+        self._started = index + 1
+
+
 def _policies_from_config(config: EeaneConfig) -> dict[str, ModelPolicy]:
     """Read every served entry's effective load policy and idle delay.
 
@@ -171,11 +332,14 @@ class CoreMLEngine:
     entry's artifacts are checked in ``__init__`` whatever its policy, so
     a broken deployment fails at start-up rather than on a first request.
 
-    Requests are served one input at a time, and identical requests --
-    same kind, same model, same texts in the same order -- that overlap
-    in time are served from a single computation when coalescing is on.
-    A request may carry a deadline: it is honoured while the request
-    waits, and no longer once its first prediction has started.
+    Requests are served one input at a time, with the next input of a
+    request tokenized on a worker thread while the current one is being
+    predicted, so all but its first tokenization happen while the compute
+    unit is busy. Identical requests -- same kind, same model, same texts
+    in the same order -- that overlap in time are served from a single
+    computation when coalescing is on. A request may carry a deadline: it
+    is honoured while the request waits, and no longer once its first
+    prediction has started.
 
     Four locks are held, and the order they may be taken in is fixed to
     keep the engine deadlock-free:
@@ -199,7 +363,11 @@ class CoreMLEngine:
       the order above.
 
     Tokenizer calls take one lock per model instead, since the mutable
-    state they protect belongs to a single tokenizer.
+    state they protect belongs to a single tokenizer. That holds for the
+    tokenizations read ahead on a worker thread too: a worker takes the
+    model's tokenizer lock and nothing else, and a thread waiting for a
+    worker holds no lock at all, so reading ahead adds no edge to the
+    order above.
     """
 
     def __init__(
@@ -301,6 +469,14 @@ class CoreMLEngine:
         self._inflight_lock = threading.Lock()
         self._stopping = threading.Event()
         self._sweeper: threading.Thread | None = None
+        # One pool for the engine's whole life: a request reads one input
+        # ahead, so it needs no thread of its own, and a pool built per
+        # request would spend on thread creation what reading ahead saves.
+        # Threads are only started when a request first submits to it, so
+        # an engine that never reads ahead stays a single-threaded one.
+        self._tokenize_pool = ThreadPoolExecutor(
+            max_workers=_TOKENIZE_WORKERS, thread_name_prefix=_TOKENIZE_THREAD_PREFIX
+        )
 
         for managed in self._models.values():
             if managed.policy.load_policy == "resident":
@@ -331,12 +507,13 @@ class CoreMLEngine:
         )
 
     def close(self) -> None:
-        """Stop the background idle sweeper, if one is running.
+        """Stop the engine's background threads, if any are running.
 
         Idempotent, and safe to call on an engine that never started a
-        sweeper. Loaded models are left in memory: the engine can still
-        answer requests afterwards, it just stops unloading idle models
-        on its own.
+        sweeper nor tokenized anything ahead. Loaded models are left in
+        memory: the engine can still answer requests afterwards, it just
+        stops unloading idle models on its own and tokenizes each input
+        inline instead of one input ahead.
         """
         self._stopping.set()
         sweeper = self._sweeper
@@ -345,6 +522,10 @@ class CoreMLEngine:
             # The sweeper waits on the event, so it wakes immediately;
             # joining keeps a caller from racing a sweep it has stopped.
             sweeper.join()
+        # Waited for rather than abandoned: a tokenization that is still
+        # running holds a model's tokenizer, so the engine is only really
+        # stopped once no worker can touch one any more.
+        self._tokenize_pool.shutdown(wait=True)
 
     def default_model_id(self, kind: str) -> str | None:
         """Return the id used when a request names no model of ``kind``.
@@ -487,28 +668,31 @@ class CoreMLEngine:
         truncated_indices: list[int] = []
         served = self._acquire(managed)
         try:
-            for index, text in enumerate(texts):
-                with served.tokenizer_lock:
-                    n_tokens = runtime.count_text_tokens(served.tokenizer, text)
-                    bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
-                    inputs = runtime.tokenize_texts(served.tokenizer, [text], bucket)
-                output = self._predict(
-                    served.compiled[bucket],
-                    inputs,
-                    served.output_name,
-                    lock_timeout=self._lock_timeout(deadline, index),
-                )
-                # Checked outside the prediction lock: an unusable answer
-                # must not hold up the requests queueing behind it.
-                _require_finite(output, served.id, bucket)
-                rows.append(output)
-                # attention_mask counts the tokens the model really
-                # consumed, i.e. n_tokens capped at the bucket size.
-                used_tokens.append(int(inputs["attention_mask"].sum()))
-                orig_tokens.append(n_tokens)
-                buckets.append(bucket)
-                if truncated:
-                    truncated_indices.append(index)
+            # Inside the acquired model and left before it is released, so
+            # no worker can be tokenizing against a model this request has
+            # already let go of -- however the request ends.
+            with self._tokenize_ahead(
+                lambda index: self._tokenize_text(served, texts[index]), len(texts)
+            ) as ahead:
+                for index in range(len(texts)):
+                    current = ahead.take()
+                    output = self._predict(
+                        served.compiled[current.bucket],
+                        current.inputs,
+                        served.output_name,
+                        lock_timeout=self._lock_timeout(deadline, index),
+                    )
+                    # Checked outside the prediction lock: an unusable answer
+                    # must not hold up the requests queueing behind it.
+                    _require_finite(output, served.id, current.bucket)
+                    rows.append(output)
+                    # attention_mask counts the tokens the model really
+                    # consumed, i.e. n_tokens capped at the bucket size.
+                    used_tokens.append(int(current.inputs["attention_mask"].sum()))
+                    orig_tokens.append(current.n_tokens)
+                    buckets.append(current.bucket)
+                    if current.truncated:
+                        truncated_indices.append(index)
         finally:
             self._release(managed)
 
@@ -614,24 +798,25 @@ class CoreMLEngine:
         truncated_indices: list[int] = []
         served = self._acquire(managed)
         try:
-            for index, document in enumerate(documents):
-                with served.tokenizer_lock:
-                    n_tokens = runtime.count_pair_tokens(served.tokenizer, query, document)
-                    bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
-                    inputs = runtime.tokenize_pairs(served.tokenizer, [(query, document)], bucket)
-                output = self._predict(
-                    served.compiled[bucket],
-                    inputs,
-                    served.output_name,
-                    lock_timeout=self._lock_timeout(deadline, index),
-                )
-                _require_finite(output, served.id, bucket)
-                # The reranker head emits a single logit per pair.
-                logits.append(float(output[0]))
-                used_tokens.append(int(inputs["attention_mask"].sum()))
-                orig_tokens.append(n_tokens)
-                if truncated:
-                    truncated_indices.append(index)
+            # Bounded by the acquired model, as in _embed_texts().
+            with self._tokenize_ahead(
+                lambda index: self._tokenize_pair(served, query, documents[index]), len(documents)
+            ) as ahead:
+                for index in range(len(documents)):
+                    current = ahead.take()
+                    output = self._predict(
+                        served.compiled[current.bucket],
+                        current.inputs,
+                        served.output_name,
+                        lock_timeout=self._lock_timeout(deadline, index),
+                    )
+                    _require_finite(output, served.id, current.bucket)
+                    # The reranker head emits a single logit per pair.
+                    logits.append(float(output[0]))
+                    used_tokens.append(int(current.inputs["attention_mask"].sum()))
+                    orig_tokens.append(current.n_tokens)
+                    if current.truncated:
+                        truncated_indices.append(index)
         finally:
             self._release(managed)
 
@@ -641,6 +826,63 @@ class CoreMLEngine:
             orig_tokens=orig_tokens,
             truncated_indices=truncated_indices,
         )
+
+    def _tokenize_ahead(
+        self, tokenize: Callable[[int], _TokenizedInput], count: int
+    ) -> _TokenizeAhead:
+        """Build the read-ahead one request takes its tokenized inputs from.
+
+        Args:
+            tokenize: Tokenizes the request's input at the index it is
+                given.
+            count: Number of inputs the request carries, at least one.
+
+        Returns:
+            A read-ahead over those inputs, to be used as a context
+            manager so a pending tokenization is always finished or given
+            up before the request releases its model.
+        """
+        # A single-input request has nothing to read ahead of: it is
+        # served inline, which spares it a hand-off it could not profit
+        # from and keeps the common one-text request thread-free.
+        executor = self._tokenize_pool if count > 1 else None
+        return _TokenizeAhead(tokenize, count, executor)
+
+    def _tokenize_text(self, served: _ServedModel, text: str) -> _TokenizedInput:
+        """Route and tokenize one embedding input under its tokenizer lock.
+
+        Runs on a read-ahead worker or on the request's own thread; the
+        lock is what makes either safe.
+
+        Args:
+            served: Loaded model serving the request.
+            text: One input text of the request.
+
+        Returns:
+            The model inputs for that text and the routing they imply.
+        """
+        with served.tokenizer_lock:
+            n_tokens = runtime.count_text_tokens(served.tokenizer, text)
+            bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
+            inputs = runtime.tokenize_texts(served.tokenizer, [text], bucket)
+        return _TokenizedInput(inputs=inputs, bucket=bucket, n_tokens=n_tokens, truncated=truncated)
+
+    def _tokenize_pair(self, served: _ServedModel, query: str, document: str) -> _TokenizedInput:
+        """Route and tokenize one rerank pair under its tokenizer lock.
+
+        Args:
+            served: Loaded reranker serving the request.
+            query: Query text of every pair of the request.
+            document: One candidate document of the request.
+
+        Returns:
+            The model inputs for that pair and the routing they imply.
+        """
+        with served.tokenizer_lock:
+            n_tokens = runtime.count_pair_tokens(served.tokenizer, query, document)
+            bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
+            inputs = runtime.tokenize_pairs(served.tokenizer, [(query, document)], bucket)
+        return _TokenizedInput(inputs=inputs, bucket=bucket, n_tokens=n_tokens, truncated=truncated)
 
     def _check_deadline(self, deadline: float | None) -> None:
         """Reject a request whose deadline has already passed.
