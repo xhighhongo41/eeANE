@@ -27,8 +27,8 @@ from fastapi.testclient import TestClient
 
 from eeane import runtime
 from eeane.config import EeaneConfig
-from eeane.engine import EmbeddingBatch, RerankBatch
-from eeane.server import HealthRateLimiter, create_app
+from eeane.engine import EmbeddingBatch, NonFiniteOutputError, QueueTimeoutError, RerankBatch
+from eeane.server import AdmissionController, HealthRateLimiter, create_app
 
 # API key used by the authenticated fixtures below (test-only value).
 _API_KEY = "unit-test-api-key"
@@ -61,7 +61,9 @@ class FakeClock:
 class TruncatingStubEngine(StubEngine):
     """Stub reporting every input as truncated, to exercise the warning path."""
 
-    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
         """Pretend each text exceeded the largest bucket and was cut down to it."""
         batch = super().embed(texts, model_id)
         batch.orig_tokens = [2000] * len(texts)
@@ -70,7 +72,14 @@ class TruncatingStubEngine(StubEngine):
         batch.truncated_indices = list(range(len(texts)))
         return batch
 
-    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
         """Pretend each pair exceeded the reranker bucket and was cut down to it."""
         batch = super().rerank(query, documents, model_id)
         batch.orig_tokens = [2000] * len(documents)
@@ -117,12 +126,21 @@ class CallCountingStubEngine(StubEngine):
         self.embed_calls = 0
         self.rerank_calls = 0
 
-    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
         """Count the call, then serve it as :class:`StubEngine` would."""
         self.embed_calls += 1
         return super().embed(texts, model_id)
 
-    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
         """Count the call, then serve it as :class:`StubEngine` would."""
         self.rerank_calls += 1
         return super().rerank(query, documents, model_id)
@@ -139,6 +157,105 @@ class CloseRecordingStubEngine(StubEngine):
     def close(self) -> None:
         """Record that shutdown reached this engine."""
         self.closed = True
+
+
+class RaisingStubEngine(StubEngine):
+    """Stub whose embed()/rerank() raise an unrelated error (admission-release test)."""
+
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
+        """Fail unconditionally, as an unexpected engine error would."""
+        raise RuntimeError("stub engine failure")
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
+        """Fail unconditionally, as an unexpected engine error would."""
+        raise RuntimeError("stub engine failure")
+
+
+class DeadlineRecordingStubEngine(StubEngine):
+    """Stub recording every ``deadline`` it is called with.
+
+    Attributes:
+        embed_deadlines: ``deadline`` argument of every :meth:`embed`
+            call, in call order.
+        rerank_deadlines: ``deadline`` argument of every :meth:`rerank`
+            call, in call order.
+    """
+
+    def __init__(self, config: EeaneConfig) -> None:
+        """Register the configured models and start with no recorded calls."""
+        super().__init__(config)
+        self.embed_deadlines: list[float | None] = []
+        self.rerank_deadlines: list[float | None] = []
+
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
+        """Record ``deadline``, then serve the call as :class:`StubEngine` would."""
+        self.embed_deadlines.append(deadline)
+        return super().embed(texts, model_id)
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
+        """Record ``deadline``, then serve the call as :class:`StubEngine` would."""
+        self.rerank_deadlines.append(deadline)
+        return super().rerank(query, documents, model_id)
+
+
+class QueueTimeoutStubEngine(StubEngine):
+    """Stub whose embed()/rerank() always raise QueueTimeoutError."""
+
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
+        """Report that the request's deadline passed before inference started."""
+        raise QueueTimeoutError("request timed out before inference started")
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
+        """Report that the request's deadline passed before inference started."""
+        raise QueueTimeoutError("request timed out before inference started")
+
+
+class NonFiniteOutputStubEngine(StubEngine):
+    """Stub whose embed()/rerank() always raise NonFiniteOutputError."""
+
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
+        """Report a non-finite output for the resolved embedding model."""
+        raise NonFiniteOutputError(model_id or _EMBEDDING_ID, 128)
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
+        """Report a non-finite output for the resolved reranker model."""
+        raise NonFiniteOutputError(model_id or _RERANKER_ID, 512)
 
 
 @pytest.fixture
@@ -1144,3 +1261,196 @@ def test_disabled_model_is_hidden_and_returns_404(caplog: pytest.LogCaptureFixtu
         if record.name == "eeane.server" and record.levelname == "INFO"
     ]
     assert any(_SECOND_EMBEDDING_ID in message and "disabled" in message for message in messages)
+
+
+# --- AdmissionController (unit) ---------------------------------------------
+
+
+def test_admission_controller_blocks_at_the_limit_and_allows_after_leave() -> None:
+    """try_enter() must refuse once the limit is reached and allow again after leave()."""
+    controller = AdmissionController(2)
+
+    assert controller.try_enter() is True
+    assert controller.try_enter() is True
+    assert controller.try_enter() is False
+
+    controller.leave()
+
+    assert controller.try_enter() is True
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_admission_controller_is_unlimited_for_non_positive_limits(limit: int) -> None:
+    """A limit of zero (or lower) must let every request through."""
+    controller = AdmissionController(limit)
+
+    assert all(controller.try_enter() for _ in range(1000))
+
+    # The gauge still counts admitted requests, and leaving balances it.
+    assert controller.pending == 1000
+    for _ in range(1000):
+        controller.leave()
+    assert controller.pending == 0
+
+
+# --- request admission control (HTTP) ---------------------------------------
+
+
+def test_admission_returns_429_when_capacity_is_reached() -> None:
+    """A full admission controller must reject inference requests with 429."""
+    config = make_config(normalize=False)
+    config.server.max_pending_requests = 1
+    app = create_app(config, engine=StubEngine(config))
+
+    with TestClient(app) as test_client:
+        # Occupy the only slot directly, bypassing the HTTP layer.
+        assert test_client.app.state.admission.try_enter() is True
+
+        response = test_client.post("/v1/embeddings", json={"input": "hello"})
+
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "5"
+        assert "1" in response.json()["detail"]
+
+
+def test_admission_at_capacity_still_serves_health_and_models() -> None:
+    """/health and /models must stay reachable even when inference is at capacity."""
+    config = make_config(normalize=False)
+    config.server.max_pending_requests = 1
+    app = create_app(config, engine=StubEngine(config))
+
+    with TestClient(app) as test_client:
+        assert test_client.app.state.admission.try_enter() is True
+
+        health_response = test_client.get("/health")
+        models_response = test_client.get("/models")
+
+    assert health_response.status_code == 200
+    assert models_response.status_code == 200
+
+
+def test_admission_releases_after_a_successful_request() -> None:
+    """A successful request must release its admission slot."""
+    config = make_config(normalize=False)
+    config.server.max_pending_requests = 1
+    app = create_app(config, engine=StubEngine(config))
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/embeddings", json={"input": "hello"})
+
+        assert response.status_code == 200
+        assert test_client.app.state.admission.pending == 0
+
+
+def test_admission_releases_when_the_engine_raises_unexpectedly() -> None:
+    """An unhandled engine error must still release the admission slot."""
+    config = make_config(normalize=False)
+    config.server.max_pending_requests = 1
+    engine = RaisingStubEngine(config)
+    app = create_app(config, engine=engine)
+
+    with TestClient(app) as test_client:
+        with pytest.raises(RuntimeError):
+            test_client.post("/v1/embeddings", json={"input": "hello"})
+
+        assert test_client.app.state.admission.pending == 0
+
+
+def test_failed_auth_does_not_consume_admission_capacity() -> None:
+    """A 401 (failed auth) must not occupy an admission slot."""
+    config = make_config(normalize=False, api_key=_API_KEY)
+    config.server.max_pending_requests = 1
+    app = create_app(config, engine=StubEngine(config))
+
+    with TestClient(app) as test_client:
+        unauthorized = test_client.post("/v1/embeddings", json={"input": "hello"})
+        assert unauthorized.status_code == 401
+
+        # If the 401 above had consumed the only slot, this would 429.
+        authorized = test_client.post(
+            "/v1/embeddings",
+            json={"input": "hello"},
+            headers={"Authorization": f"Bearer {_API_KEY}"},
+        )
+        assert authorized.status_code == 200
+
+
+# --- queue timeout / non-finite output --------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/v1/embeddings", "/rerank"], ids=["embeddings", "rerank"])
+def test_queue_timeout_returns_503_with_retry_after(path: str) -> None:
+    """A QueueTimeoutError from the engine must become 503 with Retry-After."""
+    config = make_config(normalize=False)
+    engine = QueueTimeoutStubEngine(config)
+    app = create_app(config, engine=engine)
+    body = {"input": "hello"} if path == "/v1/embeddings" else {"query": "q", "documents": ["a"]}
+
+    with TestClient(app) as test_client:
+        response = test_client.post(path, json=body)
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert "timed out" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("path", ["/v1/embeddings", "/rerank"], ids=["embeddings", "rerank"])
+def test_non_finite_output_returns_500_and_logs_error(
+    path: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A NonFiniteOutputError from the engine must become 500 and log an ERROR."""
+    config = make_config(normalize=False)
+    engine = NonFiniteOutputStubEngine(config)
+    app = create_app(config, engine=engine)
+    body = {"input": "hello"} if path == "/v1/embeddings" else {"query": "q", "documents": ["a"]}
+    expected_id = _EMBEDDING_ID if path == "/v1/embeddings" else _RERANKER_ID
+
+    with caplog.at_level(logging.ERROR, logger="eeane.server"), TestClient(app) as test_client:
+        response = test_client.post(path, json=body)
+
+    assert response.status_code == 500
+    assert expected_id in response.json()["detail"]
+    errors = [
+        record
+        for record in caplog.records
+        if record.name == "eeane.server" and record.levelname == "ERROR"
+    ]
+    assert len(errors) == 1
+    assert expected_id in errors[0].getMessage()
+
+
+# --- deadline propagation ----------------------------------------------------
+
+
+def test_deadline_is_none_when_queue_timeout_is_disabled() -> None:
+    """queue_timeout=0 must reach the engine as a deadline of None."""
+    config = make_config(normalize=False)
+    config.server.queue_timeout = 0
+    engine = DeadlineRecordingStubEngine(config)
+    app = create_app(config, engine=engine)
+
+    with TestClient(app) as test_client:
+        embeddings_response = test_client.post("/v1/embeddings", json={"input": "hello"})
+        rerank_response = test_client.post("/rerank", json={"query": "q", "documents": ["a"]})
+
+    assert embeddings_response.status_code == 200
+    assert rerank_response.status_code == 200
+    assert engine.embed_deadlines == [None]
+    assert engine.rerank_deadlines == [None]
+
+
+def test_deadline_is_set_when_queue_timeout_is_enabled() -> None:
+    """A positive queue_timeout must reach the engine as a non-None deadline."""
+    config = make_config(normalize=False)
+    config.server.queue_timeout = 60
+    engine = DeadlineRecordingStubEngine(config)
+    app = create_app(config, engine=engine)
+
+    with TestClient(app) as test_client:
+        embeddings_response = test_client.post("/v1/embeddings", json={"input": "hello"})
+        rerank_response = test_client.post("/rerank", json={"query": "q", "documents": ["a"]})
+
+    assert embeddings_response.status_code == 200
+    assert rerank_response.status_code == 200
+    assert engine.embed_deadlines[0] is not None
+    assert engine.rerank_deadlines[0] is not None

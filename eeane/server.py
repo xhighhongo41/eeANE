@@ -40,7 +40,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from eeane import __version__, runtime
 from eeane.cli import main as cli_main
 from eeane.config import EeaneConfig, ModelEntry
-from eeane.engine import CoreMLEngine, InferenceEngine
+from eeane.engine import CoreMLEngine, InferenceEngine, NonFiniteOutputError, QueueTimeoutError
 from eeane.schemas import (
     EmbeddingObject,
     EmbeddingsRequest,
@@ -69,6 +69,11 @@ _RATE_LIMIT_WINDOW_SECONDS = 60
 # exceeded, entries of past windows are dropped so a spoofed-IP flood
 # cannot grow the counter dict without bound.
 _MAX_TRACKED_CLIENTS = 1024
+
+# Seconds suggested to a rejected/timed-out client before it retries, sent
+# as the Retry-After header on both the 429 (admission cap) and 503
+# (queue timeout) responses.
+_RETRY_AFTER_SECONDS = 5
 
 
 class HealthRateLimiter:
@@ -135,6 +140,56 @@ class HealthRateLimiter:
         self._counters = {
             client_ip: entry for client_ip, entry in self._counters.items() if entry[0] == window
         }
+
+
+class AdmissionController:
+    """Caps the number of inference requests accepted at once.
+
+    Every protected inference route enters the controller through the
+    ``_admission`` dependency before it runs and leaves it once its
+    response (or an error) is ready, so ``pending`` always reflects
+    requests that are either waiting for the engine or already running.
+    Follows the same in-memory, ``threading.Lock``-guarded style as
+    :class:`HealthRateLimiter`.
+    """
+
+    def __init__(self, limit: int) -> None:
+        """Initialize an empty controller.
+
+        Args:
+            limit: Maximum number of requests admitted at once. Zero (or
+                any non-positive value) disables the cap.
+        """
+        self._limit = limit
+        self._pending = 0
+        self._lock = threading.Lock()
+
+    @property
+    def pending(self) -> int:
+        """Number of requests currently admitted and not yet released."""
+        with self._lock:
+            return self._pending
+
+    def try_enter(self) -> bool:
+        """Admit one request if the configured cap has not been reached.
+
+        Returns:
+            ``True`` if the request is admitted (the caller must later
+            call :meth:`leave` exactly once), ``False`` if the cap is
+            already reached.
+        """
+        with self._lock:
+            if self._limit > 0 and self._pending >= self._limit:
+                return False
+            # Counted even when the cap is disabled, so ``pending`` stays
+            # an accurate gauge and every leave() has a matching entry.
+            self._pending += 1
+            return True
+
+    def leave(self) -> None:
+        """Release one request previously admitted by :meth:`try_enter`."""
+        with self._lock:
+            self._pending -= 1
 
 
 def _unauthorized(detail: str) -> HTTPException:
@@ -224,6 +279,26 @@ def _log_served_models(config: EeaneConfig) -> None:
         )
 
 
+def _log_admission_control(config: EeaneConfig) -> None:
+    """Report the request-admission settings at startup, in one INFO line.
+
+    Args:
+        config: Resolved configuration. ``server.max_pending_requests``
+            of ``0`` is reported as "unlimited" and ``server.queue_timeout``
+            of ``0`` as "disabled", matching what those values mean.
+    """
+    max_pending = config.server.max_pending_requests
+    max_pending_desc = "unlimited" if max_pending <= 0 else str(max_pending)
+    timeout = config.server.queue_timeout
+    timeout_desc = "disabled" if timeout <= 0 else f"{timeout}s"
+    logger.info(
+        "admission control: max_pending_requests=%s, queue_timeout=%s, request coalescing=%s",
+        max_pending_desc,
+        timeout_desc,
+        "on" if config.server.coalesce_requests else "off",
+    )
+
+
 def _format_buckets(buckets: Sequence[int]) -> str:
     """Summarize per-input bucket usage for the request log.
 
@@ -310,6 +385,44 @@ def _resolve_entry(config: EeaneConfig, kind: str, requested: str | None) -> Mod
     return entry
 
 
+def _compute_deadline(request: Request, config: EeaneConfig) -> float | None:
+    """Compute the absolute deadline this request's inference call may run until.
+
+    Args:
+        request: Current request; ``request.state.admitted_at`` must
+            already hold the ``time.monotonic()`` reading of when the
+            request was admitted (set by the ``_admission`` dependency).
+        config: Resolved configuration; only ``server.queue_timeout`` is
+            read.
+
+    Returns:
+        The ``time.monotonic()`` reading past which the request must
+        give up, or ``None`` when ``server.queue_timeout`` is disabled
+        (``0``), meaning the request may wait indefinitely.
+    """
+    timeout = config.server.queue_timeout
+    if timeout <= 0:
+        return None
+    return request.state.admitted_at + timeout
+
+
+def _queue_timeout_response(detail: str) -> HTTPException:
+    """Build the 503 raised when a request's queue wait times out.
+
+    Args:
+        detail: Human-readable reason placed in the JSON body.
+
+    Returns:
+        A 503 ``HTTPException`` carrying a ``Retry-After`` header so a
+        well-behaved client backs off before retrying.
+    """
+    return HTTPException(
+        status_code=503,
+        detail=detail,
+        headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
+    )
+
+
 def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> FastAPI:
     """Build the eeANE FastAPI application for a resolved configuration.
 
@@ -357,6 +470,42 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
 
     auth = [Depends(require_api_key)]
 
+    async def _admission(request: Request) -> AsyncIterator[None]:
+        """Admit an inference request under ``server.max_pending_requests``.
+
+        Also stamps ``request.state.admitted_at`` with the request's
+        ``time.monotonic()`` queue time, which the endpoint functions use
+        to compute their deadline. Runs after :data:`auth` in every
+        protected inference route's dependency list, so a request that
+        fails authentication never consumes a slot.
+
+        Args:
+            request: Incoming request; only ``request.app.state.admission``
+                is read.
+
+        Raises:
+            HTTPException: 429 when the configured admission cap is
+                already reached. Carries a ``Retry-After`` header so a
+                well-behaved client backs off before retrying.
+        """
+        request.state.admitted_at = time.monotonic()
+        controller: AdmissionController = request.app.state.admission
+        if not controller.try_enter():
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"server is at capacity ({config.server.max_pending_requests} pending "
+                    "requests); retry later"
+                ),
+                headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
+            )
+        try:
+            yield
+        finally:
+            controller.leave()
+
+    admission = [Depends(_admission)]
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Build the engine at startup and stop its background work at shutdown.
@@ -376,10 +525,12 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
             active_engine = engine
             logger.info("using injected engine")
         _log_served_models(config)
+        _log_admission_control(config)
         app.state.engine = active_engine
         # Reported as every model card's "created" timestamp.
         app.state.started_at = int(time.time())
         app.state.health_limiter = HealthRateLimiter(config.server.health_rate_limit)
+        app.state.admission = AdmissionController(config.server.max_pending_requests)
         yield
         close = getattr(active_engine, "close", None)
         if callable(close):
@@ -433,19 +584,33 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
 
     # Registered under /v1 (OpenAI convention) and at the root (where
     # Infinity_emb serves it), so either base-URL style works unchanged.
-    @app.post("/embeddings", response_model=EmbeddingsResponse, dependencies=auth)
-    @app.post("/v1/embeddings", response_model=EmbeddingsResponse, dependencies=auth)
+    @app.post("/embeddings", response_model=EmbeddingsResponse, dependencies=auth + admission)
+    @app.post("/v1/embeddings", response_model=EmbeddingsResponse, dependencies=auth + admission)
     def create_embeddings(request: Request, body: EmbeddingsRequest) -> EmbeddingsResponse:
         """Embed the request's texts with the requested model (OpenAI-compatible).
 
         Raises:
             HTTPException: 404 when ``body.model`` names no configured
-                model, 400 when it names a model of another kind.
+                model, 400 when it names a model of another kind, 503
+                when the request's wait exceeded ``server.queue_timeout``
+                (either before or while it waited its turn at the
+                engine), 500 when the model produced a non-finite output.
         """
         started = time.perf_counter()
+        deadline = _compute_deadline(request, config)
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise _queue_timeout_response("request timed out while waiting to be processed")
         entry = _resolve_entry(config, "embedding", body.model)
         engine_impl: InferenceEngine = request.app.state.engine
-        batch = engine_impl.embed(body.input, model_id=entry.id)
+        try:
+            batch = engine_impl.embed(body.input, model_id=entry.id, deadline=deadline)
+        except QueueTimeoutError as exc:
+            raise _queue_timeout_response(str(exc)) from exc
+        except NonFiniteOutputError as exc:
+            logger.error(
+                "model '%s' produced a non-finite output on bucket %d", exc.model_id, exc.bucket
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         vectors = batch.vectors
         # Normalization is a per-model decision, and an empty request is
@@ -487,27 +652,43 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
         "/rerank",
         response_model=RerankResponse,
         response_model_exclude_none=True,
-        dependencies=auth,
+        dependencies=auth + admission,
     )
     @app.post(
         "/v1/rerank",
         response_model=RerankResponse,
         response_model_exclude_none=True,
-        dependencies=auth,
+        dependencies=auth + admission,
     )
     def rerank(request: Request, body: RerankRequest) -> RerankResponse:
         """Score the request's documents against its query (Infinity-compatible).
 
         Raises:
             HTTPException: 503 when the configuration has no reranker at
-                all (embedding-only deployment), 404 when ``body.model``
-                names no configured model, 400 when it names a model of
-                another kind.
+                all (embedding-only deployment) or when the request's
+                wait exceeded ``server.queue_timeout`` (either before or
+                while it waited its turn at the engine), 404 when
+                ``body.model`` names no configured model, 400 when it
+                names a model of another kind, 500 when the model
+                produced a non-finite output.
         """
         started = time.perf_counter()
+        deadline = _compute_deadline(request, config)
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise _queue_timeout_response("request timed out while waiting to be processed")
         entry = _resolve_entry(config, "reranker", body.model)
         engine_impl: InferenceEngine = request.app.state.engine
-        batch = engine_impl.rerank(body.query, body.documents, model_id=entry.id)
+        try:
+            batch = engine_impl.rerank(
+                body.query, body.documents, model_id=entry.id, deadline=deadline
+            )
+        except QueueTimeoutError as exc:
+            raise _queue_timeout_response(str(exc)) from exc
+        except NonFiniteOutputError as exc:
+            logger.error(
+                "model '%s' produced a non-finite output on bucket %d", exc.model_id, exc.bucket
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         scores = batch.logits if body.raw_scores else runtime.sigmoid(batch.logits)
         results = [

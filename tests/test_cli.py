@@ -50,6 +50,19 @@ excluded_buckets = [1024]
 256 = "compiled/emb-only/s256.mlmodelc"
 """
 
+_GRACEFUL_SHUTDOWN_TOML = """
+[server]
+graceful_shutdown_timeout = 30
+
+[[models]]
+id = "emb-only"
+kind = "embedding"
+tokenizer = "models/emb-only/tokenizer.json"
+
+[models.artifacts]
+256 = "compiled/emb-only/s256.mlmodelc"
+"""
+
 
 def _write(path: Path, content: str) -> Path:
     """Write ``content`` to ``path`` and return ``path`` for chaining."""
@@ -79,7 +92,7 @@ class _RecordingUvicornRun:
 
     def __call__(self, app: object, *, host: str, port: int, **kwargs: object) -> None:
         """Record the call instead of starting a real server."""
-        self.calls.append({"app": app, "host": host, "port": port})
+        self.calls.append({"app": app, "host": host, "port": port, **kwargs})
 
 
 @pytest.fixture
@@ -242,6 +255,35 @@ def test_serve_log_level_override_is_passed_to_basic_config(
     assert len(basic_config_calls) == 1
     assert basic_config_calls[0]["level"] == logging.WARNING
     assert "%(asctime)s" in basic_config_calls[0]["format"]
+
+
+def test_serve_passes_the_configured_graceful_shutdown_timeout(
+    tmp_path: Path,
+    stub_uvicorn_run: _RecordingUvicornRun,
+) -> None:
+    """server.graceful_shutdown_timeout must reach uvicorn.run unchanged."""
+    config_path = _write(tmp_path / "eeane.toml", _GRACEFUL_SHUTDOWN_TOML)
+
+    exit_code = cli.main(["serve", "--config", str(config_path)])
+
+    assert exit_code == 0
+    call = stub_uvicorn_run.calls[0]
+    assert call["timeout_graceful_shutdown"] == 30
+
+
+def test_serve_graceful_shutdown_timeout_defaults_to_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub_uvicorn_run: _RecordingUvicornRun,
+) -> None:
+    """With none configured, uvicorn.run must receive None (wait indefinitely)."""
+    _isolate_config_search(tmp_path, monkeypatch)
+
+    exit_code = cli.main(["serve"])
+
+    assert exit_code == 0
+    call = stub_uvicorn_run.calls[0]
+    assert call["timeout_graceful_shutdown"] is None
 
 
 @pytest.mark.parametrize("command", ["serve", "check-config"])
