@@ -78,6 +78,25 @@ class ServerConfig(BaseModel):
             model entries, or ``None`` for the default location (see
             :func:`eeane.cache.resolve_cache_root`). A relative path is
             resolved against the config file's directory.
+        default_load_policy: Default load policy for a ``[[models]]``
+            entry that omits ``load_policy``. Restricted to
+            ``"resident"``/``"on_demand"``: ``"disabled"`` is only
+            available as an explicit per-model choice, never as a
+            server-wide default.
+        keep_alive: Default number of seconds a loaded model may sit
+            idle before it becomes eligible for unloading, for entries
+            that omit ``keep_alive``. ``0`` means "eligible as soon as
+            it is idle". Idle-unload behavior itself is the serving
+            engine's responsibility; this field only holds and
+            validates the configured value.
+        max_loaded_models: Maximum number of models the serving engine
+            may hold in memory at once, or ``None`` for no limit.
+            Config-time validation only checks this against
+            ``resident``-policy entries (see
+            :meth:`EeaneConfig.resolved_load_policy`), since those are
+            guaranteed to be loaded at all times; keeping on-demand
+            entries within the limit at runtime is the serving engine's
+            responsibility.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -88,6 +107,9 @@ class ServerConfig(BaseModel):
     api_key: str | None = Field(default=None, min_length=1)
     health_rate_limit: int = Field(default=60, ge=0)
     cache_root: Path | None = None
+    default_load_policy: Literal["resident", "on_demand"] = "on_demand"
+    keep_alive: int = Field(default=300, ge=0)
+    max_loaded_models: int | None = Field(default=None, ge=1)
 
 
 class ModelEntry(BaseModel):
@@ -125,6 +147,20 @@ class ModelEntry(BaseModel):
         excluded_buckets: Buckets present in the cache but left out of
             ``artifacts`` because the cache recommends against loading
             them. Informational only (reported at server startup).
+        load_policy: How this model is loaded: ``"resident"`` (loaded at
+            startup and kept loaded), ``"on_demand"`` (loaded on first
+            use and unloaded once idle), or ``"disabled"`` (never
+            served; the entry is removed from
+            :attr:`EeaneConfig.models` during validation and its ``id``
+            is recorded in :attr:`EeaneConfig.disabled_models` instead).
+            ``None`` means "use ``server.default_load_policy``" (see
+            :meth:`EeaneConfig.resolved_load_policy`); ``"disabled"`` is
+            only available as an explicit per-model choice, since it
+            cannot be the server-wide default.
+        keep_alive: Number of seconds this model may sit idle before it
+            becomes eligible for unloading, or ``None`` to use
+            ``server.keep_alive`` (see
+            :meth:`EeaneConfig.resolved_keep_alive`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -137,6 +173,8 @@ class ModelEntry(BaseModel):
     output_name: str | None = None
     embedding_dim: int | None = Field(default=None, gt=0)
     excluded_buckets: tuple[int, ...] = ()
+    load_policy: Literal["resident", "on_demand", "disabled"] | None = None
+    keep_alive: int | None = Field(default=None, ge=0)
 
     @field_validator("artifacts", mode="before")
     @classmethod
@@ -229,21 +267,58 @@ class EeaneConfig(BaseModel):
 
     Attributes:
         server: Server/network/auth settings.
-        models: Served model entries, in config-file order. At least one
-            ``kind="embedding"`` entry is required (the engine's embedding
-            endpoints have no meaning without one); rerankers are
-            optional. Any number of either kind may be listed, as long as
-            every ``id`` is unique across kinds.
+        models: Served model entries, in config-file order, after
+            ``load_policy="disabled"`` entries have been removed (see
+            ``disabled_models``). At least one ``kind="embedding"`` entry
+            is required (the engine's embedding endpoints have no
+            meaning without one); rerankers are optional. Any number of
+            either kind may be listed, as long as every ``id`` is unique
+            across kinds and across disabled entries too.
+        disabled_models: Ids of ``[[models]]`` entries whose
+            ``load_policy`` resolved to ``"disabled"``, in their
+            original config-file order. These entries never appear in
+            ``models``; this field exists only so callers can report
+            which ids were configured but left unserved.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     models: list[ModelEntry]
+    disabled_models: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _split_disabled_models(self) -> EeaneConfig:
+        """Move ``load_policy="disabled"`` entries out of ``models`` into ``disabled_models``.
+
+        Runs before ``_validate_model_composition`` so the id-uniqueness
+        and embedding-count checks there see the already-filtered
+        ``models`` list. For a config file loaded via :func:`load_config`,
+        disabled entries are already stripped out of the raw model list
+        before this validator ever sees them (so that an id-only
+        disabled entry does not need a compiled-model cache to exist);
+        this validator's own filtering only matters for ``ModelEntry``
+        objects constructed directly with ``load_policy="disabled"``.
+
+        Returns:
+            ``self``, with ``models``/``disabled_models`` updated to
+            reflect the split.
+        """
+        active: list[ModelEntry] = []
+        newly_disabled: list[str] = []
+        for entry in self.models:
+            if entry.load_policy == "disabled":
+                newly_disabled.append(entry.id)
+            else:
+                active.append(entry)
+
+        self.models = active
+        self.disabled_models = (*self.disabled_models, *newly_disabled)
+        return self
 
     @model_validator(mode="after")
     def _validate_model_composition(self) -> EeaneConfig:
-        """Enforce embedding>=1 and unique ``id`` across ``models``.
+        """Enforce unique ids, embedding>=1, and the resident-count cap.
 
         Raises:
             ValueError: If the composition constraints are violated.
@@ -251,16 +326,63 @@ class EeaneConfig(BaseModel):
         Returns:
             ``self``.
         """
+        seen_ids: set[str] = set()
+        for model_id in (*self.disabled_models, *(entry.id for entry in self.models)):
+            if model_id in seen_ids:
+                raise ValueError(f"duplicate model id '{model_id}' in 'models'")
+            seen_ids.add(model_id)
+
         if not self.models_of_kind("embedding"):
             raise ValueError("at least one 'embedding' model entry is required, found 0")
 
-        seen_ids: set[str] = set()
-        for entry in self.models:
-            if entry.id in seen_ids:
-                raise ValueError(f"duplicate model id '{entry.id}' in 'models'")
-            seen_ids.add(entry.id)
+        if self.server.max_loaded_models is not None:
+            resident_count = sum(
+                1 for entry in self.models if self.resolved_load_policy(entry) == "resident"
+            )
+            if resident_count > self.server.max_loaded_models:
+                raise ValueError(
+                    f"{resident_count} model(s) resolve to load_policy='resident', which "
+                    f"exceeds server.max_loaded_models={self.server.max_loaded_models}"
+                )
 
         return self
+
+    def resolved_load_policy(self, entry: ModelEntry) -> Literal["resident", "on_demand"]:
+        """Return ``entry``'s effective load policy, applying the server default.
+
+        Args:
+            entry: A model entry from ``models`` (i.e. not disabled).
+
+        Returns:
+            ``entry.load_policy`` if set, otherwise
+            ``server.default_load_policy``.
+
+        Raises:
+            ValueError: If ``entry.load_policy`` is ``"disabled"``. This
+                cannot happen for an entry still listed in ``models``,
+                since disabled entries are filtered out during
+                validation.
+        """
+        if entry.load_policy is None:
+            return self.server.default_load_policy
+        if entry.load_policy == "disabled":
+            # Unreachable for an entry obtained via `models`/`model_by_id`:
+            # disabled entries never survive validation into `models`.
+            raise ValueError(
+                f"model '{entry.id}' has load_policy='disabled' and is not servable"
+            )  # pragma: no cover
+        return entry.load_policy
+
+    def resolved_keep_alive(self, entry: ModelEntry) -> int:
+        """Return ``entry``'s effective idle-unload delay in seconds, applying the server default.
+
+        Args:
+            entry: A model entry from ``models``.
+
+        Returns:
+            ``entry.keep_alive`` if set, otherwise ``server.keep_alive``.
+        """
+        return entry.keep_alive if entry.keep_alive is not None else self.server.keep_alive
 
     def models_of_kind(self, kind: str) -> list[ModelEntry]:
         """Return every configured entry of ``kind``, in config-file order.
@@ -517,6 +639,11 @@ def _load_from_file(path: Path, *, env: Mapping[str, str]) -> EeaneConfig:
     except OSError as exc:
         raise ConfigError(f"Failed to read config file '{path}': {exc}") from exc
 
+    # Disabled entries are pulled out first, before cache resolution: an
+    # id-only entry that is disabled must not need a compiled-model cache
+    # to exist just to be skipped.
+    _split_disabled_entries(raw)
+
     # path may itself be relative (e.g. --config eeane.example.toml), so
     # resolve it first: model paths must come out absolute either way.
     _resolve_relative_paths(raw, base_dir=path.resolve().parent)
@@ -530,6 +657,34 @@ def _load_from_file(path: Path, *, env: Mapping[str, str]) -> EeaneConfig:
         # raw's top-level shape did not match EeaneConfig's constructor
         # (e.g. "models" given as a scalar instead of a list of tables).
         raise ConfigError(f"Invalid config file '{path}': {exc}") from exc
+
+
+def _split_disabled_entries(raw: dict[str, Any]) -> None:
+    """Move ``load_policy = "disabled"`` model entries out of ``raw["models"]``, in place.
+
+    Runs before ``_resolve_from_cache`` so a disabled entry that only
+    states an ``id`` never triggers a compiled-model cache lookup: it is
+    simply never served, whether or not that cache entry exists.
+
+    Args:
+        raw: Dict as parsed by ``tomllib.load`` (mutated in place).
+    """
+    models = raw.get("models")
+    if not isinstance(models, list):
+        return
+
+    active: list[Any] = []
+    disabled_ids: list[Any] = []
+    for entry in models:
+        if isinstance(entry, dict) and entry.get("load_policy") == "disabled":
+            disabled_ids.append(entry.get("id"))
+        else:
+            active.append(entry)
+
+    if not disabled_ids:
+        return
+    raw["models"] = active
+    raw["disabled_models"] = [*raw.get("disabled_models", []), *disabled_ids]
 
 
 def _resolve_relative_paths(raw: dict[str, Any], *, base_dir: Path) -> None:
@@ -821,6 +976,8 @@ def _revalidate(config: EeaneConfig) -> EeaneConfig:
     """
     try:
         server = ServerConfig(**config.server.model_dump())
-        return EeaneConfig(server=server, models=config.models)
+        return EeaneConfig(
+            server=server, models=config.models, disabled_models=config.disabled_models
+        )
     except ValidationError as exc:
         raise ConfigError(f"Invalid configuration after applying overrides: {exc}") from exc
