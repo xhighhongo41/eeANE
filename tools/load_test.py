@@ -996,7 +996,7 @@ def main(argv: list[str] | None = None) -> int:
         wall_sec = time.perf_counter() - started
     except ServerUnreachable as exc:
         print(str(exc))
-        print("Start the eeANE server first: uv run python -m eeane.server")
+        print("Start the eeANE server first: uv run eeane serve")
         return 2
 
     summary = summarize(outcomes, wall_sec)

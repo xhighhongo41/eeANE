@@ -19,9 +19,9 @@ call is serialized inside the engine, so the endpoints are plain ``def``
 functions that FastAPI runs in its thread pool (``/health`` and
 ``/models`` stay ``async`` and answer immediately).
 
-Run it with ``uv run python -m eeane serve`` (single process, single
-worker: multiple workers would load the models several times).
-``uv run python -m eeane.server`` remains as a thin alias for the same
+Run it with ``eeane serve`` (single process, single worker: multiple
+workers would load the models several times). ``python -m eeane serve``
+and ``python -m eeane.server`` remain as thin aliases for the same
 command (see :func:`main`).
 """
 
