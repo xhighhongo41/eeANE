@@ -15,6 +15,11 @@ when a request first needs it and unloaded again once it has been idle
 for its ``keep_alive`` delay -- or earlier, when loading another model
 would exceed ``max_loaded_models``.
 
+Requests that arrive with the same content while an identical one is
+still running are served from that single computation instead of running
+the same inference again, and a request may carry a deadline it gives up
+at while it is still waiting for its turn.
+
 The HTTP layer only sees :class:`InferenceEngine`, so tests can inject a
 deterministic stub without touching ``eeane.server``.
 """
@@ -27,7 +32,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import coremltools as ct
 import numpy as np
@@ -42,18 +47,31 @@ from eeane.engine_types import (
     _UNLOADED,
     EmbeddingBatch,
     ModelPolicy,
+    QueueTimeoutError,
     RerankBatch,
     _as_row,
     _collect_missing,
+    _InflightRequest,
     _ManagedModel,
     _require_complete,
+    _require_finite,
     _resolve_output_key,
     _ServedModel,
+    _text_digest,
 )
 from eeane.engine_types import _LOAD_POLICIES as _LOAD_POLICIES
 from eeane.engine_types import InferenceEngine as InferenceEngine
+from eeane.engine_types import NonFiniteOutputError as NonFiniteOutputError
 
 logger = logging.getLogger("eeane.engine")
+
+# Result types one request's computation can hand back, shared as is with
+# every identical request attached to it.
+_Batch = TypeVar("_Batch", EmbeddingBatch, RerankBatch)
+
+# Identity two requests must share to be served from one computation:
+# the model kind, the model id and the digest of the request's texts.
+_RequestKey = tuple[str, str, str]
 
 
 def _load_compiled(path: Path) -> Any:
@@ -153,7 +171,13 @@ class CoreMLEngine:
     entry's artifacts are checked in ``__init__`` whatever its policy, so
     a broken deployment fails at start-up rather than on a first request.
 
-    Three locks are held, and the order they may be taken in is fixed to
+    Requests are served one input at a time, and identical requests --
+    same kind, same model, same texts in the same order -- that overlap
+    in time are served from a single computation when coalescing is on.
+    A request may carry a deadline: it is honoured while the request
+    waits, and no longer once its first prediction has started.
+
+    Four locks are held, and the order they may be taken in is fixed to
     keep the engine deadlock-free:
 
     * ``load_lock`` (one per model) guards that model's loads and is the
@@ -167,6 +191,12 @@ class CoreMLEngine:
       the model: the Neural Engine runs one prediction at a time, so a
       lock per model would only add contention without adding throughput.
       It is taken on its own, never nested inside the other two.
+    * ``_inflight_lock`` (one per engine) guards the table of running
+      computations identical requests attach to. It is a leaf lock: it is
+      held for a lookup or an update of that table and for nothing else,
+      never across a load, a tokenization or a prediction, so no other
+      lock can ever be taken while holding it and it needs no place in
+      the order above.
 
     Tokenizer calls take one lock per model instead, since the mutable
     state they protect belongs to a single tokenizer.
@@ -181,6 +211,7 @@ class CoreMLEngine:
         clock: Callable[[], float] = time.monotonic,
         loader: Callable[[ModelEntry], _ServedModel] | None = None,
         sweep_interval: float = 5.0,
+        coalesce: bool = True,
     ) -> None:
         """Validate every entry's artifacts, then load the resident models.
 
@@ -208,6 +239,11 @@ class CoreMLEngine:
             sweep_interval: Seconds between two idle-unload sweeps. A
                 non-positive value runs no background sweeper at all,
                 leaving idle unloading to whoever drives the engine.
+            coalesce: Whether a request that arrives while an identical
+                one is running is served from that running computation
+                instead of repeating it. Switching it off makes every
+                request compute its own answer, at the cost of running
+                the same inference several times.
 
         Raises:
             ValueError: If ``entries`` is empty, two entries share an id,
@@ -246,6 +282,7 @@ class CoreMLEngine:
         self._loader = loader if loader is not None else _load_entry
         self._max_loaded_models = max_loaded_models
         self._sweep_interval = sweep_interval
+        self._coalesce = coalesce
         # Insertion order mirrors the configuration order, which is what
         # decides the default model of each kind.
         self._models: dict[str, _ManagedModel] = {
@@ -260,6 +297,8 @@ class CoreMLEngine:
         }
         self._lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._inflight: dict[_RequestKey, _InflightRequest] = {}
+        self._inflight_lock = threading.Lock()
         self._stopping = threading.Event()
         self._sweeper: threading.Thread | None = None
 
@@ -288,6 +327,7 @@ class CoreMLEngine:
             config.models,
             policies=_policies_from_config(config),
             max_loaded_models=config.server.max_loaded_models,
+            coalesce=config.server.coalesce_requests,
         )
 
     def close(self) -> None:
@@ -360,7 +400,9 @@ class CoreMLEngine:
         with self._state_lock:
             return managed.state == _LOADED
 
-    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
         """Embed ``texts`` one by one, routing each to its smallest bucket.
 
         Args:
@@ -368,6 +410,11 @@ class CoreMLEngine:
                 client's responsibility).
             model_id: Embedding model to serve the request with; ``None``
                 selects the default embedding model.
+            deadline: Absolute reading of the engine's clock the request
+                gives up at while it is still waiting, or ``None`` to wait
+                as long as it takes. Only waiting is bounded: once the
+                first prediction has started, the request always runs to
+                completion.
 
         Returns:
             Raw embeddings plus the token accounting needed for the
@@ -375,7 +422,9 @@ class CoreMLEngine:
             empty request keeps the ``(N, D)`` contract with ``N = 0`` and
             ``D`` the model's width: the configured ``embedding_dim``, or
             the width measured during an earlier prediction, or ``0`` as
-            long as neither is available.
+            long as neither is available. The batch may be shared with
+            other requests that carried the same texts, so callers must
+            treat it as read-only.
 
         Raises:
             ValueError: If ``model_id`` names no served model, or names a
@@ -383,6 +432,10 @@ class CoreMLEngine:
             RuntimeError: If the engine serves no embedding model at all.
                 Loading the model can raise whatever the loader raises,
                 leaving the model unloaded so the next request retries.
+            QueueTimeoutError: If ``deadline`` passes before the request's
+                first prediction starts.
+            NonFiniteOutputError: If the model answers with NaN or
+                infinite values.
         """
         managed = self._select("embedding", model_id)
         if not texts:
@@ -398,6 +451,35 @@ class CoreMLEngine:
                 truncated_indices=[],
             )
 
+        # Checked before the model is acquired, so a request that has
+        # already given up never triggers an on-demand load.
+        self._check_deadline(deadline)
+        key = self._request_key("embedding", managed.entry.id, texts)
+        if key is None:
+            return self._embed_texts(managed, texts, deadline)
+        return self._coalesce_request(
+            managed, key, deadline, lambda: self._embed_texts(managed, texts, deadline)
+        )
+
+    def _embed_texts(
+        self, managed: _ManagedModel, texts: list[str], deadline: float | None
+    ) -> EmbeddingBatch:
+        """Embed one non-empty request's texts against ``managed``.
+
+        Args:
+            managed: Model the request routed to.
+            texts: Input texts in request order, at least one.
+            deadline: Clock reading the wait for the first prediction is
+                bounded by, or ``None``.
+
+        Returns:
+            The request's embeddings and token accounting.
+
+        Raises:
+            QueueTimeoutError: If ``deadline`` passes before the first
+                prediction starts.
+            NonFiniteOutputError: If a prediction is not finite.
+        """
         rows: list[np.ndarray] = []
         used_tokens: list[int] = []
         orig_tokens: list[int] = []
@@ -410,7 +492,15 @@ class CoreMLEngine:
                     n_tokens = runtime.count_text_tokens(served.tokenizer, text)
                     bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
                     inputs = runtime.tokenize_texts(served.tokenizer, [text], bucket)
-                output = self._predict(served.compiled[bucket], inputs, served.output_name)
+                output = self._predict(
+                    served.compiled[bucket],
+                    inputs,
+                    served.output_name,
+                    lock_timeout=self._lock_timeout(deadline, index),
+                )
+                # Checked outside the prediction lock: an unusable answer
+                # must not hold up the requests queueing behind it.
+                _require_finite(output, served.id, bucket)
                 rows.append(output)
                 # attention_mask counts the tokens the model really
                 # consumed, i.e. n_tokens capped at the bucket size.
@@ -434,7 +524,14 @@ class CoreMLEngine:
             truncated_indices=truncated_indices,
         )
 
-    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
         """Score every ``(query, document)`` pair with a cross-encoder.
 
         Args:
@@ -442,10 +539,14 @@ class CoreMLEngine:
             documents: Candidate documents in request order.
             model_id: Reranker to serve the request with; ``None`` selects
                 the default reranker.
+            deadline: Clock reading the request gives up at while it is
+                still waiting; see :meth:`embed`.
 
         Returns:
             Raw logits plus the token accounting; the sigmoid mapping is
-            applied by the HTTP layer (``raw_scores`` decides).
+            applied by the HTTP layer (``raw_scores`` decides). The batch
+            may be shared with other requests that carried the same query
+            and documents, so callers must treat it as read-only.
 
         Raises:
             ValueError: If ``model_id`` names no served model, or names a
@@ -455,6 +556,10 @@ class CoreMLEngine:
                 guard for direct engine users. Loading the model can
                 raise whatever the loader raises, leaving the model
                 unloaded so the next request retries.
+            QueueTimeoutError: If ``deadline`` passes before the request's
+                first prediction starts.
+            NonFiniteOutputError: If the model answers with NaN or
+                infinite values.
         """
         managed = self._select("reranker", model_id)
         if not documents:
@@ -466,6 +571,43 @@ class CoreMLEngine:
                 truncated_indices=[],
             )
 
+        self._check_deadline(deadline)
+        # The query is part of the identity: the same documents scored
+        # against another query are another computation.
+        key = self._request_key("reranker", managed.entry.id, [query, *documents])
+        if key is None:
+            return self._rerank_documents(managed, query, documents, deadline)
+        return self._coalesce_request(
+            managed,
+            key,
+            deadline,
+            lambda: self._rerank_documents(managed, query, documents, deadline),
+        )
+
+    def _rerank_documents(
+        self,
+        managed: _ManagedModel,
+        query: str,
+        documents: list[str],
+        deadline: float | None,
+    ) -> RerankBatch:
+        """Score one non-empty request's pairs against ``managed``.
+
+        Args:
+            managed: Reranker the request routed to.
+            query: Query text of every pair.
+            documents: Candidate documents in request order, at least one.
+            deadline: Clock reading the wait for the first prediction is
+                bounded by, or ``None``.
+
+        Returns:
+            The request's logits and token accounting.
+
+        Raises:
+            QueueTimeoutError: If ``deadline`` passes before the first
+                prediction starts.
+            NonFiniteOutputError: If a prediction is not finite.
+        """
         logits: list[float] = []
         used_tokens: list[int] = []
         orig_tokens: list[int] = []
@@ -477,7 +619,13 @@ class CoreMLEngine:
                     n_tokens = runtime.count_pair_tokens(served.tokenizer, query, document)
                     bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
                     inputs = runtime.tokenize_pairs(served.tokenizer, [(query, document)], bucket)
-                output = self._predict(served.compiled[bucket], inputs, served.output_name)
+                output = self._predict(
+                    served.compiled[bucket],
+                    inputs,
+                    served.output_name,
+                    lock_timeout=self._lock_timeout(deadline, index),
+                )
+                _require_finite(output, served.id, bucket)
                 # The reranker head emits a single logit per pair.
                 logits.append(float(output[0]))
                 used_tokens.append(int(inputs["attention_mask"].sum()))
@@ -493,6 +641,191 @@ class CoreMLEngine:
             orig_tokens=orig_tokens,
             truncated_indices=truncated_indices,
         )
+
+    def _check_deadline(self, deadline: float | None) -> None:
+        """Reject a request whose deadline has already passed.
+
+        Args:
+            deadline: Clock reading the request gives up at, or ``None``.
+
+        Raises:
+            QueueTimeoutError: If ``deadline`` is not in the future.
+        """
+        if deadline is not None and deadline - self._clock() <= 0:
+            raise QueueTimeoutError(
+                "request timed out before inference started: its deadline had already "
+                "passed when it reached the engine"
+            )
+
+    def _lock_timeout(self, deadline: float | None, index: int) -> float | None:
+        """Return how long the ``index``-th prediction may wait for its turn.
+
+        Only the first prediction of a request is bounded: a request that
+        has started inferring runs to completion, so every later
+        prediction waits for the prediction lock as long as it takes.
+
+        Args:
+            deadline: Clock reading the request gives up at, or ``None``.
+            index: Position of the prediction within the request.
+
+        Returns:
+            Seconds left before the deadline -- zero or less when it has
+            already passed, which the prediction reports as a timeout --
+            or ``None`` when the wait is not bounded at all.
+        """
+        if deadline is None or index > 0:
+            return None
+        return deadline - self._clock()
+
+    def _request_key(self, kind: str, model_id: str, texts: Sequence[str]) -> _RequestKey | None:
+        """Build the identity two requests must share to be served as one.
+
+        Args:
+            kind: Model kind the calling endpoint serves.
+            model_id: Resolved id of the model serving the request: the
+                same texts sent to two models are two computations.
+            texts: Every text the request's model inputs are built from,
+                in request order (the query first, for a rerank request).
+
+        Returns:
+            The key the request is coalesced under, or ``None`` when
+            coalescing is switched off, i.e. when every request is to
+            compute its own answer.
+        """
+        if not self._coalesce:
+            return None
+        return (kind, model_id, _text_digest(texts))
+
+    def _coalesce_request(
+        self,
+        managed: _ManagedModel,
+        key: _RequestKey,
+        deadline: float | None,
+        compute: Callable[[], _Batch],
+    ) -> _Batch:
+        """Serve one request, running ``compute`` only if nobody else is.
+
+        The first request with a given key computes the answer; the ones
+        that arrive with the same key while it runs wait for its outcome
+        instead of repeating the same inference. A waiting request is
+        counted in and out of the model exactly like a computing one, so
+        attaching to a running computation changes neither the loading
+        nor the idle accounting.
+
+        Args:
+            managed: Model the request routed to.
+            key: Identity the request is coalesced under.
+            deadline: Clock reading the request gives up waiting at, or
+                ``None``.
+            compute: Runs the request's own inference, used only if this
+                request turns out to be the first one with ``key``.
+
+        Returns:
+            This request's batch, possibly shared with every other
+            request attached to the same computation.
+
+        Raises:
+            QueueTimeoutError: If ``deadline`` passes while waiting for
+                the computation this request attached to.
+            Exception: Whatever the computation raised.
+        """
+        record, is_leader = self._register_inflight(key)
+        if is_leader:
+            return self._lead_request(key, record, compute)
+
+        # The artifacts are the leader's to use; they are acquired here
+        # only so that a waiting request counts against the model like any
+        # other, keeping it from being unloaded while it is still needed.
+        self._acquire(managed)
+        try:
+            return self._await_request(record, deadline)
+        finally:
+            self._release(managed)
+
+    def _register_inflight(self, key: _RequestKey) -> tuple[_InflightRequest, bool]:
+        """Attach to the computation running under ``key``, or start one.
+
+        Args:
+            key: Identity the request is coalesced under.
+
+        Returns:
+            The record the request is served from, and whether this
+            request is the one that has to compute it.
+        """
+        with self._inflight_lock:
+            record = self._inflight.get(key)
+            if record is not None:
+                return record, False
+            record = _InflightRequest()
+            self._inflight[key] = record
+            return record, True
+
+    def _lead_request(
+        self, key: _RequestKey, record: _InflightRequest, compute: Callable[[], _Batch]
+    ) -> _Batch:
+        """Compute one answer and publish it to every request waiting for it.
+
+        Args:
+            key: Identity the computation is registered under.
+            record: Record every waiting request is watching.
+            compute: Runs this request's inference.
+
+        Returns:
+            Whatever ``compute`` returned.
+
+        Raises:
+            Exception: Whatever ``compute`` raised, after handing the
+                same error to every waiting request.
+        """
+        try:
+            result = compute()
+        except BaseException as error:
+            # Published as is: identical requests fail identically, and a
+            # waiter must never be left waiting for a leader that is gone.
+            record.error = error
+            raise
+        else:
+            record.result = result
+            return result
+        finally:
+            # Removed before the waiters are woken, so requests arriving
+            # from now on start a computation of their own instead of
+            # attaching to one that has already finished.
+            with self._inflight_lock:
+                self._inflight.pop(key, None)
+            record.done.set()
+
+    def _await_request(self, record: _InflightRequest, deadline: float | None) -> _Batch:
+        """Wait for the computation this request attached to, then share it.
+
+        An outcome that is already published is taken whatever the
+        deadline says: there is nothing left to wait for.
+
+        Args:
+            record: Record the request attached to.
+            deadline: Clock reading the request gives up waiting at, or
+                ``None`` to wait for the outcome however long it takes.
+
+        Returns:
+            The batch the computation produced, shared with every other
+            request attached to it.
+
+        Raises:
+            QueueTimeoutError: If ``deadline`` passes with the
+                computation still running.
+            Exception: Whatever the computation raised.
+        """
+        # Clamped at zero: a deadline that has already passed still gets
+        # one look at the outcome, and never turns into an endless wait.
+        timeout = None if deadline is None else max(deadline - self._clock(), 0.0)
+        if not record.done.wait(timeout=timeout):
+            raise QueueTimeoutError(
+                "request timed out before inference started: the identical request it "
+                "attached to was still running when the deadline passed"
+            )
+        if record.error is not None:
+            raise record.error
+        return record.result
 
     def _select(self, kind: str, model_id: str | None) -> _ManagedModel:
         """Resolve one request's model id to a served model.
@@ -808,7 +1141,14 @@ class CoreMLEngine:
             if managed.embedding_dim is None:
                 managed.embedding_dim = width
 
-    def _predict(self, model: Any, inputs: dict[str, np.ndarray], output_name: str) -> np.ndarray:
+    def _predict(
+        self,
+        model: Any,
+        inputs: dict[str, np.ndarray],
+        output_name: str,
+        *,
+        lock_timeout: float | None = None,
+    ) -> np.ndarray:
         """Run one batch-of-one prediction under the process-wide lock.
 
         Args:
@@ -816,11 +1156,31 @@ class CoreMLEngine:
             inputs: ``input_ids``/``attention_mask`` arrays of shape
                 ``(1, S)``, dtype int32.
             output_name: Output name requested at conversion time.
+            lock_timeout: Seconds to wait for the prediction lock before
+                giving up, or ``None`` to wait for it however long the
+                predictions ahead of this one take. Giving up is only an
+                option before the prediction starts; once the lock is
+                held, the prediction always runs to its end.
 
         Returns:
             The prediction flattened to a 1-D float32 row.
+
+        Raises:
+            QueueTimeoutError: If the prediction lock could not be taken
+                within ``lock_timeout``.
         """
-        with self._lock:
+        if lock_timeout is None:
+            self._lock.acquire()
+        elif lock_timeout <= 0 or not self._lock.acquire(timeout=lock_timeout):
+            # A non-positive timeout is a deadline that has passed while
+            # the request was being tokenized: no point trying the lock.
+            raise QueueTimeoutError(
+                "request timed out before inference started: the engine was still busy "
+                "with earlier requests when the deadline passed"
+            )
+        try:
             prediction = model.predict(inputs)
+        finally:
+            self._lock.release()
         key = _resolve_output_key(prediction, output_name)
         return _as_row(prediction[key], key)

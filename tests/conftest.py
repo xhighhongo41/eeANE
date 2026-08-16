@@ -193,8 +193,14 @@ class StubEngine:
             raise KeyError(model_id)
         return True
 
-    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
-        """Return :func:`stub_vector` for each text, counting 1 token per character."""
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
+        """Return :func:`stub_vector` for each text, counting 1 token per character.
+
+        The stub answers immediately, so ``deadline`` is accepted (the
+        protocol requires it) and never has anything to cut short.
+        """
         resolved = self._resolve("embedding", model_id)
         self.embed_model_ids.append(resolved)
         if not texts:
@@ -214,8 +220,18 @@ class StubEngine:
             truncated_indices=[],
         )
 
-    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
-        """Return :func:`stub_logit` for each document, ignoring the query's content."""
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
+        """Return :func:`stub_logit` for each document, ignoring the query's content.
+
+        ``deadline`` is accepted and ignored, as in :meth:`embed`.
+        """
         resolved = self._resolve("reranker", model_id)
         self.rerank_model_ids.append(resolved)
         tokens = [len(query) + len(document) for document in documents]

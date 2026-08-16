@@ -1,16 +1,19 @@
 """Data contracts and pure helpers for the eeANE Core ML engine.
 
-This module holds the dataclasses and the :class:`InferenceEngine`
-protocol the HTTP layer and the engine implementation share, plus the
-small pure functions that validate a model entry and shape a raw Core ML
-prediction into the engine's result types. Nothing here touches Core ML
-itself or any mutable engine state; :mod:`eeane.engine` composes these
-pieces with the actual model loading and lifecycle management.
+This module holds the dataclasses, the errors and the
+:class:`InferenceEngine` protocol the HTTP layer and the engine
+implementation share, plus the small pure functions that validate a model
+entry and shape a raw Core ML prediction into the engine's result types.
+Nothing here touches Core ML itself or any mutable engine state;
+:mod:`eeane.engine` composes these pieces with the actual model loading
+and lifecycle management.
 """
 
 from __future__ import annotations
 
+import hashlib
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -35,6 +38,52 @@ _LOAD_POLICIES = ("resident", "on_demand")
 _UNLOADED = "unloaded"
 _LOADING = "loading"
 _LOADED = "loaded"
+
+# Bytes the request digest frames every text's length with. Eight bytes
+# hold any text a request could carry, so the framing never overflows.
+_LENGTH_PREFIX_BYTES = 8
+
+
+class QueueTimeoutError(RuntimeError):
+    """Raised when a request gives up before its inference starts.
+
+    Every wait a request goes through before its first prediction ends
+    this way once its deadline has passed: the wait for the engine to
+    become free, and the wait for an identical request it was attached
+    to. Nothing has been computed at that point, so the caller is free to
+    retry or to report the timeout as it sees fit. A request whose first
+    prediction has started is never interrupted, so this is never raised
+    once inference is under way.
+    """
+
+
+class NonFiniteOutputError(RuntimeError):
+    """Raised when a model answers with NaN or infinite values.
+
+    Such an output is not a usable result -- it would silently poison a
+    similarity search or a ranking -- and it points at the model itself
+    rather than at the request, so it fails loudly instead of being
+    passed on.
+
+    Attributes:
+        model_id: Id of the model that produced the output.
+        bucket: Sequence-length bucket the prediction ran on, i.e. the
+            compiled artifact the output came from.
+    """
+
+    def __init__(self, model_id: str, bucket: int) -> None:
+        """Describe which model and which artifact produced the output.
+
+        Args:
+            model_id: Id of the model that produced the output.
+            bucket: Sequence length the prediction ran on.
+        """
+        super().__init__(
+            f"model '{model_id}' produced a non-finite output for bucket {bucket}; "
+            "the compiled model may have run on an unsupported compute path"
+        )
+        self.model_id = model_id
+        self.bucket = bucket
 
 
 @dataclass
@@ -117,12 +166,29 @@ class InferenceEngine(Protocol):
     themselves against an id that does not exist.
     """
 
-    def embed(self, texts: list[str], model_id: str | None = None) -> EmbeddingBatch:
-        """Embed ``texts`` in request order with the given embedding model."""
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
+        """Embed ``texts`` in request order with the given embedding model.
+
+        ``deadline`` is an absolute reading of the implementation's clock
+        past which a request that is still waiting gives up, or ``None``
+        to wait as long as it takes.
+        """
         ...
 
-    def rerank(self, query: str, documents: list[str], model_id: str | None = None) -> RerankBatch:
-        """Score every ``(query, document)`` pair with the given reranker."""
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        model_id: str | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> RerankBatch:
+        """Score every ``(query, document)`` pair with the given reranker.
+
+        ``deadline`` means what it does in :meth:`embed`.
+        """
         ...
 
     def buckets(self, model_id: str) -> tuple[int, ...]:
@@ -221,6 +287,70 @@ class _ManagedModel:
     served: _ServedModel | None = None
     last_used: float = 0.0
     in_flight: int = 0
+
+
+@dataclass
+class _InflightRequest:
+    """One running computation identical requests can be served from.
+
+    The request that created the record computes the answer and publishes
+    it here; every request that arrives with the same content while it
+    runs waits on :attr:`done` instead of computing the same thing again.
+    Exactly one of :attr:`result` and :attr:`error` is set by the time
+    :attr:`done` is set.
+
+    Attributes:
+        done: Set once the outcome has been published, whatever it is.
+        result: Batch the computation produced, or ``None`` while it is
+            still running or has failed. It is shared by every request
+            served from this record, so all of them must treat it as
+            read-only.
+        error: Exception the computation raised, or ``None``. Identical
+            requests fail identically, so it is re-raised as is by every
+            request waiting on the record.
+    """
+
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    error: BaseException | None = None
+
+
+def _text_digest(texts: Sequence[str]) -> str:
+    """Hash a request's texts into the identity it is coalesced under.
+
+    Every text is framed with its own UTF-8 byte length, so no separator
+    can be forged by the texts themselves: ``["ab", "c"]`` and
+    ``["a", "bc"]`` hash differently, and two requests therefore share a
+    digest only if they carry exactly the same texts in the same order.
+
+    Args:
+        texts: Texts the request's model inputs are built from, in
+            request order.
+
+    Returns:
+        The hex-encoded SHA-256 digest of the framed texts.
+    """
+    digest = hashlib.sha256()
+    for text in texts:
+        encoded = text.encode("utf-8")
+        digest.update(len(encoded).to_bytes(_LENGTH_PREFIX_BYTES, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _require_finite(row: np.ndarray, model_id: str, bucket: int) -> None:
+    """Reject a prediction that carries NaN or infinite values.
+
+    Args:
+        row: One prediction, flattened to a 1-D row.
+        model_id: Id of the model that produced it.
+        bucket: Sequence length the prediction ran on.
+
+    Raises:
+        NonFiniteOutputError: If any value of ``row`` is not finite.
+    """
+    if not np.isfinite(row).all():
+        raise NonFiniteOutputError(model_id, bucket)
 
 
 def _resolve_output_key(prediction: dict[str, Any], preferred: str) -> str:
