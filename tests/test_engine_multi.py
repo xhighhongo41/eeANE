@@ -172,7 +172,7 @@ def deployment(tmp_path: Path) -> list[ModelEntry]:
 
 
 @pytest.mark.parametrize("implementation", [CoreMLEngine, StubEngine])
-@pytest.mark.parametrize("name", ["embed", "rerank", "buckets", "default_model_id"])
+@pytest.mark.parametrize("name", ["embed", "rerank", "buckets", "default_model_id", "loaded"])
 def test_implementations_keep_the_inference_engine_signatures(
     implementation: type, name: str
 ) -> None:
@@ -216,10 +216,14 @@ def test_from_config_serves_every_configured_entry(
     config = EeaneConfig(server=ServerConfig(), models=deployment)
 
     engine = CoreMLEngine.from_config(config)
-
-    assert engine.default_model_id("embedding") == "emb-a"
-    assert engine.buckets("emb-b") == (16,)
-    assert engine.buckets("rr-b") == (16,)
+    try:
+        assert engine.default_model_id("embedding") == "emb-a"
+        assert engine.buckets("emb-b") == (16,)
+        assert engine.buckets("rr-b") == (16,)
+    finally:
+        # This configuration serves its models on demand, so the engine
+        # runs an idle sweeper this test has to stop again.
+        engine.close()
 
 
 def test_embedding_only_deployment_reports_no_reranker(
@@ -237,7 +241,8 @@ def test_tokenizer_locks_are_per_model_while_predict_stays_serialized(
     """One predict lock for the whole engine, one tokenizer lock per model."""
     engine = CoreMLEngine(deployment)
 
-    served = list(engine._models.values())
+    served = [managed.served for managed in engine._models.values()]
+    assert all(model is not None for model in served)
     assert len({id(model.tokenizer_lock) for model in served}) == len(deployment)
     assert all(model.tokenizer_lock is not engine._lock for model in served)
 
