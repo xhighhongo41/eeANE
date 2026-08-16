@@ -8,7 +8,7 @@ Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **Status: early development (v0.9).**
+> **Status: early development (v0.10).**
 > v0.1–v0.3 proved the concept:
 > [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
 > (a Japanese ModernBERT embedding model) and
@@ -85,37 +85,98 @@ and most of your unified memory free for other work.
 > by compiling a batch-2 artifact (`eeane compile <model> --buckets
 > <S> --batch 2`), which the server picks up automatically for
 > id-only entries and uses to predict two same-bucket inputs of one
-> request together.
-> Packaged one-command installs arrive in later milestones.
+> request together. **v0.10 makes eeANE installable directly from
+> GitHub**: `uv`, `pipx` and `pip` can each install it straight from
+> this repository (see Installation below), and the package now
+> provides an `eeane` console command in place of `python -m eeane`.
 
 ## Requirements
 
 - Apple Silicon Mac (M1 or later)
 - macOS 13 or later
+- Python 3.11 or 3.12 (3.13 and later are not yet supported). `uv`
+  resolves a matching interpreter automatically; installing with pipx
+  or pip + venv instead means providing one yourself.
 - Xcode Command Line Tools (`xcode-select --install`) — `eeane compile`
   uses `xcrun coremlcompiler`
-- [uv](https://docs.astral.sh/uv/) (for the development environment)
+- [uv](https://docs.astral.sh/uv/) — the recommended way to install
+  eeANE (see Installation below), and required for the development
+  workflow
+
+## Installation
+
+Install eeANE directly from this GitHub repository with any of the
+methods below.
+
+### uv (recommended)
+
+A single command installs eeANE together with the `[compile]` extra
+(torch/transformers), so the same environment can both compile models
+and serve them:
+
+```sh
+uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+```
+
+Pin a released tag (`@v0.10.0`, the latest release) for a reproducible
+install, or use `@main` to track the latest development version
+instead. To upgrade, run the same command with a newer tag and add
+`--force` to replace the existing install.
+
+### pipx
+
+```sh
+pipx install --python python3.12 "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+```
+
+pipx's default Python interpreter may be 3.13 or later, which eeANE
+does not yet support, so pass `--python` naming a Python 3.11 or 3.12
+executable available on your machine (for example `python3.11`, or a
+full path to one).
+
+### pip + venv
+
+```sh
+python3.12 -m venv eeane-env
+eeane-env/bin/pip install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+```
+
+Substitute `python3.11` if that is the supported interpreter you have
+available instead.
+
+### Lightweight install (server only)
+
+The `[compile]` extra pulls in torch and transformers, but the server
+itself never imports them — they are needed only when running `eeane
+compile` to convert a model into Core ML artifacts. Keeping them
+installed alongside the server costs disk space (a few GB) but has no
+effect on the server's memory use or behavior, so the combined install
+above is a reasonable default. If you would rather keep the
+always-installed environment down to eeANE's five runtime dependencies,
+install eeANE without the extra and run `eeane compile` from a
+disposable environment instead:
+
+```sh
+uv tool install "eeane @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+uvx --from "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0" eeane compile <model>
+```
 
 ## Compiling models and running the server
 
 ```sh
-git clone https://github.com/xhighhongo41/eeANE.git
-cd eeANE
-uv sync --extra compile   # torch/transformers are needed only for compiling
-
 # Compile models straight from their Hugging Face IDs (auto-downloaded)
 # or from local directories in HF distribution form. One-time; the
 # artifacts land under ~/.cache/eeane/ and each bucket takes ~30-100 s:
-uv run python -m eeane compile cl-nagoya/ruri-v3-310m
-uv run python -m eeane compile cl-nagoya/ruri-v3-reranker-310m
-uv run python -m eeane compile intfloat/multilingual-e5-base
+eeane compile cl-nagoya/ruri-v3-310m
+eeane compile cl-nagoya/ruri-v3-reranker-310m
+eeane compile intfloat/multilingual-e5-base
 
 # Each run ends with a ready-made [[models]] TOML snippet on stdout.
 # Since v0.7 the snippet is minimal -- usually just the model id --
 # because the server resolves everything else from the compiled-model
 # cache. Paste the snippets into ./eeane.toml (see eeane.example.toml),
 # then start the server:
-uv run python -m eeane serve
+eeane serve
 ```
 
 `eeane compile` picks the model backend from the model's `config.json`.
@@ -155,12 +216,12 @@ this order: `--config PATH` > `./eeane.toml` >
 environment variable override the file.
 
 ```sh
-uv run python -m eeane serve --config /path/to/eeane.toml
-uv run python -m eeane serve --host 192.168.1.20 --port 7997
+eeane serve --config /path/to/eeane.toml
+eeane serve --host 192.168.1.20 --port 7997
 
 # Validate a config file and print the resolved effective configuration
 # (the API key value is never printed) without starting the server:
-uv run python -m eeane check-config --config /path/to/eeane.toml
+eeane check-config --config /path/to/eeane.toml
 ```
 
 The config file lists the served models — any number of embedding and
@@ -173,8 +234,11 @@ calibration's recommended buckets. Spelling out `kind`, `tokenizer` and
 pins the entry independently of the cache. Within each kind the
 first-listed entry is the default model, used when a request does not
 name one. Reranker entries may be omitted entirely for an
-embedding-only server (`/rerank` then answers 503).
-`uv run python -m eeane.server` remains as an alias for `eeane serve`.
+embedding-only server (`/rerank` then answers 503). `python -m
+eeane.server` and `python -m eeane <subcommand>` remain available as
+backward-compatible aliases for `eeane serve` and the `eeane` command
+respectively (prefix both with `uv run` in the development
+environment).
 
 ### Batch-2 artifacts for embedding requests
 
@@ -294,16 +358,6 @@ set the embedding engine to OpenAI with base URL
 as the OpenAI API key / External reranker API key — Open WebUI sends it
 as the `Authorization` header eeANE expects.
 
-To verify a running server end to end (accuracy vs. direct Core ML
-inference, API compatibility, latency):
-
-```sh
-uv run python tools/verify_server.py all
-# Check one specific served model against direct Core ML inference:
-uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
-uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
-```
-
 ### Known limitations
 
 eeANE targets the Apple Neural Engine; running a compiled model on a
@@ -333,7 +387,37 @@ Troubleshooting below.
   verify Neural Engine availability on the machine serving the
   request.
 
-## Trying the PoC (historical development snapshot)
+## Development
+
+To work on eeANE itself, or to use the repository-only tools below,
+clone the repository and run commands with `uv run` from the checkout
+instead of installing the package:
+
+```sh
+git clone https://github.com/xhighhongo41/eeANE.git
+cd eeANE
+uv sync --extra compile   # torch/transformers are needed only for compiling
+uv run eeane compile cl-nagoya/ruri-v3-310m
+uv run eeane serve
+```
+
+`uv run eeane <subcommand>` runs the same `compile`/`serve`/
+`check-config` subcommands described above, from the checkout rather
+than an installed package.
+
+To verify a running server end to end (accuracy vs. direct Core ML
+inference, API compatibility, latency), and to lint and test the
+codebase in one step — both assume a repository checkout:
+
+```sh
+uv run python tools/verify_server.py all
+# Check one specific served model against direct Core ML inference:
+uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
+uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
+./tools/check.sh   # ruff lint + format check + pytest, in one step
+```
+
+### Trying the PoC (historical development snapshot)
 
 The `poc/` scripts are the frozen v0.1–v0.3 research record; the
 supported conversion path is `eeane compile` above. They remain runnable
