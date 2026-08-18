@@ -12,6 +12,11 @@ exact names being guarded against.
 The forbidden pattern strings are built by concatenation below so that
 this test file's own source never contains them verbatim; otherwise the
 scan (which also covers ``tests/**/*.py``) would flag itself.
+
+In addition to the fixed patterns, an optional untracked file at the
+repository root (see :data:`_LOCAL_PATTERNS_FILE`) can supply extra,
+machine-local patterns; when the file is absent (for example in CI) the
+scan simply runs with the fixed patterns alone.
 """
 
 from __future__ import annotations
@@ -19,6 +24,13 @@ from __future__ import annotations
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Optional, untracked list of additional patterns to scan for (one per
+# line; blank lines and ``#`` comments are ignored). Keeping this file
+# out of the repository lets a maintainer guard against reintroducing
+# strings that are specific to their own machine or deployment history
+# without publishing those strings themselves.
+_LOCAL_PATTERNS_FILE = _REPO_ROOT / ".guard-local-patterns.txt"
 
 # Glob patterns (relative to the repo root) for every publicly distributed
 # text file this policy applies to. ``poc/`` is deliberately excluded: it
@@ -40,6 +52,7 @@ _TARGET_FILES: tuple[str, ...] = (
     "README_ja.md",
     "eeane.example.toml",
     "pyproject.toml",
+    ".gitignore",
 )
 
 # Names of eeANE's non-public internal documents/labels. Each is built by
@@ -59,6 +72,28 @@ _FORBIDDEN_PATTERNS: tuple[str, ...] = (
 # now: add an entry here only together with a comment explaining why that
 # specific match is not actually a reference to non-public material.
 _ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
+
+
+def _load_local_patterns(path: Path) -> tuple[str, ...]:
+    """Read additional scan patterns from an optional local file.
+
+    Args:
+        path: Location of the pattern list; typically
+            :data:`_LOCAL_PATTERNS_FILE`. The file may be absent.
+
+    Returns:
+        One pattern per non-empty, non-comment line, stripped of
+        surrounding whitespace; an empty tuple if ``path`` does not
+        exist.
+    """
+    if not path.is_file():
+        return ()
+    patterns: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            patterns.append(stripped)
+    return tuple(patterns)
 
 
 def _target_files() -> list[Path]:
@@ -90,6 +125,7 @@ def _find_violations() -> list[str]:
         cannot be decoded as UTF-8 text are skipped (none are expected
         among the target files).
     """
+    patterns = _FORBIDDEN_PATTERNS + _load_local_patterns(_LOCAL_PATTERNS_FILE)
     violations: list[str] = []
     for path in _target_files():
         rel_path = path.relative_to(_REPO_ROOT).as_posix()
@@ -98,7 +134,7 @@ def _find_violations() -> list[str]:
         except UnicodeDecodeError:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
-            for pattern in _FORBIDDEN_PATTERNS:
+            for pattern in patterns:
                 if pattern in line and (rel_path, pattern) not in _ALLOWLIST:
                     violations.append(f"{rel_path}:{lineno}: {pattern!r}")
     return violations
@@ -110,3 +146,18 @@ def test_no_internal_document_references_in_public_files() -> None:
     assert not violations, "internal-document references found in public files:\n" + "\n".join(
         violations
     )
+
+
+def test_load_local_patterns_missing_file_yields_nothing(tmp_path: Path) -> None:
+    """An absent local pattern file must contribute no patterns."""
+    assert _load_local_patterns(tmp_path / "absent.txt") == ()
+
+
+def test_load_local_patterns_parses_lines_and_skips_comments(tmp_path: Path) -> None:
+    """Local patterns are read one per line, ignoring blanks and comments."""
+    path = tmp_path / "patterns.txt"
+    path.write_text(
+        "# a comment\n\nfirst-pattern\n  second pattern with spaces  \n\n# another\n",
+        encoding="utf-8",
+    )
+    assert _load_local_patterns(path) == ("first-pattern", "second pattern with spaces")

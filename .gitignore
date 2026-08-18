@@ -217,14 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# 開発資料フォルダ
-開発資料
-開発資料/*
-開発資料/**/*
-
-# PROJECT.md
-PROJECT.md
-
 # eeANE: local models and PoC outputs
 models/
 poc/results/
@@ -233,3 +225,6 @@ testdata/corpus/raw/
 
 # eeANE: local server configuration (commit eeane.example.toml instead)
 eeane.toml
+
+# eeANE: machine-local extra patterns for the public-text policy test
+.guard-local-patterns.txt

@@ -83,8 +83,8 @@ id = "cl-nagoya/ruri-v3-reranker-310m"
 
 # Optional, embedding models only: pairs a bucket with a second compiled artifact that infers
 # two inputs per Neural Engine call instead of one. Produced by `eeane compile <model>
-# --buckets <S> --batch 2`, run alongside the normal batch-1 compile; raised throughput by
-# about 25% on our test machine for requests with many short inputs. An id-only entry
+# --buckets <S> --batch 2`, run alongside the normal batch-1 compile; raised throughput for
+# requests with many short inputs by about 25% in benchmarks on an M2 Mac. An id-only entry
 # resolves this automatically once a batch-2 artifact is in the cache; the explicit form must
 # spell it out here, and requires [models.artifacts] to be explicit too. No batch-2 artifacts
 # configured: behavior is unchanged.

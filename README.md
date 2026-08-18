@@ -21,9 +21,9 @@ and most of your unified memory free for other work.
 > and an Infinity-compatible `/rerank` endpoint served from the ANE,
 > with responses that match direct Core ML inference exactly (a
 > 36-document rerank over HTTP takes ~2.0–5.6 s depending on chunk
-> length, ~3–8x faster than the same request against an
-> Infinity_emb/MPS deployment on the same machine, with ~750 MB
-> resident vs. 6–8 GB for the setup it replaces). **v0.5 makes the
+> length, ~3–8x faster than the same request served by infinity_emb
+> running the same model on the MPS GPU of the same M2 Mac mini, with
+> ~750 MB resident vs. 6–8 GB for that GPU stack). **v0.5 makes the
 > server configurable and operable**: a TOML config file plus an
 > `eeane serve` / `eeane check-config` CLI (bind address, port,
 > models and their buckets, log level), optional Bearer API key

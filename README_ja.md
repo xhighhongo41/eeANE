@@ -19,8 +19,9 @@ Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式に�
 > v0.4で最初のHTTPサーバーを実装: OpenAI互換の`/v1/embeddings`と
 > Infinity互換の`/rerank`をANEから直接サービングし、レスポンスはCore ML
 > 直接推論と完全一致します(HTTP経由の36文書rerankはチャンク長に応じて
-> 約2.0〜5.6秒で、同一マシンのInfinity_emb/MPS構成の約3〜8倍速。常駐
-> メモリ約750MB対6〜8GB)。**v0.5でサーバーが設定可能になりました**:
+> 約2.0〜5.6秒で、同一のM2 Mac mini上でinfinity_embが同じモデルを
+> MPS(GPU)でサービングした場合の約3〜8倍速。常駐メモリは約750MB、
+> 同GPU構成では6〜8GB)。**v0.5でサーバーが設定可能になりました**:
 > TOML設定ファイル+`eeane serve` / `eeane check-config` CLI(bind
 > アドレス・ポート・モデルとバケツ構成・ログレベル)、localhost外へ
 > 公開するための任意のBearer APIキー認証、OpenAI互換`GET /models`、
