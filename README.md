@@ -2,93 +2,38 @@
 
 **e**mbedding **e**ngine for **A**pple **N**eural **E**ngine
 
+[![PyPI](https://img.shields.io/pypi/v/eeane)](https://pypi.org/project/eeane/)
+[![CI](https://github.com/xhighhongo41/eeANE/actions/workflows/ci.yml/badge.svg)](https://github.com/xhighhongo41/eeANE/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+
 eeANE runs text embedding and reranking models on the Apple Neural
 Engine (ANE) of Apple Silicon Macs. Models are taken as-is in their
 Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **Status: early development (v0.10).**
-> v0.1–v0.3 proved the concept:
-> [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
-> (a Japanese ModernBERT embedding model) and
-> [cl-nagoya/ruri-v3-reranker-310m](https://huggingface.co/cl-nagoya/ruri-v3-reranker-310m)
-> (its cross-encoder reranker) are converted to Core ML through a
-> shared pipeline, verified for ANE inference and numerical accuracy,
-> and benchmarked on an M2 Mac mini at up to ~13,600 effective
-> tokens/s for embeddings (2–3x the MPS GPU baseline). v0.4 added the
-> first HTTP server: an OpenAI-compatible `/v1/embeddings` endpoint
-> and an Infinity-compatible `/rerank` endpoint served from the ANE,
-> with responses that match direct Core ML inference exactly (a
-> 36-document rerank over HTTP takes ~2.0–5.6 s depending on chunk
-> length, ~3–8x faster than the same request against an
-> Infinity_emb/MPS deployment on the same machine, with ~750 MB
-> resident vs. 6–8 GB for the setup it replaces). **v0.5 makes the
-> server configurable and operable**: a TOML config file plus an
-> `eeane serve` / `eeane check-config` CLI (bind address, port,
-> models and their buckets, log level), optional Bearer API key
-> authentication for serving beyond localhost, an OpenAI-compatible
-> `GET /models` listing, and rate limiting on `/health`. **v0.6 turns
-> model conversion into a product**: `eeane compile <model>` takes a
-> local directory or a Hugging Face model ID (auto-downloaded),
-> converts it into per-bucket `.mlmodelc` artifacts under
-> `~/.cache/eeane/`, freezes the tokenizer alongside them (verified
-> token-for-token against the original), runs a self-check (accuracy
-> vs. FP32, ANE placement, warm latency) whose report doubles as a
-> hardware compatibility report, and prints a ready-to-paste config
-> snippet. The server itself no longer needs torch or transformers —
-> heavyweight dependencies moved to the optional `[compile]` extra.
-> **v0.7 lays the multi-architecture, multi-model foundation**: a
-> defined backend interface makes adding an architecture a matter of
-> writing one backend module, and the first non-ModernBERT backend
-> (XLM-RoBERTa) is verified end to end on
-> [multilingual-e5-base](https://huggingface.co/intfloat/multilingual-e5-base),
-> [multilingual-e5-large](https://huggingface.co/intfloat/multilingual-e5-large)
-> and [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)
-> (compile → serve → exact HTTP/Core ML agreement, 93–98% ANE
-> placement). The server now serves any number of embedding and
-> reranker models at once and routes each request by its `model`
-> field, `eeane compile` records a per-machine calibration in the
-> artifact cache, and a `[[models]]` config entry can be just an
-> `id = "..."` line — everything else is resolved from that cache.
-> **v0.8 adds on-demand loading and idle unload**: `on_demand` is now
-> the default `load_policy` for a `[[models]]` entry (`[server]
-> default_load_policy` can change the default), so the server starts
-> without loading any model and loads one the moment a request first
-> needs it -- well under a second once its artifacts have loaded before
-> (0.3-0.8 s measured on a development Mac), except for the very first
-> load of a freshly compiled artifact, which can take tens of seconds
-> while macOS builds its Neural Engine cache for it (later loads, even
-> after a restart, are fast again). An on-demand model idle past its
-> `keep_alive` (`[server] keep_alive`, default 300 s, per-model
-> override) is unloaded automatically and reloaded on demand;
-> `load_policy = "resident"` keeps a model always loaded as before v0.8,
-> and `load_policy = "disabled"` removes an entry from service while
-> leaving it in the config. `[server] max_loaded_models` caps how many
-> models stay in memory at once, evicting the longest-idle on-demand
-> model first. `GET /health` now reports each model's `loaded` state.
-> **v0.9 hardens the server under load**: inference requests now pass
-> admission control — `[server] max_pending_requests` (default 500)
-> caps how many are accepted at once and the excess is rejected
-> immediately with `429` plus a `Retry-After` header, while a request
-> that waits longer than `[server] queue_timeout` (default 600 s) for
-> its turn is answered with `503` instead of waiting forever (a
-> request whose inference has started always runs to completion, and
-> shutdown drains in-flight requests, bounded by
-> `graceful_shutdown_timeout` if set). Identical concurrent requests
-> are served from a single computation (`coalesce_requests`, on by
-> default; 8 identical requests measured ~7x faster than without it),
-> and a model output containing NaN or infinite values — the sign of
-> an unsupported compute path — is reported as a clear `500` error
-> instead of being passed on. Embedding throughput for requests full
-> of short inputs can be raised ~25% (measured on a development Mac)
-> by compiling a batch-2 artifact (`eeane compile <model> --buckets
-> <S> --batch 2`), which the server picks up automatically for
-> id-only entries and uses to predict two same-bucket inputs of one
-> request together. **v0.10 makes eeANE installable directly from
-> GitHub**: `uv`, `pipx` and `pip` can each install it straight from
-> this repository (see Installation below), and the package now
-> provides an `eeane` console command in place of `python -m eeane`.
+## Highlights
+
+- **ANE inference**: embeddings at up to ~13,600 effective tokens/s on
+  an M2 Mac mini, 2–3x the same model served from the MPS GPU by
+  PyTorch — while leaving the GPU idle (see Performance below).
+- **No model modification, no re-distribution**: `eeane compile` takes
+  a Hugging Face model ID (or a local directory in HF distribution
+  form) and converts it on your machine, then verifies the result
+  against the FP32 original with a built-in self-check.
+- **Standard APIs**: OpenAI-compatible `/v1/embeddings` and
+  Infinity-compatible `/rerank`, so existing clients (Open WebUI among
+  them) connect by changing a base URL.
+- **Cheap to keep running**: models load on demand in well under a
+  second and unload after an idle timeout; the always-on server itself
+  is a small Python process with five runtime dependencies (no torch,
+  no transformers).
+- **Multi-model serving** with per-request routing, admission control
+  (429/503 + `Retry-After`), identical-request coalescing, and graceful
+  shutdown.
+- **Two architecture families supported today**: ModernBERT and
+  XLM-RoBERTa, both embedding and cross-encoder reranker models. More
+  are planned.
 
 ## Requirements
 
@@ -103,30 +48,30 @@ and most of your unified memory free for other work.
   eeANE (see Installation below), and required for the development
   workflow
 
+eeANE requires the Apple Neural Engine: CPU-only execution is not
+supported (see Known limitations). Docker is not supported either —
+containers on macOS run inside a Linux VM, and the ANE is not passed
+through to it.
+
 ## Installation
 
-Install eeANE directly from this GitHub repository with any of the
-methods below.
+eeANE is on [PyPI](https://pypi.org/project/eeane/). The `[compile]`
+extra adds torch/transformers, which only `eeane compile` needs; the
+combined install below gives one environment that can both compile
+models and serve them.
 
 ### uv (recommended)
 
-A single command installs eeANE together with the `[compile]` extra
-(torch/transformers), so the same environment can both compile models
-and serve them:
-
 ```sh
-uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+uv tool install "eeane[compile]"
 ```
 
-Pin a released tag (`@v0.10.0`, the latest release) for a reproducible
-install, or use `@main` to track the latest development version
-instead. To upgrade, run the same command with a newer tag and add
-`--force` to replace the existing install.
+To upgrade later, run `uv tool upgrade eeane`.
 
 ### pipx
 
 ```sh
-pipx install --python python3.12 "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+pipx install --python python3.12 "eeane[compile]"
 ```
 
 pipx's default Python interpreter may be 3.13 or later, which eeANE
@@ -138,7 +83,7 @@ full path to one).
 
 ```sh
 python3.12 -m venv eeane-env
-eeane-env/bin/pip install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+eeane-env/bin/pip install "eeane[compile]"
 ```
 
 Substitute `python3.11` if that is the supported interpreter you have
@@ -157,11 +102,25 @@ install eeANE without the extra and run `eeane compile` from a
 disposable environment instead:
 
 ```sh
-uv tool install "eeane @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
-uvx --from "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0" eeane compile <model>
+uv tool install eeane
+uvx --from "eeane[compile]" eeane compile <model>
 ```
 
-## Compiling models and running the server
+### Installing from GitHub
+
+To install a development snapshot or pin an exact repository revision,
+install from a git URL instead of PyPI — with any of the tools above,
+for example:
+
+```sh
+uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@main"
+```
+
+`@main` tracks the latest development version; `@v1.0.0` (or any other
+release tag) pins a released revision. To switch an existing install,
+run the same command with `--force`.
+
+## Quick start
 
 ```sh
 # Compile models straight from their Hugging Face IDs (auto-downloaded)
@@ -172,12 +131,24 @@ eeane compile cl-nagoya/ruri-v3-reranker-310m
 eeane compile intfloat/multilingual-e5-base
 
 # Each run ends with a ready-made [[models]] TOML snippet on stdout.
-# Since v0.7 the snippet is minimal -- usually just the model id --
-# because the server resolves everything else from the compiled-model
-# cache. Paste the snippets into ./eeane.toml (see eeane.example.toml),
-# then start the server:
+# The snippet is minimal -- usually just the model id -- because the
+# server resolves everything else from the compiled-model cache. Paste
+# the snippets into ./eeane.toml (see eeane.example.toml), then start
+# the server:
 eeane serve
 ```
+
+Then, from another shell:
+
+```sh
+curl -s http://127.0.0.1:7997/health
+
+curl -s http://127.0.0.1:7997/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "intfloat/multilingual-e5-base", "input": "hello eeANE"}'
+```
+
+### About `eeane compile`
 
 `eeane compile` picks the model backend from the model's `config.json`.
 Two architecture families are supported: **ModernBERT** (verified on
@@ -205,7 +176,7 @@ so the server needs neither the original model files nor the
 transformers library at run time (see
 [docs/dependency-policy.md](docs/dependency-policy.md)).
 
-### Configuration
+## Configuration
 
 The server runs with built-in defaults out of the box. To change them,
 copy [`eeane.example.toml`](eeane.example.toml) to `./eeane.toml` (or
@@ -230,7 +201,7 @@ reranker entries. A `[[models]]` entry usually needs only its
 embedding width are then resolved from the compiled-model cache
 (`server.cache_root`, default `~/.cache/eeane/`), honouring the
 calibration's recommended buckets. Spelling out `kind`, `tokenizer` and
-`[models.artifacts]` explicitly (the pre-v0.7 form) still works and
+`[models.artifacts]` explicitly still works and
 pins the entry independently of the cache. Within each kind the
 first-listed entry is the default model, used when a request does not
 name one. Reranker entries may be omitted entirely for an
@@ -240,32 +211,16 @@ backward-compatible aliases for `eeane serve` and the `eeane` command
 respectively (prefix both with `uv run` in the development
 environment).
 
-### Batch-2 artifacts for embedding requests
-
-Embedding models (not rerankers) may optionally be compiled with a
-second artifact per bucket that packs two inputs into one Neural Engine
-call: `eeane compile <model> --buckets <S> --batch 2`, run alongside
-the normal batch-1 compile. Serving it is opt-in through
-`[models.batch_artifacts]` on a `[[models]]` entry — a bucket ->
-artifact-path table mirroring `[models.artifacts]`. When a request
-routes two or more of its inputs to the same bucket, they are paired up
-and inferred through the batch-2 artifact instead of one at a time,
-which raised throughput by about 25% on our test machine for requests
-carrying many short inputs. An id-only entry resolves
-`batch_artifacts` automatically from the compiled-model cache once a
-batch-2 artifact has been compiled for it; the explicit form (which
-spells out `[models.artifacts]`) must spell out
-`[models.batch_artifacts]` too — it cannot be set on its own. A
-configuration without any batch-2 artifacts behaves exactly as before.
+## Serving and operations
 
 ### Model loading
 
-Since v0.8 the default `load_policy` for a `[[models]]` entry is
+The default `load_policy` for a `[[models]]` entry is
 `"on_demand"` (`[server] default_load_policy` can change the default;
 see `eeane.example.toml` for the setting): the server does not load
 any model at start-up, and loads one the moment a request first needs
 it. Once a model's artifacts have loaded once, a load is well under a
-second (0.3-0.8 s measured on a development Mac); the exception is the
+second (0.3-0.8 s measured on an M2 Mac); the exception is the
 very first load of an artifact right after `eeane compile` produced
 it, which can take tens of seconds while macOS builds its Neural
 Engine cache for it — a one-time cost that later loads, even after a
@@ -277,7 +232,7 @@ seconds (`[server] keep_alive`, default 300, overridable per model;
 `0` unloads it as soon as it goes idle) is unloaded automatically and
 reloaded on the next request that needs it. Set `load_policy =
 "resident"` on an entry to load it at start-up and keep it in memory
-for the server's whole run, matching the pre-v0.8 default. Set
+for the server's whole run. Set
 `load_policy = "disabled"` to keep an entry in the config file without
 serving it: it is absent from `GET /models` and `GET /health`, and a
 request naming its id gets a 404.
@@ -288,6 +243,24 @@ the longest-idle `on_demand` model is unloaded to make room;
 `resident` models and models currently handling a request are never
 evicted this way, so a configuration whose `resident` entries alone
 exceed the cap is rejected at start-up.
+
+### Batch-2 artifacts for embedding requests
+
+Embedding models (not rerankers) may optionally be compiled with a
+second artifact per bucket that packs two inputs into one Neural Engine
+call: `eeane compile <model> --buckets <S> --batch 2`, run alongside
+the normal batch-1 compile. Serving it is opt-in through
+`[models.batch_artifacts]` on a `[[models]]` entry — a bucket ->
+artifact-path table mirroring `[models.artifacts]`. When a request
+routes two or more of its inputs to the same bucket, they are paired up
+and inferred through the batch-2 artifact instead of one at a time,
+which raised throughput for requests carrying many short inputs by
+about 25% in benchmarks on an M2 Mac. An id-only entry resolves
+`batch_artifacts` automatically from the compiled-model cache once a
+batch-2 artifact has been compiled for it; the explicit form (which
+spells out `[models.artifacts]`) must spell out
+`[models.batch_artifacts]` too — it cannot be set on its own. A
+configuration without any batch-2 artifacts behaves exactly as before.
 
 ### Request admission, queueing and shutdown
 
@@ -329,7 +302,15 @@ default 60 requests/min per client IP, `0` disables). These are
 application-level safeguards only: for exposure beyond a trusted
 LAN/VPN, put the server behind a reverse proxy or firewall.
 
-### Endpoints
+### Running as a service
+
+To start the server automatically at login and keep it running, set it
+up as a macOS launchd agent — see [docs/launchd.md](docs/launchd.md)
+for a step-by-step guide and a ready-made plist template. Thanks to
+on-demand loading, an always-on eeANE agent costs almost nothing while
+idle.
+
+## API
 
 - `GET /health` — status and one entry per served model (`id`, `kind`,
   buckets in service, `loaded`), unauthenticated, rate-limited
@@ -358,23 +339,31 @@ set the embedding engine to OpenAI with base URL
 as the OpenAI API key / External reranker API key — Open WebUI sends it
 as the `Authorization` header eeANE expects.
 
-### Known limitations
+## Performance
 
-eeANE targets the Apple Neural Engine; running a compiled model on a
-CPU-only compute path is not supported. On a machine or configuration
-where the Neural Engine is not actually available to a compiled model,
-inference can produce non-finite (NaN/Inf) output — this has been
-observed across every architecture eeANE supports, with how often it
-happens depending on the architecture and the input's sequence length.
-Rather than silently return such a result, the server detects
-non-finite output at inference time and answers with `500 Internal
-Server Error` (for example: `model '<id>' produced a non-finite output
-for bucket <N>; the compiled model may have run on an unsupported
-compute path`). Seeing this error is a strong signal that the Neural
-Engine is not actually being used in your environment; see
-Troubleshooting below.
+Figures below were measured on an M2 Mac mini (macOS 13+, 16 GB), with
+the same models served from the MPS GPU by PyTorch (sentence-transformers)
+as the baseline:
 
-### Troubleshooting
+- **Embedding throughput**: up to ~13,600 effective (padding-excluded)
+  tokens/s on the ANE — 2–3x the MPS baseline, at a similar power draw
+  but 2.6–3.8x the energy efficiency per token, with the GPU left
+  entirely free.
+- **Reranking**: a 36-document rerank over HTTP completes in
+  ~2.0–5.6 s depending on chunk length, ~2–8x faster than the same
+  request against MPS-based serving of the same model.
+- **Memory**: a server holding one 310M-class embedding model and one
+  reranker resident stays around 750 MB; compiled weights live mostly
+  outside the Python process, and on-demand entries release their
+  memory when idle.
+- **Load times**: ~0.2–0.8 s per model once macOS has cached a
+  compiled artifact (the very first load after compiling takes tens of
+  seconds, once).
+
+Responses over HTTP are verified to match direct Core ML inference
+exactly (`tools/verify_server.py` in a repository checkout).
+
+## Troubleshooting
 
 - **`404 model not found`**: the `model` field a client sends must
   match a served model's configured `id` exactly. Check the ids eeANE
@@ -382,10 +371,39 @@ Troubleshooting below.
   eeANE version should note that the `model` field used to be ignored
   entirely, so a request naming anything (or nothing) used to succeed
   — that leniency is gone.
-- **`500 ... produced a non-finite output ...`**: see "Known
-  limitations" above. This means the model ran off the Neural Engine;
+- **`500 ... produced a non-finite output ...`**: see Known
+  limitations below. This means the model ran off the Neural Engine;
   verify Neural Engine availability on the machine serving the
   request.
+- **A request occasionally takes much longer than usual**: the first
+  request after a model was idle past `keep_alive` pays the on-demand
+  reload (typically well under a second), and the very first request
+  after `eeane compile` pays the one-time Neural Engine cache build
+  (tens of seconds). Both are expected; use `load_policy = "resident"`
+  if you need to avoid even the sub-second reload.
+
+## Known limitations
+
+- **ANE only**: eeANE targets the Apple Neural Engine; running a
+  compiled model on a CPU-only compute path is not supported. On a
+  machine or configuration where the Neural Engine is not actually
+  available to a compiled model, inference can produce non-finite
+  (NaN/Inf) output — this has been observed across every architecture
+  eeANE supports. Rather than silently return such a result, the
+  server detects non-finite output at inference time and answers with
+  `500 Internal Server Error`. Seeing this error is a strong signal
+  that the Neural Engine is not actually being used in your
+  environment.
+- **Verified hardware**: all published measurements and verifications
+  were run on an M2 Mac. Other Apple Silicon generations (M1/M3/M4...)
+  are expected to work but are unverified by the maintainer; the
+  self-check summary that `eeane compile` prints doubles as a
+  compatibility report for exactly this reason. Reports from other
+  machines — success or failure — are very welcome as GitHub issues.
+- **Long documents**: each input is truncated to its model's largest
+  compiled bucket (add larger buckets with `eeane compile --buckets`
+  if you need them); rerankers have no sliding-window handling for
+  documents beyond that.
 
 ## Development
 
@@ -447,6 +465,40 @@ uv run python poc/run_sweep.py --seq-lens 128,512 --batches 1,2      # S x B lat
 uv run python poc/benchmark_throughput.py --model embedding --chunk-tokens 128 --batch 2
 uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 32  # GPU baseline
 ```
+
+## Acknowledgments and related projects
+
+eeANE was inspired by
+[Infinity](https://github.com/michaelfeil/infinity), the open-source
+serving engine that showed how convenient a self-hosted,
+API-compatible embedding and reranking server can be — eeANE's
+`/rerank` API deliberately follows Infinity's schema so that clients
+can switch between the two by changing a URL.
+
+eeANE exists in the first place because its author could run
+ModernBERT-based embedding models on a GPU with Infinity. The two
+projects complement rather than compete with each other: eeANE runs
+models exclusively on the Apple Neural Engine of Apple Silicon Macs,
+and supports a deliberately small set of model architectures. If you
+want to serve embedding or reranking models on Linux or Windows, on
+NVIDIA/AMD GPUs or CPUs, or need a much wider model catalogue, by all
+means use Infinity.
+
+## Changelog
+
+| Version | Highlights |
+|---|---|
+| 1.0.0 | First stable release: published on PyPI, launchd service guide, documentation overhaul |
+| 0.10.0 | Installable straight from GitHub with uv/pipx/pip; `eeane` console command |
+| 0.9.0 | Admission control (429/503 + `Retry-After`), identical-request coalescing, graceful shutdown, non-finite output guard, opt-in batch-2 artifacts |
+| 0.8.0 | On-demand loading, idle unload (`keep_alive`), `max_loaded_models` eviction |
+| 0.7.0 | Multi-architecture backends (XLM-RoBERTa joins ModernBERT), multi-model serving and routing, cache auto-resolution with per-machine calibration |
+| 0.6.0 | `eeane compile`: HF ID/local directory -> Core ML artifacts with self-check and frozen tokenizer; torch-free server runtime |
+| 0.5.0 | TOML config + CLI, API key auth, `GET /models`, `/health` rate limit, CI |
+| 0.4.0 | First HTTP server: OpenAI-compatible embeddings, Infinity-compatible rerank |
+| 0.1.0–0.3.0 | Proof of concept: ANE conversion and inference of an embedding model and a reranker, accuracy verification, performance study vs. GPU |
+
+Details for each release: [GitHub Releases](https://github.com/xhighhongo41/eeANE/releases).
 
 ## License
 

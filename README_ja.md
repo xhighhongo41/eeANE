@@ -2,377 +2,425 @@
 
 **e**mbedding **e**ngine for **A**pple **N**eural **E**ngine
 
-eeANEは、Apple SiliconマックのApple Neural Engine (ANE)上でテキスト埋め込み
-モデルとrerankingモデルを動かすためのエンジンです。モデルは
-Hugging Faceの配布形式のまま取得し、ローカルでCore ML形式にコンパイルします。
-コンパイル済みモデルは数秒でロードでき、ANE上で推論するため、GPUと
-ユニファイドメモリの大部分を他の作業のために空けておけます。
+[![PyPI](https://img.shields.io/pypi/v/eeane)](https://pypi.org/project/eeane/)
+[![CI](https://github.com/xhighhongo41/eeANE/actions/workflows/ci.yml/badge.svg)](https://github.com/xhighhongo41/eeANE/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
-> **開発状況: 初期開発中 (v0.10)。**
-> v0.1〜v0.3で概念実証を完了:
-> [cl-nagoya/ruri-v3-310m](https://huggingface.co/cl-nagoya/ruri-v3-310m)
-> (日本語ModernBERT埋め込みモデル)と
-> [cl-nagoya/ruri-v3-reranker-310m](https://huggingface.co/cl-nagoya/ruri-v3-reranker-310m)
-> (そのクロスエンコーダ型reranker)を共通パイプラインでCore MLに変換し、
-> ANE推論・数値精度を検証のうえ、M2 Mac mini上で埋め込み最大約13,600
-> 実効トークン/秒(MPS GPUベースラインの2〜3倍)を計測済みです。
-> v0.4で最初のHTTPサーバーを実装: OpenAI互換の`/v1/embeddings`と
-> Infinity互換の`/rerank`をANEから直接サービングし、レスポンスはCore ML
-> 直接推論と完全一致します(HTTP経由の36文書rerankはチャンク長に応じて
-> 約2.0〜5.6秒で、同一マシンのInfinity_emb/MPS構成の約3〜8倍速。常駐
-> メモリ約750MB対6〜8GB)。**v0.5でサーバーが設定可能になりました**:
-> TOML設定ファイル+`eeane serve` / `eeane check-config` CLI(bind
-> アドレス・ポート・モデルとバケツ構成・ログレベル)、localhost外へ
-> 公開するための任意のBearer APIキー認証、OpenAI互換`GET /models`、
-> `/health`のレート制限を追加。**v0.6でモデル変換が製品機能になりました**:
-> `eeane compile <model>`はローカルディレクトリまたはHugging FaceのモデルID
-> (自動ダウンロード)を受け取り、バケツごとの`.mlmodelc`成果物を
-> `~/.cache/eeane/`配下に生成します。トークナイザは成果物ディレクトリへ
-> 「凍結」され(元のトークナイズとトークン単位で一致することを機械検証)、
-> 変換後にはセルフチェック(FP32基準の精度・ANE配置率・ウォームレイテンシ)
-> が走り、そのレポートはハードウェア互換性レポートを兼ねます。最後に
-> 設定ファイルへそのまま貼れるスニペットを出力します。サーバー本体は
-> torch/transformersに依存しなくなり、重量級の依存はオプションの
-> `[compile]`エクストラへ分離されました。**v0.7で多アーキテクチャ・
-> 多モデルの基盤ができました**: バックエンドインターフェースの確定に
-> より、アーキテクチャの追加は「バックエンドモジュールを1つ書く」作業
-> に定型化されました。最初の非ModernBERTバックエンド(XLM-RoBERTa)は
-> [multilingual-e5-base](https://huggingface.co/intfloat/multilingual-e5-base)・
-> [multilingual-e5-large](https://huggingface.co/intfloat/multilingual-e5-large)・
-> [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)
-> でエンドツーエンド検証済みです(compile→serve→HTTP応答とCore ML直接
-> 推論の完全一致、ANE配置率93〜98%)。サーバーは任意の数のembedding/
-> rerankerモデルを同時サービングし、リクエストの`model`フィールドで
-> ルーティングします。`eeane compile`はマシン別のキャリブレーション
-> 実測を成果物キャッシュに記録し、設定の`[[models]]`エントリは
-> `id = "..."`の1行だけで書けるようになりました(残りはキャッシュから
-> 自動解決)。**v0.8でオンデマンドロードとアイドルアンロードを追加
-> しました**: `[[models]]`エントリの既定`load_policy`が`on_demand`に
-> なりました(`[server] default_load_policy`で変更可)。サーバーは
-> 起動時にモデルをロードせず、最初にそのモデルを必要とするリクエスト
-> の時点でロードします。成果物が一度ロードされていれば、以降のロード
-> は1秒未満です(開発機実測0.3〜0.8秒程度)。例外はコンパイル直後の
-> 成果物を初めてロードするときで、OSがANE向けキャッシュを生成する
-> ため数十秒かかることがあります(サーバー再起動後も含め、2回目以降
-> は高速に戻ります)。この待ち時間は最初にロードを誘発したリクエスト
-> の応答時間に含まれます。on_demandモデルはアイドル時間が
-> `keep_alive`(`[server] keep_alive`、既定300秒、モデル毎上書き可)
-> を超えると自動アンロードされ、次のリクエストで再ロードされます。
-> `load_policy = "resident"`を指定するとv0.8以前と同様に常時ロード
-> のままになり、`load_policy = "disabled"`を指定するとエントリを
-> 設定に残したままサービング対象から外せます(APIに現れず、当該id
-> へのリクエストは404)。`[server] max_loaded_models`は同時にメモリへ
-> 保持するモデル数の上限で、超過時は最も長くアイドルなon_demand
-> モデルから追い出されます。`GET /health`は各モデルの`loaded`状態を
-> 返すようになりました。**v0.9で高負荷時の堅牢性を強化しました**:
-> 推論リクエストは受付制御を通るようになり、`[server]
-> max_pending_requests`(既定500)を超えた分は即座に429と
-> `Retry-After`ヘッダで拒否され、順番待ちが`[server] queue_timeout`
-> (既定600秒)を超えたリクエストは待ち続ける代わりに503で応答され
-> ます(推論が始まったリクエストは必ず完走します。シャットダウン
-> 時も処理中のリクエストは完遂まで待たれ、`graceful_shutdown_timeout`
-> で待ち時間の上限を設定できます)。同一内容のリクエストが処理中の
-> ものと重なった場合は計算を1回にして結果を共有します
-> (`coalesce_requests`、既定on。同一8リクエストの実測で約7倍高速)。
-> モデル出力にNaN/無限大が含まれる場合(サポート外の計算経路で実行
-> された兆候)は、壊れた数値を黙って返す代わりに明確な500エラーに
-> なります。短い入力を多数含むembeddingリクエストは、バッチ2成果物
-> を追加コンパイル(`eeane compile <model> --buckets <S> --batch 2`)
-> すると約25%スループットが向上します(開発機実測。id-onlyエントリ
-> では自動解決され、同一リクエスト内の同バケツ入力を2件ずつまとめて
-> 推論します)。**v0.10でGitHubから直接インストールできるように
-> なりました**: `uv`・`pipx`・`pip`のいずれからもこのリポジトリから
-> 直接インストールでき(下記のインストール節を参照)、`eeane`
-> コンソールコマンドが使えるようになりました(`python -m eeane`に
-> 代わるものです)。
+eeANEは、Apple Silicon MacのApple Neural Engine (ANE) 上でテキスト
+埋め込みモデルとrerankingモデルを実行します。モデルはHugging Face
+配布形式のまま取得し、ローカルでCore ML形式の成果物へコンパイル
+します。この成果物は数秒でロードでき、ANE上で実行されるため、
+GPUとユニファイドメモリの大部分を他の作業のために空けておけます。
+
+## ハイライト
+
+- **ANE推論**: M2 Mac miniで埋め込み処理は最大約13,600実効
+  トークン/秒に達し、PyTorchが同じモデルをMPS GPUでサービングした
+  場合の2〜3倍です — その間GPUはアイドルのままです(詳細は後述の
+  パフォーマンスを参照)。
+- **モデルの改変も再配布も不要**: `eeane compile`はHugging Faceの
+  モデルID(またはHF配布形式のローカルディレクトリ)を受け取って
+  あなたのマシン上で変換し、組み込みのセルフチェックで変換結果を
+  FP32のオリジナルと突き合わせて検証します。
+- **標準API**: OpenAI互換の`/v1/embeddings`とInfinity互換の
+  `/rerank`を提供するため、既存のクライアント(Open WebUIを含む)は
+  base URLを変更するだけで接続できます。
+- **常駐コストが低い**: モデルはオンデマンドで1秒未満のうちに
+  ロードされ、アイドルタイムアウト後にアンロードされます。常駐
+  させるサーバー本体はランタイム依存が5つだけの小さなPythonプロ
+  セスです(torchもtransformersも不要)。
+- **マルチモデルサービング**: リクエスト単位のルーティング、受付
+  制御(429/503 + `Retry-After`)、同一リクエストの併合、グレース
+  フルシャットダウンに対応。
+- **現時点で対応するアーキテクチャ系統は2つ**: ModernBERTと
+  XLM-RoBERTa。いずれもembeddingモデルとクロスエンコーダ型
+  rerankerモデルの両方に対応しています。さらなる系統の追加を計画
+  中です。
 
 ## 動作要件
 
-- Apple Siliconマック (M1以降)
+- Apple Silicon Mac (M1以降)
 - macOS 13以降
-- Python 3.11または3.12(3.13以降は未対応)。`uv`は対応するPythonを
-  自動的に解決します。pipxやpip+venvでインストールする場合は、対応
-  バージョンのPythonを自分で用意する必要があります。
-- Xcodeコマンドラインツール (`xcode-select --install`) — `eeane compile`
-  が`xcrun coremlcompiler`を使用します
-- [uv](https://docs.astral.sh/uv/) — eeANEのインストールに推奨(下記
-  インストール節を参照)。開発環境の構築にも必要です
+- Python 3.11または3.12(3.13以降は未対応)。`uv`は対応する
+  インタプリタを自動的に解決します。pipxやpip + venvでインストール
+  する場合は、対応バージョンを自分で用意する必要があります。
+- Xcodeコマンドラインツール (`xcode-select --install`) —
+  `eeane compile`が`xcrun coremlcompiler`を使用します
+- [uv](https://docs.astral.sh/uv/) — eeANEのインストールに推奨
+  される方法(下記のインストールを参照)であり、開発ワークフロー
+  にも必要です
+
+eeANEはApple Neural Engineを必須とします: CPUのみでの実行はサポート
+していません(既知の制限を参照)。Dockerもサポート対象外です —
+macOS上のコンテナはLinux VM内で動作し、ANEはそのVMへパススルー
+されません。
 
 ## インストール
 
-eeANEは以下のいずれかの方法で、このGitHubリポジトリから直接
-インストールできます。
+eeANEは[PyPI](https://pypi.org/project/eeane/)で公開されています。
+`[compile]`エクストラはtorch/transformersを追加しますが、これらが
+必要になるのは`eeane compile`だけです。下記の統合インストールを
+使えば、モデルのコンパイルとサービングの両方を1つの環境で行えます。
 
 ### uv (推奨)
 
-以下の1コマンドで`[compile]`エクストラ(torch/transformers)も
-含めてインストールされるため、同じ環境でモデルのコンパイルと
-サーバー起動の両方ができます:
-
 ```sh
-uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+uv tool install "eeane[compile]"
 ```
 
-タグを指定する`@v0.10.0`(最新リリース)は再現性のあるインストールに、
-`@main`は最新の開発版を追いたい場合に使います。アップグレードする
-ときは、新しいタグを指定した上で`--force`を付けて同じコマンドを
-実行し、既存のインストールを入れ替えてください。
+後でアップグレードする場合は`uv tool upgrade eeane`を実行してください。
 
 ### pipx
 
 ```sh
-pipx install --python python3.12 "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+pipx install --python python3.12 "eeane[compile]"
 ```
 
-pipxの既定Pythonが3.13以降だとeeANEの動作要件を満たさないため、
-`--python`にはマシン上にあるPython 3.11/3.12の実行ファイル名
-(例: `python3.11`)またはフルパスを指定してください。
+pipxの既定Pythonインタプリタは3.13以降であることがあり、eeANEは
+まだこれに対応していません。そのため`--python`にはマシン上で利用
+可能なPython 3.11または3.12の実行ファイル名(例: `python3.11`)、
+あるいはそのフルパスを指定してください。
 
 ### pip + venv
 
 ```sh
 python3.12 -m venv eeane-env
-eeane-env/bin/pip install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
+eeane-env/bin/pip install "eeane[compile]"
 ```
 
-対応するPythonが`python3.11`しかない場合はそちらに読み替えてください。
+利用可能な対応インタプリタが`python3.11`である場合はそちらに読み
+替えてください。
 
 ### 軽量インストール(サーバーのみ)
 
-`[compile]`エクストラが導入するtorchとtransformersが必要になるのは
-`eeane compile`(モデルをCore ML形式に変換するコマンド)を実行する
-ときだけで、サーバー本体はこれらを一切importしません。常設環境に
-含めておいてもディスクを数GB消費するだけでメモリ面への影響はない
-ため、上記のuvによる一括インストール(compile込み)のままで実害は
-ありません。それでも常設環境をeeANEのランタイム依存5つだけに保ち
-たい場合は、`[compile]`なしでeeANEをインストールし、`eeane compile`
-だけを使い捨ての一時環境から実行してください:
+`[compile]`エクストラはtorchとtransformersを導入しますが、サーバー
+本体はこれらを一切importしません — 必要になるのはモデルをCore ML
+成果物に変換する`eeane compile`を実行するときだけです。サーバーと
+一緒にインストールしておいてもディスク容量(数GB)を消費するだけで、
+サーバーのメモリ使用量や動作には影響しないため、上記の統合インス
+トールを既定とするのが妥当です。それでも常設環境をeeANEのランタイム
+依存5つだけに保ちたい場合は、エクストラなしでeeANEをインストールし、
+`eeane compile`は使い捨ての環境から実行してください:
 
 ```sh
-uv tool install "eeane @ git+https://github.com/xhighhongo41/eeANE@v0.10.0"
-uvx --from "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@v0.10.0" eeane compile <model>
+uv tool install eeane
+uvx --from "eeane[compile]" eeane compile <model>
 ```
 
-## モデルのコンパイルとサーバー起動
+### GitHubからのインストール
+
+開発中のスナップショットをインストールしたい場合や、リポジトリの
+特定リビジョンを固定したい場合は、PyPIの代わりにgit URLからインス
+トールします — 上記のいずれのツールでも、たとえば:
 
 ```sh
-# Hugging FaceのモデルID(自動ダウンロード)またはHF配布形式のローカル
-# ディレクトリから直接コンパイルします。初回のみ。成果物は
-# ~/.cache/eeane/ 配下に生成され、1バケツあたり約30〜100秒です:
+uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@main"
+```
+
+`@main`は最新の開発版を追跡し、`@v1.0.0`(または他の任意のリリース
+タグ)はリリース済みのリビジョンを固定します。既存のインストールを
+切り替えるには、同じコマンドに`--force`を付けて実行してください。
+
+## クイックスタート
+
+```sh
+# Hugging FaceのモデルID(自動ダウンロード)、またはHF配布形式の
+# ローカルディレクトリから直接モデルをコンパイルします。初回のみ
+# 必要で、成果物は ~/.cache/eeane/ 配下に生成され、1バケツあたり
+# 約30〜100秒です:
 eeane compile cl-nagoya/ruri-v3-310m
 eeane compile cl-nagoya/ruri-v3-reranker-310m
 eeane compile intfloat/multilingual-e5-base
 
-# 各実行の最後に[[models]]のTOMLスニペットが標準出力に表示されます。
-# v0.7以降のスニペットは最小形(基本はモデルidのみ)です — 残りの情報は
-# サーバーがコンパイル済みキャッシュから自動解決します。スニペットを
-# ./eeane.toml に貼り付けて(eeane.example.toml参照)、サーバーを起動します:
+# 各実行の最後に、そのまま使える[[models]]のTOMLスニペットが標準
+# 出力に表示されます。このスニペットは最小限(通常はモデルidのみ)
+# です。残りはサーバーがコンパイル済みモデルのキャッシュから自動
+# 解決するためです。スニペットを ./eeane.toml に貼り付けたら
+# (eeane.example.toml参照)、サーバーを起動します:
 eeane serve
 ```
 
-`eeane compile`はモデルの`config.json`からバックエンドを自動選択します。
-対応アーキテクチャは2系統: **ModernBERT**(cl-nagoya/ruri-v3-310mと
-同rerankerで検証済み)と**XLM-RoBERTa**(intfloat/multilingual-e5-base・
-intfloat/multilingual-e5-large・BAAI/bge-reranker-v2-m3で検証済み。
-embeddingモデルはモデルディレクトリが宣言するmean/CLSプーリングを自動
-適用)です。対応系統は1.0以降に順次拡充予定です。embedding/rerankerの
-種別も自動判別します。バケツの既定は埋め込み128/512/1024、reranker
-512/1024で、モデルの最大系列長へ自動クリップされます(最大512トークン
-のmultilingual-e5系は128/512になります)。`--buckets 512,2048`のように
-変更もできます(S2048はM2実機で約518ms/推論を検証済み)。再実行時は
-最新の成果物をスキップします(`--force`で再変換)。変換後には
-**セルフチェック**が走り、FP32基準の精度検証・Neural Engineへの配置率
-計測・ウォームレイテンシ記録を行います。表示されるサマリは互換性
-レポートを兼ねるので、未検証ハードウェア(M1/M3/M4など)で動かした際は
-ぜひIssueに貼ってください。バケツ別の実測はキャッシュ内の
-キャリブレーション記録(`model_info.json`)に集約され、セルフチェックに
-失敗したバケツはキャッシュ自動解決の設定がロードする推奨集合から
-除外されます。トークナイザは
-成果物ディレクトリへ凍結され、元のトークナイズとの完全一致が機械検証
-されるため、サーバー実行時には元のモデルファイルもtransformers
-ライブラリも不要です([docs/dependency-policy.md](docs/dependency-policy.md)
-参照)。
+続けて、別のシェルから:
 
-### 設定
+```sh
+curl -s http://127.0.0.1:7997/health
 
-サーバーは設定なしでも組み込みデフォルトで動作します。変更するには
-[`eeane.example.toml`](eeane.example.toml)を`./eeane.toml`(または
-`~/.config/eeane/eeane.toml`)にコピーして編集してください。設定ファイル
-の探索順は `--config PATH` > `./eeane.toml` >
-`~/.config/eeane/eeane.toml` > 組み込みデフォルト、です。CLIフラグ
-(`--host`/`--port`/`--log-level`)と環境変数`EEANE_API_KEY`は設定
-ファイルより優先されます。
+curl -s http://127.0.0.1:7997/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "intfloat/multilingual-e5-base", "input": "hello eeANE"}'
+```
+
+### `eeane compile`について
+
+`eeane compile`はモデルの`config.json`からバックエンドを自動選択
+します。対応するアーキテクチャ系統は2つです: **ModernBERT**
+(cl-nagoya/ruri-v3-310mと同rerankerで検証済み)と**XLM-RoBERTa**
+(intfloat/multilingual-e5-base・intfloat/multilingual-e5-large・
+BAAI/bge-reranker-v2-m3で検証済み。embeddingモデルではモデル
+ディレクトリが宣言するmean/CLSプーリングが自動的に適用されます)。
+さらなる系統は1.0以降に計画されています。コンパイラはモデルが
+embeddingモデルかrerankerかを自動判別し、既定のバケツはembedding
+が128/512/1024、rerankerが512/1024で、モデルの最大系列長にクリップ
+されます(最大512トークンのmultilingual-e5は128/512としてコンパイル
+されます)。`--buckets 512,2048`のようにカスタムの集合をコンパイル
+することもできます(S2048はM2実機で約518ms/推論を検証済み)。再実行
+時は最新の成果物をスキップします(`--force`で再変換)。変換のたびに
+**セルフチェック**が走り、FP32オリジナルに対する精度を検証し、どれ
+だけの演算がNeural Engineに配置されたかを計測し、ウォームレイテン
+シを記録します — 表示されるサマリは互換性レポートを兼ねるため、
+未検証のハードウェア(M1/M3/M4など)でeeANEを実行した場合は、ぜひ
+Issueに貼り付けてください。バケツごとの実測値はキャッシュ内の
+キャリブレーション記録(`model_info.json`)に集約され、セルフチェック
+に失敗したバケツは、キャッシュ自動解決の設定がロードする推奨集合
+から除外されます。トークナイザは成果物ディレクトリへ凍結され、元の
+トークナイズを完全に再現することが検証されるため、サーバーは実行時
+に元のモデルファイルもtransformersライブラリも必要としません
+([docs/dependency-policy.md](docs/dependency-policy.md)を参照)。
+
+## 設定
+
+サーバーは組み込みのデフォルト設定でそのまま動作します。変更する
+には、[`eeane.example.toml`](eeane.example.toml)を`./eeane.toml`
+(または`~/.config/eeane/eeane.toml`)にコピーして編集してください。
+設定ファイルは次の順序で探索されます: `--config PATH` >
+`./eeane.toml` > `~/.config/eeane/eeane.toml` > 組み込みデフォルト。
+`--host`/`--port`/`--log-level`のCLIフラグと環境変数
+`EEANE_API_KEY`は設定ファイルより優先されます。
 
 ```sh
 eeane serve --config /path/to/eeane.toml
 eeane serve --host 192.168.1.20 --port 7997
 
-# 設定ファイルを検証し、解決後の有効設定を表示します (サーバーは起動
-# しません。APIキーの値は表示されません):
+# 設定ファイルを検証し、解決後の有効な設定を表示します
+# (APIキーの値は表示されません)。サーバーは起動しません:
 eeane check-config --config /path/to/eeane.toml
 ```
 
-設定ファイルにはサービングするモデルを列挙します — embedding/reranker
-とも複数エントリを書けます。`[[models]]`エントリは通常`id = "..."`だけ
-で足ります: kind・凍結済みトークナイザ・バケツごとの成果物・埋め込み
-次元は、`eeane compile`が書いたキャッシュ(`server.cache_root`、既定
-`~/.cache/eeane/`)から自動解決され、キャリブレーションの推奨バケツが
-ロードされます。`kind`/`tokenizer`/`[models.artifacts]`を明示する
-書き方(v0.7以前の形式)も引き続き有効で、キャッシュと独立にエントリを
-固定できます。各kindの中では設定に最初に書いたエントリが既定モデルに
-なり、`model`未指定のリクエストを処理します。rerankerエントリは省略
-可能で、その場合はembedding専用サーバーになります(`/rerank`は503を
-返します)。`python -m eeane.server`と`python -m eeane <サブコマンド>`は、
-それぞれ`eeane serve`と`eeane`コマンドの後方互換エイリアスとして
-引き続き使えます(開発環境では両方とも`uv run`を先頭に付けます)。
+設定ファイルにはサービングするモデルを列挙します — embedding・
+rerankerとも任意の数のエントリを書けます。`[[models]]`エントリは
+通常`id = "..."`だけで足ります: kind・凍結済みトークナイザ・バケツ
+ごとの成果物・埋め込み次元は、コンパイル済みモデルのキャッシュ
+(`server.cache_root`、既定`~/.cache/eeane/`)から、キャリブレーション
+が推奨するバケツに従って自動解決されます。`kind`・`tokenizer`・
+`[models.artifacts]`を明示的に書く方式も引き続き有効で、その場合は
+キャッシュとは独立にエントリが固定されます。各kindの中では最初に
+列挙したエントリが既定モデルとなり、`model`を指定しないリクエスト
+で使われます。rerankerエントリはembedding専用サーバーの場合は丸ごと
+省略できます(その場合`/rerank`は503を返します)。`python -m
+eeane.server`と`python -m eeane <サブコマンド>`は、それぞれ
+`eeane serve`と`eeane`コマンドの後方互換エイリアスとして引き続き
+利用できます(開発環境ではどちらも先頭に`uv run`を付けます)。
 
-### バケツごとのバッチ2成果物 (embeddingリクエスト向け)
-
-embeddingモデル(reranker除く)は任意で、バケツごとに2件目の成果物を
-追加コンパイルできます。1回のNeural Engine呼び出しで2件の入力を
-まとめて処理する成果物です:
-`eeane compile <model> --buckets <S> --batch 2`を、通常のバッチ1
-コンパイルと合わせて実行します。サービングは任意選択で、`[[models]]`
-エントリの`[models.batch_artifacts]`(`[models.artifacts]`と同じ形の
-バケツ→成果物パスのテーブル)で有効化します。1リクエスト内で2件以上
-の入力が同じバケツにルーティングされた場合、1件ずつではなくバッチ2
-成果物でまとめて2件ずつ推論され、短い入力を多数含むリクエストで手元
-計測では約25%スループットが向上しました。id-onlyエントリは、バッチ2
-成果物がキャッシュにコンパイル済みであれば`batch_artifacts`を自動
-解決します。明示形式(`[models.artifacts]`を明示するもの)では
-`[models.batch_artifacts]`も明示する必要があり、単独では設定できません。
-バッチ2成果物が無い構成の動作は従来と完全に同一です。
+## サービングと運用
 
 ### モデルのロード
 
-v0.8から`[[models]]`エントリの既定`load_policy`は`"on_demand"`です
-(既定値は`[server] default_load_policy`で変更可能。設定例は
-`eeane.example.toml`参照)。サーバーは起動時に一切モデルをロードせず、
-最初にそのモデルを必要とするリクエストの時点でロードします。一度
-ロード済みの成果物であれば、次のロードは1秒未満です(開発機実測
-0.3〜0.8秒程度)。例外は`eeane compile`が生成した直後の成果物を初めて
-ロードするときで、OSがそのモデル用にANE向けキャッシュを生成するため
-数十秒かかることがあります(サーバーを再起動しても、2回目以降は
-高速です)。この待ち時間は、ロードを誘発したリクエストの応答時間に
-含まれます。
+`[[models]]`エントリの既定`load_policy`は`"on_demand"`です(既定値
+は`[server] default_load_policy`で変更できます。設定方法は
+`eeane.example.toml`を参照): サーバーは起動時にどのモデルもロード
+せず、最初にそのモデルを必要とするリクエストが来た時点でロードし
+ます。モデルの成果物が一度ロードされていれば、以降のロードは1秒
+未満で完了します(M2 Macでの実測は0.3〜0.8秒)。例外は`eeane compile`
+が成果物を生成した直後にその成果物を初めてロードするときで、macOS
+がそのモデル用のNeural Engineキャッシュを構築するため数十秒かかる
+ことがあります — これは一度きりのコストで、サーバーを再起動した
+後であっても、以降のロードでは再び発生しません。この待ち時間は、
+そのロードを誘発したリクエストの応答時間に含まれます。
 
 on_demandモデルは、`keep_alive`秒(`[server] keep_alive`、既定300、
-モデル毎に上書き可能。`0`はアイドルになり次第アンロード)の間リクエ
-ストに応答しなかった場合に自動アンロードされ、次に必要とするリクエ
-ストで再ロードされます。エントリに`load_policy = "resident"`を指定
-すると起動時にロードされ、サーバーの実行中ずっとメモリに保持されます
-(v0.8以前の既定動作)。`load_policy = "disabled"`を指定すると、その
-エントリを設定ファイルに残したままサービング対象から外せます:
-`GET /models`と`GET /health`には現れず、そのidを指定したリクエストは
-404になります。
+モデルごとに上書き可能。`0`はアイドルになり次第アンロード)の間
+どのリクエストにも応答しなかった場合、自動的にアンロードされ、次に
+そのモデルを必要とするリクエストで再ロードされます。エントリに
+`load_policy = "resident"`を設定すると、起動時にロードされ、
+サーバーの実行中ずっとメモリに保持されます。`load_policy =
+"disabled"`を設定すると、エントリを設定ファイルに残したまま
+サービング対象から外せます: `GET /models`と`GET /health`には現れ
+ず、そのidを指定したリクエストは404になります。
 
 `[server] max_loaded_models`は、同時にメモリへ保持できるモデル数の
-上限です(未設定なら無制限)。この上限を超えてモデルをロードする必要
-があるときは、最も長くアイドルなon_demandモデルから追い出してメモリ
-を確保します。residentモデルと現在リクエストを処理中のモデルは追い
-出し対象になりません。したがって、residentエントリの数だけで上限を
-超える設定は起動時にエラーになります。
+上限です(未設定なら無制限)。この上限を超えてモデルをロードする
+必要が生じた場合は、最も長くアイドルな`on_demand`モデルから追い
+出してメモリを確保します。`resident`モデルと現在リクエストを処理中
+のモデルはこの方法で追い出されることはないため、`resident`エントリ
+だけで上限を超える設定は起動時に拒否されます。
+
+### embeddingリクエスト向けバッチ2成果物
+
+embeddingモデル(reranker以外)は任意で、バケツごとに2件目の成果物
+を追加コンパイルできます。これは1回のNeural Engine呼び出しに2件の
+入力をまとめて詰め込む成果物です: 通常のバッチ1コンパイルに加えて
+`eeane compile <model> --buckets <S> --batch 2`を実行します。
+サービングするかどうかは任意選択で、`[[models]]`エントリの
+`[models.batch_artifacts]`(`[models.artifacts]`と同じ形の、バケツ
+→成果物パスのテーブル)で有効化します。1リクエスト内で2件以上の
+入力が同じバケツにルーティングされた場合、それらはペアにまとめら
+れ、1件ずつではなくバッチ2成果物で推論されます。これはM2 Mac上の
+ベンチマークで、短い入力を多数含むリクエストのスループットを約
+25%向上させました。id-onlyエントリは、バッチ2成果物がコンパイル
+済みであれば`batch_artifacts`をコンパイル済みモデルのキャッシュ
+から自動解決します。明示形式(`[models.artifacts]`を明示するもの)
+では`[models.batch_artifacts]`も明示する必要があり、単独では設定
+できません。バッチ2成果物を持たない構成の動作は従来と完全に同一
+です。
 
 ### リクエストの受付・キューイング・シャットダウン
 
 `server.max_pending_requests`は、サーバーが同時に受け付ける推論
-リクエスト数の上限です(処理中+待機中の合計。既定500、`0`は無制限)。
-上限に達した後に届いたリクエストは、`Retry-After`ヘッダ付きの
+リクエスト数の上限です。現在実行中のリクエストと順番待ち中の
+リクエストの両方を数えます(既定500、`0`は無制限)。上限に達した後
+に到着したリクエストは、`Retry-After`ヘッダ付きの
 `429 Too Many Requests`で即座に拒否されます。
 
-`server.queue_timeout`は、受理されたリクエストが推論開始まで待って
-よい時間の上限です(既定600秒、`0`はタイムアウト無効)。この上限を
-超えて待ったリクエストは、`Retry-After`ヘッダ付きの
-`503 Service Unavailable`で打ち切られます。推論が開始した後の
-リクエストは、どれだけ時間がかかってもこのタイムアウトで中断される
-ことはありません。いずれの場合も`Retry-After`は、クライアントに
-何秒後の再試行を推奨するかを伝えます。
+`server.queue_timeout`は、受け付けられたリクエストが実際に推論を
+開始するまで待ってよい時間の上限です(既定600秒、`0`でタイムアウト
+無効)。この上限を超えて待ったリクエストは、`Retry-After`ヘッダ付
+きの`503 Service Unavailable`で打ち切られます。推論を開始した後の
+リクエストは、どれだけ時間がかかってもこのタイムアウトによって
+中断されることはありません。いずれの場合も`Retry-After`は、クライ
+アントに何秒待って再試行すべきかを伝えます。
 
 `server.coalesce_requests`(既定`true`)は、処理中のリクエストと
-内容が同一(同一モデル・同一入力)の新規リクエストが届いた場合に、
-推論を2回実行する代わりに新規リクエストを処理中のリクエストへ
-併合し、完了時に同じ結果を共有します。
+内容が同一(同一モデル・同一入力)の新規リクエストが届いた場合、
+それを既存のリクエストへ併合します: 推論を2回実行する代わりに、
+2件目のリクエストは1件目に相乗りし、完了時に同じ結果を受け取り
+ます。
 
-`server.graceful_shutdown_timeout`は、SIGTERMやCtrl-Cを受けたときに
-in-flightリクエストの完了をサーバーが待つ時間の上限です(既定は
-未設定=全件完了まで無期限に待つ。待っている間は新規接続を受け付け
-ません)。秒数を指定すると、その待ち時間に上限をかけられます。
+`server.graceful_shutdown_timeout`は、SIGTERMやCtrl-Cを受信した
+ときに、実行中(in-flight)のリクエストの完了をサーバーが待つ時間の
+上限です(既定は未設定で、その場合はどれだけ時間がかかっても全件
+の完了まで待ちます。待っている間は新規接続を受け付けません)。秒数
+を指定すると、その待ち時間に上限をかけられます。
 
 ### localhost外への公開
 
-非loopbackアドレスへのbind(`--host`または`server.host`)はサーバーを
-ネットワークへ公開します。APIキー — 設定ファイルの`api_key`(ファイル
-は`chmod 600`推奨)または環境変数`EEANE_API_KEY` — を設定すると、
-`GET /health`以外の全エンドポイントが`Authorization: Bearer <key>`
-ヘッダを要求するようになります。キーなしで非loopbackアドレスを
-サービングすると起動時に警告が出ます。`/health`は監視用途のため常に
-無認証で開放され、代わりにレート制限がかかります
-(`server.health_rate_limit`、既定60リクエスト/分/クライアントIP、`0`で
-無効)。これらはアプリケーション層の保護にすぎません。信頼できる
-LAN/VPNの外へ公開する場合はリバースプロキシやファイアウォールの背後に
-置いてください。
+非loopbackアドレスへのbind(`--host`または`server.host`)は、
+サーバーをあなたのネットワークへ公開します。APIキーを設定して
+ください — 設定ファイルの`api_key`(`chmod 600`にしておくこと)、
+または環境変数`EEANE_API_KEY`です — そうすると`GET /health`を除く
+全エンドポイントが`Authorization: Bearer <key>`ヘッダを要求する
+ようになります。APIキーなしで非loopbackアドレスをサービングする
+と、サーバーは警告ログを出します。`/health`は監視用途のため常に
+開放されており、代わりにレート制限がかかります
+(`server.health_rate_limit`、既定60リクエスト/分/クライアントIP、
+`0`で無効)。これらはあくまでアプリケーション層の保護策です: 信頼
+できるLAN/VPNの外へ公開する場合は、サーバーをリバースプロキシや
+ファイアウォールの背後に置いてください。
 
-### エンドポイント
+### サービスとして起動する
 
-- `GET /health` — ステータスとサービス中モデルの一覧(モデルごとに
-  `id`/`kind`/バケツ/`loaded`)。無認証・レート制限あり
-- `GET /models` (エイリアス: `GET /v1/models`) — OpenAI互換の全モデル一覧
-- `POST /v1/embeddings` (エイリアス: `POST /embeddings`) — OpenAI互換
-  (`input`は文字列またはリスト、`encoding_format`は`float`/`base64`)。
-  埋め込みは既定でL2正規化して返します (モデル毎の`normalize`設定)
-- `POST /rerank`, `POST /v1/rerank` — Infinity互換
+ログイン時にサーバーを自動起動し、稼働させ続けるには、macOSの
+launchd agentとして登録します — 手順とそのまま使えるplistテンプ
+レートは[docs/launchd.md](docs/launchd.md)を参照してください。
+オンデマンドロードのおかげで、常駐させたeeANE agentはアイドル中
+ほぼコストがかかりません。
+
+## API
+
+- `GET /health` — ステータスと、サービス中モデルごとのエントリ
+  (`id`・`kind`・サービス中のバケツ・`loaded`)。無認証・レート
+  制限あり
+- `GET /models`(エイリアス: `GET /v1/models`) — サービング中の
+  全モデルのOpenAI互換リスト
+- `POST /v1/embeddings`(エイリアス: `POST /embeddings`) —
+  OpenAI互換(`input`は文字列またはリスト、`encoding_format`は
+  `float`/`base64`)。埋め込みは既定でL2正規化されます(モデル
+  ごとの`normalize`設定)
+- `POST /rerank`、`POST /v1/rerank` — Infinity互換
   (`query`/`documents`/`top_n`/`return_documents`/`raw_scores`)
 
-embeddings/rerankリクエストの`model`フィールド(省略可)は、設定した
-モデルidでサービング対象を選択します。省略時はそのエンドポイントの
-kindの既定モデル(設定順の先頭)が使われます。未知のidは利用可能なid
-一覧付きの404、別kindのモデルidを指定した場合は400になります。
-embeddings/rerankエンドポイントは`/v1`配下とルート直下の両方で提供される
-ため、base URLは`/v1`付き・なしのどちらでも動作します。各入力はその
-モデルの最小の収まる固定長バケツに自動ルーティングされ、最大バケツを
-超える入力は警告ログ付きで切り詰められます。
+embeddingsとrerankリクエストの`model`フィールド(省略可能)は、
+設定されたidでサービング対象のモデルを選択します。省略した場合は、
+そのエンドポイントのkindにおいて設定に最初に列挙されたモデルが
+選ばれます。未知のidを指定すると、サービング可能なid一覧付きの
+404が返り、別のkindのモデルを指定すると400が返ります。embeddings
+とrerankのエンドポイントは`/v1`配下とルート直下の両方でサービング
+されるため、base URLは`/v1`サフィックスの有無どちらでも動作します。
+各入力はそのモデルの、収まる最小の系列長バケツにルーティングされ、
+それより長い場合は最大バケツに切り詰められ、サーバー側で警告が
+出ます。
 
-[Open WebUI](https://github.com/open-webui/open-webui)から使う場合:
-埋め込みエンジンをOpenAIにしてbase URLを`http://127.0.0.1:7997/v1`、
-rerankingエンジンをExternalにしてURLを`http://127.0.0.1:7997/rerank`に
-設定してください。APIキーを設定した場合は、OpenAI APIキー欄 / External
-reranker APIキー欄にそのキーを入力してください — Open WebUIはeeANEが
-期待する`Authorization`ヘッダとして送信します。
+[Open WebUI](https://github.com/open-webui/open-webui)からeeANEを
+使うには: 埋め込みエンジンをOpenAIに設定し、base URLを
+`http://127.0.0.1:7997/v1`にします。rerankingエンジンはExternalに
+設定し、URLを`http://127.0.0.1:7997/rerank`にします。APIキーを
+設定した場合は、それをOpenAI APIキー欄 / External reranker APIキー
+欄に入力してください — Open WebUIはeeANEが期待する`Authorization`
+ヘッダとしてそれを送信します。
 
-### 既知の制限
+## パフォーマンス
 
-eeANEはApple Neural Engineでの実行を前提としており、コンパイル済み
-モデルをCPUのみの計算経路で実行することはサポートしていません。
-Neural Engineが実際には利用できないマシンや構成でコンパイル済み
-モデルを実行すると、推論結果が非有限値(NaN/Inf)になることが実測で
-確認されています — これは対応する全アーキテクチャで発生し、発生
-頻度はアーキテクチャと入力の系列長に依存します。サーバーはこの
-ような結果を黙って返す代わりに、実行時に非有限値の出力を検出した
-場合`500 Internal Server Error`を返します(エラーメッセージ例:
-`model '<id>' produced a non-finite output for bucket <N>; the
-compiled model may have run on an unsupported compute path`)。この
-エラーが出た場合、実行環境でNeural Engineが実際には使えていない
-可能性が高いです。詳しくは下記のトラブルシューティングを参照して
-ください。
+以下の数値はM2 Mac mini(macOS 13以降、16GB)で計測したものです。
+ベースラインには、同じモデルをPyTorch(sentence-transformers)が
+MPS GPUでサービングした場合を用いています:
 
-### トラブルシューティング
+- **埋め込みスループット**: ANE上で最大約13,600実効(パディング
+  除外後)トークン/秒 — MPSベースラインの2〜3倍。消費電力は同程度
+  ながら、トークンあたりのエネルギー効率は2.6〜3.8倍で、GPUは完全
+  に空いたままです。
+- **Reranking**: HTTP経由の36文書rerankはチャンク長に応じて約
+  2.0〜5.6秒で完了し、同じモデルをMPSベースでサービングした場合の
+  同一リクエストと比べて約2〜8倍高速です。
+- **メモリ**: 310Mクラスのembeddingモデル1つとreranker 1つを常駐
+  させたサーバーは約750MBに収まります。コンパイル済みの重みの大
+  部分はPythonプロセスの外に存在し、on_demandエントリはアイドル
+  時にメモリを解放します。
+- **ロード時間**: macOSがコンパイル済み成果物をキャッシュした後
+  は、モデル1つあたり約0.2〜0.8秒です(コンパイル直後の最初の1回
+  だけは数十秒かかります)。
 
-- **`404 model not found`**: クライアントが送る`model`フィールドは、
-  サーバー側で設定した`id`と完全に一致している必要があります。
-  `GET /models`でeeANEが実際にサービングしているid一覧を確認して
-  ください。旧バージョンからの移行クライアントは、以前は`model`
-  フィールドが完全に無視されていたため任意の名前(または未指定)で
-  動作していた点に注意してください — その挙動はなくなりました。
-- **`500 ... produced a non-finite output ...`**: 上記「既知の制限」
-  を参照してください。モデルがNeural Engine上で動作していないことを
-  意味します。リクエストを処理したマシンでNeural Engineが利用可能か
-  確認してください。
+HTTP経由のレスポンスは、Core ML直接推論と完全に一致することを
+検証しています(リポジトリのチェックアウトにある
+`tools/verify_server.py`)。
+
+## トラブルシューティング
+
+- **`404 model not found`**: クライアントが送る`model`フィールド
+  は、サービング中モデルの設定`id`と完全に一致している必要があり
+  ます。eeANEが実際にサービングしているidは`GET /models`で確認し
+  てください。旧バージョンのeeANEから移行したクライアントは、
+  以前は`model`フィールドが完全に無視されていたため、任意の値
+  (または未指定)を指定したリクエストが成功していた点に注意して
+  ください — その寛容な挙動はなくなりました。
+- **`500 ... produced a non-finite output ...`**: 下記の既知の
+  制限を参照してください。これはモデルがNeural Engine以外で実行
+  されたことを意味します。リクエストを処理しているマシンでNeural
+  Engineが利用可能か確認してください。
+- **リクエストがまれに通常よりずっと時間がかかる**: モデルが
+  `keep_alive`を超えてアイドルだった後の最初のリクエストは、オン
+  デマンド再ロードのコストを負担します(通常は1秒未満)。また、
+  `eeane compile`直後の最初のリクエストは、一度きりのNeural
+  Engineキャッシュ構築のコストを負担します(数十秒)。どちらも
+  想定内の挙動です。1秒未満の再ロードすら避けたい場合は
+  `load_policy = "resident"`を使ってください。
+
+## 既知の制限
+
+- **ANE専用**: eeANEはApple Neural Engineでの実行を対象としてお
+  り、コンパイル済みモデルをCPUのみの計算経路で実行することは
+  サポートしていません。Neural Engineがコンパイル済みモデルから
+  実際には利用できないマシンや構成では、推論結果が非有限値
+  (NaN/Inf)になることがあります — これはeeANEが対応する全アーキ
+  テクチャで観測されています。サーバーはそのような結果を黙って
+  返す代わりに、推論時に非有限値の出力を検出し、`500 Internal
+  Server Error`で応答します。このエラーが出た場合は、あなたの
+  環境で実際にはNeural Engineが使われていないことを示す強い
+  シグナルです。
+- **検証済みハードウェア**: 公開しているすべての計測値と検証は
+  M2 Macで実施したものです。他のApple Siliconの世代(M1/M3/M4
+  など)でも動作すると見込まれますが、メンテナによる検証は行われ
+  ていません。`eeane compile`が表示するセルフチェックのサマリが
+  互換性レポートを兼ねているのはまさにこのためです。他のマシン
+  からの報告は、成功・失敗を問わずGitHub issueで大歓迎です。
+- **長い文書**: 各入力は、そのモデルのコンパイル済み最大バケツに
+  切り詰められます(必要であれば`eeane compile --buckets`でより
+  大きなバケツを追加してください)。rerankerには、それを超える
+  文書に対するスライディングウィンドウ処理はありません。
 
 ## 開発
 
-eeANE自体の開発や、以下のリポジトリ前提のツールを使う場合は、
-リポジトリをcloneし、インストール済みパッケージの代わりに`uv run`
-でチェックアウトから直接コマンドを実行します:
+eeANE自体の開発を行う場合、または以下のリポジトリ限定のツールを
+使う場合は、リポジトリをcloneし、パッケージをインストールする
+代わりにチェックアウトから`uv run`でコマンドを実行します:
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git
@@ -383,34 +431,37 @@ uv run eeane serve
 ```
 
 `uv run eeane <サブコマンド>`は、上記で説明した`compile`/`serve`/
-`check-config`と同じサブコマンドを、インストール済みパッケージでは
-なくチェックアウトから実行します。
+`check-config`と同じサブコマンドを、インストール済みパッケージで
+はなくチェックアウトから実行します。
 
-起動中のサーバーの検証(Core ML直接推論との一致・API互換・レイテンシ)、
-およびlint・テストの一括実行は、いずれもリポジトリのチェックアウトが
-前提です:
+稼働中のサーバーをエンドツーエンドで検証する(Core ML直接推論との
+精度比較・API互換性・レイテンシ)、および1ステップでコードベースを
+lint・テストする、いずれもリポジトリのチェックアウトを前提とし
+ます:
 
 ```sh
 uv run python tools/verify_server.py all
-# 特定のサービング中モデルをCore ML直接推論と突き合わせる場合:
+# 特定のサービング中モデルをCore ML直接推論と突き合わせて確認する場合:
 uv run python tools/verify_server.py verify-embedding --model intfloat/multilingual-e5-base
 uv run python tools/verify_server.py verify-rerank --model BAAI/bge-reranker-v2-m3
-./tools/check.sh   # ruff lint + フォーマットチェック + pytest を一括実行
+./tools/check.sh   # ruff lint + フォーマットチェック + pytest を1ステップで実行
 ```
 
-### PoCを試す (歴史的な開発スナップショット)
+### PoCを試す(歴史的な開発スナップショット)
 
-`poc/`のスクリプトはv0.1〜v0.3の研究記録として凍結されています。
-公式の変換手段は上記の`eeane compile`です。ベンチマーク用途では
-引き続き実行できます:
+`poc/`配下のスクリプトは、v0.1〜v0.3の研究記録として凍結された
+ものです。サポートされている変換手段は上記の`eeane compile`です。
+これらのスクリプトはベンチマーク研究のために引き続き実行できます:
 
 ```sh
 git clone https://github.com/xhighhongo41/eeANE.git
 cd eeANE
 uv sync
 
-# HF配布形式のモデルを models/ruri-v3-310m と models/ruri-v3-reranker-310m に
-# 配置してから (例: `huggingface-cli download cl-nagoya/ruri-v3-310m` で取得):
+# HF配布形式のモデルを models/ruri-v3-310m と
+# models/ruri-v3-reranker-310m に配置してから(例:
+# `huggingface-cli download cl-nagoya/ruri-v3-310m`で取得)、
+# 以下を実行します:
 
 # 埋め込みモデル (v0.1)
 uv run python poc/convert_embedding.py --seq-len 512   # HF -> .mlmodelc
@@ -428,10 +479,48 @@ uv run python poc/benchmark_throughput.py --model embedding --chunk-tokens 128 -
 uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 32  # GPUベースライン
 ```
 
+## 謝辞と関連プロジェクト
+
+eeANEは[Infinity](https://github.com/michaelfeil/infinity)に触発
+されて生まれました。Infinityは、自己ホスト型でAPI互換の埋め込み・
+rerankingサーバーがいかに便利であり得るかを示したオープンソースの
+サービングエンジンです — eeANEの`/rerank` APIは、クライアントが
+URLを変更するだけで両者を切り替えられるよう、意図的にInfinityの
+スキーマに従っています。
+
+eeANEは作者がInfinityを使ってGPU上でModernBERTベースのembedding
+モデルを使用できた体験があったからこそ開発されました。両プロジェ
+クトは競合するのではなく、互いに補完し合う関係にあります: eeANE
+はApple Silicon MacのApple Neural Engine上でのみモデルを実行し、
+対応するモデルアーキテクチャの集合も意図的に絞り込んでいます。
+LinuxやWindows上で、あるいはNVIDIA/AMDのGPUやCPU上でembeddingや
+rerankingモデルをサービングしたい場合、またはもっと幅広いモデル
+カタログが必要な場合は、是非Infinityを使ってください。
+
+## 変更履歴
+
+| バージョン | ハイライト |
+|---|---|
+| 1.0.0 | 最初の安定版リリース: PyPIで公開、launchdサービス化ガイド、ドキュメント全面改訂 |
+| 0.10.0 | uv/pipx/pipでGitHubから直接インストール可能に、`eeane`コンソールコマンドを追加 |
+| 0.9.0 | 受付制御(429/503 + `Retry-After`)、同一リクエストの併合、グレースフルシャットダウン、非有限出力ガード、opt-inのバッチ2成果物 |
+| 0.8.0 | オンデマンドロード、アイドルアンロード(`keep_alive`)、`max_loaded_models`による追い出し |
+| 0.7.0 | 複数アーキテクチャ対応バックエンド(XLM-RoBERTaがModernBERTに加わる)、マルチモデルサービングとルーティング、マシン別キャリブレーションによるキャッシュ自動解決 |
+| 0.6.0 | `eeane compile`: HFのID/ローカルディレクトリ→セルフチェックと凍結トークナイザ付きのCore ML成果物への変換。torch不要のサーバーランタイム |
+| 0.5.0 | TOML設定+CLI、APIキー認証、`GET /models`、`/health`のレート制限、CI |
+| 0.4.0 | 最初のHTTPサーバー: OpenAI互換embeddings、Infinity互換rerank |
+| 0.1.0〜0.3.0 | 概念実証: embeddingモデルとrerankerのANE変換・推論、精度検証、GPUとの性能比較 |
+
+各リリースの詳細: [GitHub Releases](https://github.com/xhighhongo41/eeANE/releases)。
+
 ## ライセンス
 
 GPL-3.0-or-later。[LICENSE](LICENSE)を参照してください。
 
-`testdata/corpus/` 以下のテストコーパスは[青空文庫](https://www.aozora.gr.jp/)
-由来のパブリックドメイン作品であり、GPLの対象外です。詳細は
-`testdata/corpus/README.md` を参照してください。
+`testdata/corpus/`配下のテストコーパスは、[青空文庫](https://www.aozora.gr.jp/)
+由来のパブリックドメイン文学作品であり、GPLの対象外です。詳細は
+`testdata/corpus/README.md`を参照してください。
+
+---
+
+The English README is [README.md](README.md).
