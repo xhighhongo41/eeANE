@@ -1,0 +1,42 @@
+# Release workflow for eeANE.
+#
+# Runs when a version tag (v*) is pushed: verifies that the tag matches
+# the version declared in pyproject.toml, builds the wheel and sdist,
+# and publishes them to PyPI through trusted publishing (OIDC), so no
+# API token is stored in the repository. Lint and tests are enforced
+# separately by the CI workflow before a release tag is ever pushed.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Verify the tag matches the declared version
+        run: |
+          declared="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$declared" != "$tag" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match declared version ${declared}" >&2
+            exit 1
+          fi
+          echo "OK: ${GITHUB_REF_NAME} matches declared version ${declared}"
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always
