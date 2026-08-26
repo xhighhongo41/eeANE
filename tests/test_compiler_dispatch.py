@@ -45,6 +45,46 @@ def test_resolve_dispatch_detects_reranker_kind(tmp_path: Path) -> None:
     assert result.backend_name == "ModernBert"
 
 
+def test_resolve_dispatch_detects_a_bert_embedding_model(tmp_path: Path) -> None:
+    """A bare BertModel must be dispatched to the BERT backend as an embedding model."""
+    model_dir = _write_config(tmp_path / "m", {"architectures": ["BertModel"]})
+
+    result = dispatch.resolve_dispatch(model_dir)
+
+    assert result.kind == dispatch.KIND_EMBEDDING
+    assert result.architecture == "BertModel"
+    assert result.backend_name == "Bert"
+
+
+def test_resolve_dispatch_detects_a_bert_reranker(tmp_path: Path) -> None:
+    """BertForSequenceClassification must be dispatched as a reranker.
+
+    Dispatch resolves architecture and kind only; the BERT backend then
+    refuses that kind (it compiles embedding models only), which the
+    compile pipeline reports as a plain error message.
+    """
+    model_dir = _write_config(tmp_path / "m", {"architectures": ["BertForSequenceClassification"]})
+
+    result = dispatch.resolve_dispatch(model_dir)
+
+    assert result.kind == dispatch.KIND_RERANKER
+    assert result.architecture == "BertForSequenceClassification"
+    assert result.backend_name == "Bert"
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["ModernBertModel", "ModernBertForSequenceClassification"],
+)
+def test_resolve_dispatch_prefers_the_modernbert_backend_over_bert(
+    tmp_path: Path, architecture: str
+) -> None:
+    """A ModernBERT name must never be captured by the shorter ``Bert`` registry key."""
+    model_dir = _write_config(tmp_path / "m", {"architectures": [architecture]})
+
+    assert dispatch.resolve_dispatch(model_dir).backend_name == "ModernBert"
+
+
 def test_resolve_dispatch_detects_an_xlm_roberta_embedding_model(tmp_path: Path) -> None:
     """A bare XLMRobertaModel must be dispatched to the XLM-RoBERTa backend."""
     model_dir = _write_config(tmp_path / "m", {"architectures": ["XLMRobertaModel"]})
@@ -87,8 +127,10 @@ def test_no_registry_key_is_a_prefix_of_another_one() -> None:
         ("BertModel", dispatch.KIND_EMBEDDING),
         ("XLMRobertaModel", dispatch.KIND_EMBEDDING),
         ("ModernBertForSequenceClassification", dispatch.KIND_RERANKER),
+        ("BertForSequenceClassification", dispatch.KIND_RERANKER),
         ("XLMRobertaForSequenceClassification", dispatch.KIND_RERANKER),
         ("ModernBertForMaskedLM", None),
+        ("BertForMaskedLM", None),
         ("XLMRobertaForMaskedLM", None),
         ("", None),
     ],
@@ -183,6 +225,7 @@ def test_resolve_dispatch_unsupported_architecture_lists_supported_models(tmp_pa
 
     message = str(excinfo.value)
     assert "Unsupported architecture 'LlamaForCausalLM'" in message
+    assert "BAAI/bge-large-en-v1.5" in message
     assert "ModernBERT" in message
     assert "cl-nagoya/ruri-v3-310m" in message
     assert "XLM-RoBERTa" in message
@@ -240,6 +283,7 @@ def test_resolve_dispatch_bad_architectures_field(tmp_path: Path, config: object
 @pytest.mark.parametrize(
     ("architecture", "class_name", "backend_name"),
     [
+        ("BertModel", "BertBackend", "Bert"),
         ("ModernBertModel", "ModernBertBackend", "ModernBert"),
         ("XLMRobertaModel", "XlmRobertaBackend", "XLMRoberta"),
     ],

@@ -19,7 +19,9 @@ Two properties set this family apart from the other backends:
 
 The pooling of an embedding model is not part of the HF configuration; it
 is declared by the sentence-transformers pooling module in the model
-directory, which this backend reads (and refuses to guess).
+directory, which this backend reads (and refuses to guess) through the
+shared reader in :mod:`eeane.compiler.backends.common`, re-exported here
+so that the names stay reachable under this module.
 
 Importing this module pulls in ``torch``/``transformers``; it therefore
 requires the ``[compile]`` extra and must never be imported from the
@@ -40,15 +42,39 @@ from transformers import AutoModel, AutoModelForSequenceClassification, AutoToke
 from eeane.compiler.backends.base import LoadedModel, SanitySpec
 from eeane.compiler.backends.common import (
     POOLING_CLS,
+    POOLING_DIRNAME,
     POOLING_MEAN,
+    POOLING_MODE_KEYS,
+    POOLING_MODE_PREFIX,
     ClsEmbeddingWrapper,
     EmbeddingWrapper,
     RerankerWrapper,
     encode_pytorch,
+    read_pooling_mode,
     score_pytorch,
     tokenize_batch,
     tokenize_pairs,
 )
+
+# Public surface of this module, including the pooling-declaration reader
+# and its constants, re-exported from
+# :mod:`eeane.compiler.backends.common`.
+__all__ = [
+    "CONFIG_FILENAME",
+    "EMBEDDING_WRAPPERS",
+    "MAX_POSITION_KEY",
+    "OUTPUT_NAMES",
+    "POOLING_DIRNAME",
+    "POOLING_MODE_KEYS",
+    "POOLING_MODE_PREFIX",
+    "POSITION_OFFSET",
+    "SANITY_PAIRS",
+    "SANITY_SPECS",
+    "SANITY_TEXTS",
+    "SUPPORTED_KINDS",
+    "XlmRobertaBackend",
+    "read_pooling_mode",
+]
 
 # Model kinds understood by this backend.
 KIND_EMBEDDING = "embedding"
@@ -72,24 +98,6 @@ MAX_POSITION_KEY = "max_position_embeddings"
 # padding_idx + 1), so the first two rows of the position embedding table
 # are unreachable and the usable sequence length is that much shorter.
 POSITION_OFFSET = 2
-
-# sentence-transformers pooling module: directory holding the pooling
-# declaration of an embedding model, and the flags it can set.
-POOLING_DIRNAME = "1_Pooling"
-POOLING_MODE_PREFIX = "pooling_mode_"
-POOLING_MODE_KEYS: dict[str, str] = {
-    "pooling_mode_mean_tokens": POOLING_MEAN,
-    "pooling_mode_cls_token": POOLING_CLS,
-}
-
-# Appended to every pooling-detection error: an embedding model whose
-# pooling cannot be read must fail loudly rather than default silently,
-# because the wrong pooling produces a plausible but wrong embedding.
-_POOLING_REQUIREMENT = (
-    "An embedding model must declare its pooling in the sentence-transformers "
-    f"'{POOLING_DIRNAME}/{CONFIG_FILENAME}' with exactly one of "
-    f"{' / '.join(POOLING_MODE_KEYS)} set to true."
-)
 
 # Short Japanese sentence used as the example input for torch.jit.trace.
 TRACE_EXAMPLE_TEXT = "変換に使う短い日本語のサンプル文です。"
@@ -147,49 +155,6 @@ SANITY_SPECS: dict[str, SanitySpec] = {
 # would risk NaN).
 BATCH_PADDING_TEXT = ""
 BATCH_PADDING_PAIR: tuple[str, str] = ("", "")
-
-
-def read_pooling_mode(model_dir: Path) -> str:
-    """Read the pooling mode an embedding model directory declares.
-
-    Args:
-        model_dir: Local HuggingFace-format model directory, expected to
-            carry a sentence-transformers pooling module.
-
-    Returns:
-        ``"mean"`` or ``"cls"``.
-
-    Raises:
-        ValueError: If the pooling declaration is missing, unreadable,
-            malformed, or does not select exactly one supported mode.
-    """
-    path = model_dir / POOLING_DIRNAME / CONFIG_FILENAME
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ValueError(
-            f"cannot read the pooling module '{path}': {exc}. {_POOLING_REQUIREMENT}"
-        ) from exc
-    try:
-        declaration = json.loads(raw)
-    except ValueError as exc:
-        raise ValueError(f"'{path}' is not valid JSON: {exc}. {_POOLING_REQUIREMENT}") from exc
-    if not isinstance(declaration, dict):
-        raise ValueError(f"'{path}' does not contain a JSON object. {_POOLING_REQUIREMENT}")
-    # Only a literal ``true`` counts: anything else (a string, a number)
-    # is a declaration this backend cannot claim to understand.
-    enabled = [
-        key
-        for key, value in declaration.items()
-        if key.startswith(POOLING_MODE_PREFIX) and value is True
-    ]
-    if len(enabled) != 1 or enabled[0] not in POOLING_MODE_KEYS:
-        declared = ", ".join(sorted(enabled)) if enabled else "none"
-        raise ValueError(
-            f"'{path}' does not enable exactly one supported pooling mode "
-            f"(enabled: {declared}). {_POOLING_REQUIREMENT}"
-        )
-    return POOLING_MODE_KEYS[enabled[0]]
 
 
 class XlmRobertaBackend:

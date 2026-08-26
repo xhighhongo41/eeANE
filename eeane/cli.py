@@ -174,6 +174,13 @@ def _add_compile_subparser(
         action="store_true",
         help="Skip the post-conversion self-check (development use; default: run it).",
     )
+    compile_parser.add_argument(
+        "--allow-pickle",
+        action="store_true",
+        help="Allow loading pickle-based checkpoints (pytorch_model.bin) when no "
+        "safetensors weights are available. Only use this with models from "
+        "publishers you trust.",
+    )
     compile_parser.set_defaults(func=_cmd_compile)
 
 
