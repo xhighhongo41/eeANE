@@ -31,9 +31,9 @@ and most of your unified memory free for other work.
 - **Multi-model serving** with per-request routing, admission control
   (429/503 + `Retry-After`), identical-request coalescing, and graceful
   shutdown.
-- **Two architecture families supported today**: ModernBERT and
-  XLM-RoBERTa, both embedding and cross-encoder reranker models. More
-  are planned.
+- **Three architecture families supported today**: ModernBERT and
+  XLM-RoBERTa (both embedding and cross-encoder reranker models), and
+  BERT (embedding models only). More are planned.
 
 ## Requirements
 
@@ -151,16 +151,24 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 ### About `eeane compile`
 
 `eeane compile` picks the model backend from the model's `config.json`.
-Two architecture families are supported: **ModernBERT** (verified on
-cl-nagoya/ruri-v3-310m and its reranker) and **XLM-RoBERTa** (verified
-on intfloat/multilingual-e5-base, intfloat/multilingual-e5-large and
-BAAI/bge-reranker-v2-m3; for embedding models the mean/CLS pooling
-declared by the model directory is applied automatically). More
-families are planned after 1.0. The compiler detects whether a model is
+Three architecture families are supported: **ModernBERT** (verified on
+cl-nagoya/ruri-v3-310m and its reranker), **XLM-RoBERTa** (verified on
+intfloat/multilingual-e5-base, intfloat/multilingual-e5-large,
+BAAI/bge-reranker-v2-m3, BAAI/bge-m3, BAAI/bge-reranker-base and
+BAAI/bge-reranker-large; for embedding models the mean/CLS pooling
+declared by the model directory is applied automatically), and **BERT**
+(embedding models only, verified on BAAI/bge-small-en-v1.5,
+BAAI/bge-base-en-v1.5 and BAAI/bge-large-en-v1.5 — a BERT
+cross-encoder reranker is rejected instead, because the compiled graph
+would have to pin its segment ids to zero, which changes the meaning
+of a query/document pair for this architecture). More families are
+planned. The compiler detects whether a model is
 an embedding model or a reranker and defaults to buckets 128/512/1024
 (embedding) or 512/1024 (reranker), clipped to the model's maximum
 sequence length (multilingual-e5, capped at 512 tokens, compiles as
-128/512); `--buckets 512,2048` compiles a custom set (S2048 is verified
+128/512; BAAI/bge-reranker-base and BAAI/bge-reranker-large, also
+capped at 512, compile with just the 512 bucket, dropping the default
+1024 one); `--buckets 512,2048` compiles a custom set (S2048 is verified
 on M2 at ~518 ms/inference). Re-running
 skips up-to-date artifacts (`--force` reconverts). After every
 conversion a **self-check** verifies accuracy against the FP32 original,
@@ -175,6 +183,31 @@ directory and verified to reproduce the original tokenization exactly,
 so the server needs neither the original model files nor the
 transformers library at run time (see
 [docs/dependency-policy.md](docs/dependency-policy.md)).
+
+### Checkpoint formats
+
+`eeane compile` accepts safetensors checkpoints by default. A Hugging
+Face repo id or local model directory that ships `pytorch_model.bin`
+weights only (no `.safetensors` file) is rejected with a clear error,
+whether the source is a Hub download or a local directory. Pass
+`--allow-pickle` to opt into pickle-based `.bin` weights instead:
+`eeane compile` then forces transformers to load them with
+`torch.load(weights_only=True)`, and logs a WARNING. `weights_only=True`
+reduces but does not eliminate the risk of loading a pickle file —
+bypasses have been found before (e.g. CVE-2026-24747, fixed in torch
+2.10.0), and the torch version `eeane compile` depends on is pinned,
+for compatibility with the Core ML conversion toolchain, to a release
+that predates that fix (see
+[docs/dependency-policy.md](docs/dependency-policy.md)). Only use
+`--allow-pickle` with checkpoints from publishers you trust. When a
+repository does have safetensors, `--allow-pickle` changes nothing:
+safetensors are always preferred, and the `.bin` files are never
+downloaded. BAAI/bge-m3, for example, ships `pytorch_model.bin` only,
+so compiling it needs the flag:
+
+```sh
+eeane compile BAAI/bge-m3 --allow-pickle
+```
 
 ## Configuration
 
@@ -381,6 +414,11 @@ exactly (`tools/verify_server.py` in a repository checkout).
   after `eeane compile` pays the one-time Neural Engine cache build
   (tens of seconds). Both are expected; use `load_policy = "resident"`
   if you need to avoid even the sub-second reload.
+- **`eeane compile` fails with `no .safetensors weights are available
+  ...`**: the model ships a pickle-based `pytorch_model.bin` checkpoint
+  only, and `eeane compile` requires safetensors by default. The error
+  message already names the fix: pass `--allow-pickle` (see Checkpoint
+  formats above) — only for checkpoints from publishers you trust.
 
 ## Known limitations
 
@@ -404,6 +442,19 @@ exactly (`tools/verify_server.py` in a repository checkout).
   compiled bucket (add larger buckets with `eeane compile --buckets`
   if you need them); rerankers have no sliding-window handling for
   documents beyond that.
+- **BAAI/bge-m3 is dense-only**: eeANE compiles and serves bge-m3's
+  dense embedding output; its separate sparse and multi-vector
+  (ColBERT-style) representations are additional weight files that
+  `eeane compile` does not fetch or expose.
+- **BERT cross-encoder rerankers are not supported**: see About `eeane
+  compile` above — pinning the compiled graph's segment ids to zero
+  would change the meaning of a query/document pair for this
+  architecture. BERT embedding models are unaffected.
+- **Chinese bge v1.5 models are unverified**: the `zh` variants (e.g.
+  bge-large-zh-v1.5) are expected to work on the same BERT backend as
+  their English counterparts, but have not been verified by the
+  maintainer; the `zh` large and base variants also ship
+  `pytorch_model.bin` only, so compiling them needs `--allow-pickle`.
 
 ## Development
 
@@ -488,6 +539,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.1.0 | BERT embedding backend; six more verified BAAI/bge models (bge-m3, bge-reranker-base/large, bge-small/base/large-en-v1.5); `--allow-pickle` opt-in for pickle-based checkpoints; expanded PyPI metadata |
 | 1.0.0 | First stable release: published on PyPI, launchd service guide, documentation overhaul |
 | 0.10.0 | Installable straight from GitHub with uv/pipx/pip; `eeane` console command |
 | 0.9.0 | Admission control (429/503 + `Retry-After`), identical-request coalescing, graceful shutdown, non-finite output guard, opt-in batch-2 artifacts |

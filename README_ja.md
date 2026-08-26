@@ -32,10 +32,10 @@ GPUとユニファイドメモリの大部分を他の作業のために空け�
 - **マルチモデルサービング**: リクエスト単位のルーティング、受付
   制御(429/503 + `Retry-After`)、同一リクエストの併合、グレース
   フルシャットダウンに対応。
-- **現時点で対応するアーキテクチャ系統は2つ**: ModernBERTと
-  XLM-RoBERTa。いずれもembeddingモデルとクロスエンコーダ型
-  rerankerモデルの両方に対応しています。さらなる系統の追加を計画
-  中です。
+- **現時点で対応するアーキテクチャ系統は3つ**: ModernBERTと
+  XLM-RoBERTa(いずれもembeddingモデルとクロスエンコーダ型reranker
+  モデルの両方に対応)、そしてBERT(embeddingモデルのみに対応)。
+  さらなる系統の追加を計画中です。
 
 ## 動作要件
 
@@ -153,29 +153,64 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 ### `eeane compile`について
 
 `eeane compile`はモデルの`config.json`からバックエンドを自動選択
-します。対応するアーキテクチャ系統は2つです: **ModernBERT**
-(cl-nagoya/ruri-v3-310mと同rerankerで検証済み)と**XLM-RoBERTa**
+します。対応するアーキテクチャ系統は3つです: **ModernBERT**
+(cl-nagoya/ruri-v3-310mと同rerankerで検証済み)、**XLM-RoBERTa**
 (intfloat/multilingual-e5-base・intfloat/multilingual-e5-large・
-BAAI/bge-reranker-v2-m3で検証済み。embeddingモデルではモデル
-ディレクトリが宣言するmean/CLSプーリングが自動的に適用されます)。
-さらなる系統は1.0以降に計画されています。コンパイラはモデルが
-embeddingモデルかrerankerかを自動判別し、既定のバケツはembedding
-が128/512/1024、rerankerが512/1024で、モデルの最大系列長にクリップ
-されます(最大512トークンのmultilingual-e5は128/512としてコンパイル
-されます)。`--buckets 512,2048`のようにカスタムの集合をコンパイル
-することもできます(S2048はM2実機で約518ms/推論を検証済み)。再実行
-時は最新の成果物をスキップします(`--force`で再変換)。変換のたびに
-**セルフチェック**が走り、FP32オリジナルに対する精度を検証し、どれ
-だけの演算がNeural Engineに配置されたかを計測し、ウォームレイテン
-シを記録します — 表示されるサマリは互換性レポートを兼ねるため、
-未検証のハードウェア(M1/M3/M4など)でeeANEを実行した場合は、ぜひ
-Issueに貼り付けてください。バケツごとの実測値はキャッシュ内の
-キャリブレーション記録(`model_info.json`)に集約され、セルフチェック
-に失敗したバケツは、キャッシュ自動解決の設定がロードする推奨集合
-から除外されます。トークナイザは成果物ディレクトリへ凍結され、元の
-トークナイズを完全に再現することが検証されるため、サーバーは実行時
-に元のモデルファイルもtransformersライブラリも必要としません
-([docs/dependency-policy.md](docs/dependency-policy.md)を参照)。
+BAAI/bge-reranker-v2-m3・BAAI/bge-m3・BAAI/bge-reranker-base・
+BAAI/bge-reranker-largeで検証済み。embeddingモデルではモデル
+ディレクトリが宣言するmean/CLSプーリングが自動的に適用されます)、
+そして**BERT**(embeddingモデルのみに対応。BAAI/bge-small-en-v1.5・
+BAAI/bge-base-en-v1.5・BAAI/bge-large-en-v1.5で検証済み — BERT系
+クロスエンコーダrerankerは代わりに明確なエラーで拒否されます。理由
+は、コンパイル済みグラフではsegment idをゼロに固定せざるを得ず、
+それがこのアーキテクチャにおけるquery/documentペアの意味を変えて
+しまうためです)。さらなる系統の追加を計画中です。コンパイラは
+モデルがembeddingモデルかrerankerかを自動判別し、既定のバケツは
+embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
+にクリップされます(最大512トークンのmultilingual-e5は128/512として
+コンパイルされます。同じく最大512トークンのBAAI/bge-reranker-base・
+BAAI/bge-reranker-largeは512バケツのみでコンパイルされ、既定の1024
+バケツは外れます)。`--buckets 512,2048`のようにカスタムの集合を
+コンパイルすることもできます(S2048はM2実機で約518ms/推論を検証
+済み)。再実行時は最新の成果物をスキップします(`--force`で再変換)。
+変換のたびに**セルフチェック**が走り、FP32オリジナルに対する精度を
+検証し、どれだけの演算がNeural Engineに配置されたかを計測し、
+ウォームレイテンシを記録します — 表示されるサマリは互換性レポート
+を兼ねるため、未検証のハードウェア(M1/M3/M4など)でeeANEを実行した
+場合は、ぜひIssueに貼り付けてください。バケツごとの実測値はキャッ
+シュ内のキャリブレーション記録(`model_info.json`)に集約され、
+セルフチェックに失敗したバケツは、キャッシュ自動解決の設定がロード
+する推奨集合から除外されます。トークナイザは成果物ディレクトリへ
+凍結され、元のトークナイズを完全に再現することが検証されるため、
+サーバーは実行時に元のモデルファイルもtransformersライブラリも
+必要としません([docs/dependency-policy.md](docs/dependency-policy.md)
+を参照)。
+
+### チェックポイント形式
+
+`eeane compile`は既定でsafetensors形式のチェックポイントのみを受け
+付けます。`pytorch_model.bin`のみを配布し`.safetensors`ファイルを
+持たないHugging Faceリポジトリやローカルモデルディレクトリは、
+Hubからのダウンロードでもローカルディレクトリでも、明確なエラーで
+拒否されます。`--allow-pickle`を指定すると、代わりにpickleベースの
+`.bin`重みへオプトインできます: この場合`eeane compile`は
+transformersに`torch.load(weights_only=True)`での読み込みを強制し、
+WARNINGログを出力します。`weights_only=True`はpickleファイル読み込み
+のリスクを緩和しますが、完全には排除しません — 過去にバイパスが
+発見されたことがあり(例: CVE-2026-24747、torch 2.10.0で修正)、
+`eeane compile`が依存するtorchのバージョンは、Core ML変換ツール
+チェーンとの互換性のため、その修正より前のリリースに固定されて
+います([docs/dependency-policy.md](docs/dependency-policy.md)を
+参照)。`--allow-pickle`は、信頼できる配布元のチェックポイントに
+限って使用してください。リポジトリにsafetensorsが存在する場合、
+`--allow-pickle`を付けても挙動は変わりません: safetensorsが常に
+優先され、`.bin`ファイルはダウンロードされません。たとえば
+BAAI/bge-m3は`pytorch_model.bin`のみを配布しているため、コンパイル
+にはこのフラグが必要です:
+
+```sh
+eeane compile BAAI/bge-m3 --allow-pickle
+```
 
 ## 設定
 
@@ -392,6 +427,12 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   Engineキャッシュ構築のコストを負担します(数十秒)。どちらも
   想定内の挙動です。1秒未満の再ロードすら避けたい場合は
   `load_policy = "resident"`を使ってください。
+- **`eeane compile`が`no .safetensors weights are available ...`で
+  失敗する**: そのモデルはpickleベースの`pytorch_model.bin`
+  チェックポイントのみを配布しており、`eeane compile`は既定で
+  safetensorsを要求します。エラーメッセージが対処法(`--allow-pickle`
+  を付ける。上記のチェックポイント形式を参照)をすでに示しています —
+  信頼できる配布元のチェックポイントに限って使用してください。
 
 ## 既知の制限
 
@@ -415,6 +456,20 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   切り詰められます(必要であれば`eeane compile --buckets`でより
   大きなバケツを追加してください)。rerankerには、それを超える
   文書に対するスライディングウィンドウ処理はありません。
+- **BAAI/bge-m3はdense出力のみ**: eeANEはbge-m3のdense embedding出力
+  のみをコンパイル・サービングします。同モデルが持つ別のsparse表現
+  やmulti-vector(ColBERTスタイル)表現は別の重みファイルであり、
+  `eeane compile`はこれらを取得も公開もしません。
+- **BERT系クロスエンコーダrerankerは非対応**: 上記の「`eeane
+  compile`について」を参照してください — コンパイル済みグラフの
+  segment idをゼロに固定せざるを得ず、それがこのアーキテクチャに
+  おけるquery/documentペアの意味を変えてしまうためです。BERT系
+  embeddingモデルはこの影響を受けず、対応しています。
+- **中国語版bge v1.5系は未検証**: `zh`系(例: bge-large-zh-v1.5)は
+  英語版と同じBERTバックエンドで動作する見込みですが、メンテナに
+  よる検証は行われていません。また`zh`系のlarge/baseは
+  `pytorch_model.bin`のみを配布しているため、コンパイルには
+  `--allow-pickle`が必要になります。
 
 ## 開発
 
@@ -501,6 +556,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 1.1.0 | BERT embeddingバックエンドを新設。BAAI/bge系モデルを6件追加検証(bge-m3・bge-reranker-base/large・bge-small/base/large-en-v1.5)。pickleベースのチェックポイント向けopt-inの`--allow-pickle`。PyPIメタデータの拡充 |
 | 1.0.0 | 最初の安定版リリース: PyPIで公開、launchdサービス化ガイド、ドキュメント全面改訂 |
 | 0.10.0 | uv/pipx/pipでGitHubから直接インストール可能に、`eeane`コンソールコマンドを追加 |
 | 0.9.0 | 受付制御(429/503 + `Retry-After`)、同一リクエストの併合、グレースフルシャットダウン、非有限出力ガード、opt-inのバッチ2成果物 |

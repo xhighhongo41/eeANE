@@ -45,8 +45,10 @@ coremltools, numpy, or tokenizers must be accompanied by:
 
 1. `eeane compile` re-run with `--force` for the reference models of
    every supported architecture (ModernBERT: ruri-v3-310m and
-   ruri-v3-reranker-310m; XLM-RoBERTa: multilingual-e5-base and
-   bge-reranker-v2-m3),
+   ruri-v3-reranker-310m; BERT: bge-base-en-v1.5, embedding only;
+   XLM-RoBERTa: multilingual-e5-base,
+   bge-reranker-v2-m3, and bge-m3, the last of which also exercises the
+   `--allow-pickle` path),
 2. all self-checks passing (accuracy sanity, NE placement, warm latency
    recorded — the self-check is the designed detector for a conversion
    silently degrading),
