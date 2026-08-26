@@ -15,6 +15,7 @@ keywords = [
     "text-embeddings",
     "reranker",
     "modernbert",
+    "bert",
     "xlm-roberta",
     "inference-server",
     "openai-compatible",
