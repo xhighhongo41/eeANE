@@ -10,7 +10,10 @@ Three properties set this family apart from the other backends:
 
 * Positions are learned absolute embeddings indexed from 0, so the whole
   configured position budget is usable and
-  :meth:`BertBackend.max_seq_len` reports it unchanged.
+  :meth:`BertBackend.max_seq_len` reports it unchanged. They are handed
+  to the model explicitly while tracing, because deriving them inside the
+  embedding layer records a graph node the Core ML converter rejects (see
+  :class:`ZeroTokenTypeModel`).
 * The embedding layer adds a segment (``token_type_ids``) embedding. The
   compiled graph takes ``input_ids`` and ``attention_mask`` only, so the
   segment ids are pinned to zeros inside the traced module by
@@ -117,13 +120,23 @@ BATCH_PADDING_TEXT = ""
 
 
 class ZeroTokenTypeModel(torch.nn.Module):
-    """Adapter that calls a BERT model with all-zero ``token_type_ids``.
+    """Adapter that supplies the two implicit embedding inputs explicitly.
 
     The compiled graph is built from ``input_ids`` and ``attention_mask``
-    alone, so the segment ids have to be decided at tracing time. Pinning
-    them to zeros reproduces what HuggingFace does when the argument is
-    omitted (its ``token_type_ids`` buffer is all zeros), but states the
-    assumption in the traced graph instead of relying on that fallback.
+    alone, so everything the embedding layer would otherwise derive by
+    itself has to be decided while tracing:
+
+    * ``token_type_ids`` are pinned to zeros, reproducing what HuggingFace
+      does when the argument is omitted (its ``token_type_ids`` buffer is
+      all zeros), but stating the assumption in the traced graph instead
+      of relying on that fallback.
+    * ``position_ids`` are built as ``arange(S)``, the same values the
+      omitted argument would take. Left out, HuggingFace slices its
+      position buffer with the traced sequence length, which records an
+      ``aten::Int`` of a dynamic size that the Core ML converter cannot
+      translate; passing the positions in removes that node. Each bucket
+      is traced at its own fixed length, so the constant is exactly the
+      one that bucket needs.
 
     Placed between the backbone and the pooling wrappers of
     :mod:`eeane.compiler.backends.common`, so those stay
@@ -143,7 +156,7 @@ class ZeroTokenTypeModel(torch.nn.Module):
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
-        """Run the model with segment ids fixed to zero.
+        """Run the model with segment ids and positions fixed.
 
         Args:
             input_ids: Token ids, shape (B, S).
@@ -155,8 +168,16 @@ class ZeroTokenTypeModel(torch.nn.Module):
         # zeros_like keeps the dtype and shape of the ids the graph takes,
         # so the traced constant matches the declared int input exactly.
         token_type_ids = torch.zeros_like(input_ids)
+        # Shape (1, S): the embedding layer broadcasts one row of positions
+        # over the batch, exactly as its own position buffer does.
+        position_ids = torch.arange(
+            input_ids.shape[1], dtype=input_ids.dtype, device=input_ids.device
+        ).unsqueeze(0)
         return self.model(
-            input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
         )
 
 

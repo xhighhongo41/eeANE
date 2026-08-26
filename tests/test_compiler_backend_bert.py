@@ -4,13 +4,14 @@ Three layers:
 
 * ``eeane.compiler.backends.bert``: pooling detection from the
   sentence-transformers pooling module, the offset-free rule behind the
-  effective sequence length, the fixtures, the segment-id adapter and the
-  kind/pooling validation the pipeline relies on.
+  effective sequence length, the fixtures, the adapter that pins the
+  embedding layer's implicit inputs, and the kind/pooling validation the
+  pipeline relies on.
 * The architecture assumptions this backend encodes, checked against a
-  tiny randomly initialised model: that pinning ``token_type_ids`` to
-  zeros equals omitting them, in eager mode and through
-  ``torch.jit.trace``, and that the full configured position budget is
-  addressable.
+  tiny randomly initialised model: that pinning ``token_type_ids`` and
+  ``position_ids`` equals omitting them (in eager mode and through
+  ``torch.jit.trace``), that the traced graph really converts to Core ML,
+  and that the full configured position budget is addressable.
 * Conformance to the backend interface, driven by the protocol in
   ``eeane.compiler.backends.base``.
 
@@ -29,6 +30,7 @@ import numpy as np
 import pytest
 import torch
 
+from eeane.compiler import conversion
 from eeane.compiler.backends import bert, common
 
 # Ids the stand-in tokenizer below uses for the special/padding tokens.
@@ -72,7 +74,7 @@ class _FakeTokenizer:
 
 
 class _RecordingModel(torch.nn.Module):
-    """Backbone stand-in returning a fixed output and recording its segment ids."""
+    """Backbone stand-in returning a fixed output and recording its implicit inputs."""
 
     def __init__(self, output: torch.Tensor, hidden_size: int = 2) -> None:
         """Store the output every forward call returns."""
@@ -80,15 +82,18 @@ class _RecordingModel(torch.nn.Module):
         self.output = output
         self.config = SimpleNamespace(hidden_size=hidden_size)
         self.seen_token_type_ids: torch.Tensor | None = None
+        self.seen_position_ids: torch.Tensor | None = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        """Record the segment ids and return the stored output as a tuple."""
+        """Record the segment/position ids and return the stored output as a tuple."""
         self.seen_token_type_ids = token_type_ids
+        self.seen_position_ids = position_ids
         return (self.output,)
 
 
@@ -490,6 +495,22 @@ def test_adapter_passes_all_zero_segment_ids(input_ids: torch.Tensor) -> None:
     assert torch.equal(seen, torch.zeros_like(input_ids))
 
 
+@pytest.mark.parametrize("input_ids", [torch.tensor([[5, 6, 0]]), torch.tensor([[1, 2], [3, 4]])])
+def test_adapter_passes_the_positions_of_this_sequence_length(input_ids: torch.Tensor) -> None:
+    """The positions must be handed in as one broadcastable row of 0..S-1."""
+    model = _RecordingModel(torch.zeros(input_ids.shape[0], input_ids.shape[1], 2))
+    adapter = bert.ZeroTokenTypeModel(model)
+
+    with torch.no_grad():
+        adapter(input_ids, torch.ones_like(input_ids))
+
+    seen = model.seen_position_ids
+    assert seen is not None
+    assert seen.shape == (1, input_ids.shape[1])  # broadcast over the batch
+    assert seen.dtype == input_ids.dtype
+    assert torch.equal(seen[0], torch.arange(input_ids.shape[1], dtype=input_ids.dtype))
+
+
 def test_adapter_returns_the_model_output_tuple_unchanged() -> None:
     """The adapter must stay transparent: the wrappers read ``outputs[0]``."""
     output = torch.tensor([[[1.0, 2.0]]])
@@ -612,12 +633,12 @@ def test_max_seq_len_matches_the_length_the_model_actually_accepts(tmp_path: Pat
             model(input_ids=too_long_ids, attention_mask=too_long_mask)
 
 
-def test_zero_segment_ids_equal_the_omitted_argument() -> None:
-    """Pinning the segment ids to zeros must reproduce HuggingFace's own fallback.
+def test_the_pinned_inputs_equal_the_omitted_arguments() -> None:
+    """Pinning the segment ids and the positions must reproduce HuggingFace's own defaults.
 
     This is what lets the compiled graph take ``input_ids`` and
     ``attention_mask`` only while the FP32 baseline calls the model
-    without any segment ids at all.
+    without either argument.
     """
     model = _tiny_model()
     input_ids, attention_mask = _tiny_inputs(6)
@@ -630,28 +651,30 @@ def test_zero_segment_ids_equal_the_omitted_argument() -> None:
     assert torch.equal(omitted, pinned)
 
 
-def test_the_segment_ids_really_change_the_output() -> None:
-    """Guard for the test above: a model insensitive to segments would prove nothing."""
+@pytest.mark.parametrize("argument", ["token_type_ids", "position_ids"])
+def test_the_pinned_inputs_really_change_the_output(argument: str) -> None:
+    """Guard for the test above: a model ignoring these inputs would prove nothing."""
     model = _tiny_model()
     input_ids, attention_mask = _tiny_inputs(6)
+    # A value that is valid but different from the default the adapter pins.
+    changed = torch.ones_like(input_ids)
 
     with torch.no_grad():
-        zeros = model(input_ids=input_ids, attention_mask=attention_mask)[0]
-        ones = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=torch.ones_like(input_ids),
-        )[0]
+        default = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+        altered = model(input_ids=input_ids, attention_mask=attention_mask, **{argument: changed})[
+            0
+        ]
 
-    assert (zeros - ones).abs().max().item() > 1e-3
+    assert (default - altered).abs().max().item() > 1e-3
 
 
-def test_tracing_keeps_the_zero_segment_ids() -> None:
-    """The traced graph must keep the pinned zeros for inputs it was not traced on.
+def test_tracing_keeps_the_pinned_inputs() -> None:
+    """The traced graph must keep the pinned values for inputs it was not traced on.
 
     Traces exactly what the pipeline traces -- the wrapper returned by
-    ``wrap`` -- and replays it on a different batch, so a segment tensor
-    accidentally captured from the tracing example would show up.
+    ``wrap`` -- and replays it on a different batch, so a segment or
+    position tensor accidentally captured from the tracing example would
+    show up.
     """
     model = _tiny_model()
     wrapper = bert.BertBackend().wrap(_loaded(model, "embedding", pooling="cls"))
@@ -682,6 +705,52 @@ def test_backbone_returns_the_last_hidden_state_first() -> None:
     assert hidden.shape == (2, 6, model.config.hidden_size)
     assert torch.allclose(pooled, common.mean_pool(hidden, attention_mask))
     assert torch.allclose(cls_pooled, hidden[:, 0])
+
+
+# --- Core ML conversion of the traced wrapper --------------------------------
+
+# Graph node the converter cannot translate: it is what an embedding layer
+# records when it derives its own positions from the traced sequence
+# length, and what the explicit inputs of the adapter avoid.
+_DYNAMIC_SIZE_NODE = "aten::Int"
+
+# Sequence length of the conversion tests: within the tiny position budget
+# and large enough that a wrong position row would be a real difference.
+_CONVERSION_SEQ_LEN = _TINY_POSITIONS - 2
+
+
+def _traced_tiny_wrapper(seq_len: int = _CONVERSION_SEQ_LEN) -> Any:
+    """Trace the tiny model through the pipeline's own tracing helper."""
+    wrapper = bert.BertBackend().wrap(_loaded(_tiny_model(), "embedding", pooling="cls"))
+    example = {
+        "input_ids": np.ones((1, seq_len), dtype=np.int32),
+        "attention_mask": np.ones((1, seq_len), dtype=np.int32),
+    }
+    return conversion.trace_model(wrapper, example)
+
+
+def test_the_traced_graph_has_no_dynamic_size_node() -> None:
+    """Positions derived in-model record a node the Core ML converter rejects."""
+    graph = str(_traced_tiny_wrapper().inlined_graph)
+
+    assert _DYNAMIC_SIZE_NODE not in graph
+
+
+def test_the_traced_wrapper_converts_to_core_ml() -> None:
+    """The traced module must actually convert, with the two declared graph inputs."""
+    backend = bert.BertBackend()
+
+    mlmodel = conversion.convert_model(
+        _traced_tiny_wrapper(),
+        _CONVERSION_SEQ_LEN,
+        "fp16",
+        "macos13",
+        backend.output_name("embedding"),
+    )
+
+    description = mlmodel.get_spec().description
+    assert [tensor.name for tensor in description.input] == ["input_ids", "attention_mask"]
+    assert [tensor.name for tensor in description.output] == ["embedding"]
 
 
 def test_eager_and_sdpa_agree_without_any_patch() -> None:
