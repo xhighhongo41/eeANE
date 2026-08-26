@@ -28,6 +28,7 @@ KINDS: tuple[str, ...] = (KIND_EMBEDDING, KIND_RERANKER)
 # Human-readable list of the architectures a backend is registered for,
 # used in the "unsupported architecture" error message.
 SUPPORTED_ARCHITECTURES = (
+    "BERT embedding models (e.g. BAAI/bge-large-en-v1.5), "
     "ModernBERT (e.g. cl-nagoya/ruri-v3-310m) and "
     "XLM-RoBERTa (e.g. intfloat/multilingual-e5-base, BAAI/bge-reranker-v2-m3)"
 )
@@ -37,6 +38,7 @@ SUPPORTED_ARCHITECTURES = (
 # may start with another key, or prefix matching would depend on the order
 # of this mapping.
 BACKEND_REGISTRY: dict[str, str] = {
+    "Bert": "eeane.compiler.backends.bert:BertBackend",
     "ModernBert": "eeane.compiler.backends.modernbert:ModernBertBackend",
     "XLMRoberta": "eeane.compiler.backends.xlm_roberta:XlmRobertaBackend",
 }

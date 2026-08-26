@@ -995,6 +995,30 @@ def test_run_reports_an_unresolvable_source(capsys: pytest.CaptureFixture) -> No
     assert "Traceback" not in captured.err
 
 
+def test_run_reports_a_bert_reranker_as_unsupported(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A BERT cross-encoder must be refused with a reason, not a traceback.
+
+    Its architecture is dispatched to the BERT backend, which compiles
+    embedding models only, so the refusal has to travel from the backend
+    to the single ``eeane compile: ...`` line the user sees.
+    """
+    source = tmp_path / "bert-reranker"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps({"architectures": ["BertForSequenceClassification"]}), encoding="utf-8"
+    )
+
+    exit_code = pipeline.run(_compile_args(str(source)))
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "reranker" in captured.err
+    assert "segment ids" in captured.err
+
+
 def test_run_reports_a_directory_without_config_json(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:

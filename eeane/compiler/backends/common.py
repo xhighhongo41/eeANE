@@ -1,10 +1,11 @@
 """Architecture-independent helpers shared by the compile backends.
 
-Everything in here is pure PyTorch/NumPy plumbing that does not depend on
-a particular model architecture: masked pooling, the stable sigmoid used
-for reranker post-processing, fixed-shape tokenization, the FP32 PyTorch
-baselines and the traceable wrapper modules. Architecture-specific code
-(graph patches, fixtures, position-embedding offsets) stays in the
+Everything in here is plumbing that does not depend on a particular model
+architecture: masked pooling, the stable sigmoid used for reranker
+post-processing, fixed-shape tokenization, the FP32 PyTorch baselines,
+the traceable wrapper modules and the reader for the pooling mode a
+sentence-transformers model directory declares. Architecture-specific
+code (graph patches, fixtures, position-embedding offsets) stays in the
 per-family backend modules that import from here.
 
 The pooling helpers and the wrappers are the single source of truth for
@@ -19,6 +20,9 @@ requires the ``[compile]`` extra and must never be imported from the
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -29,6 +33,71 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 POOLING_MEAN = "mean"
 POOLING_CLS = "cls"
 POOLING_MODES: tuple[str, ...] = (POOLING_MEAN, POOLING_CLS)
+
+# sentence-transformers pooling module: directory holding the pooling
+# declaration of an embedding model, the file inside it, and the flags it
+# can set. The declaration is not part of the HF configuration and does
+# not depend on the architecture, so every backend whose embedding models
+# come from sentence-transformers reads the same file the same way.
+POOLING_DIRNAME = "1_Pooling"
+POOLING_CONFIG_FILENAME = "config.json"
+POOLING_MODE_PREFIX = "pooling_mode_"
+POOLING_MODE_KEYS: dict[str, str] = {
+    "pooling_mode_mean_tokens": POOLING_MEAN,
+    "pooling_mode_cls_token": POOLING_CLS,
+}
+
+# Appended to every pooling-detection error: an embedding model whose
+# pooling cannot be read must fail loudly rather than default silently,
+# because the wrong pooling produces a plausible but wrong embedding.
+_POOLING_REQUIREMENT = (
+    "An embedding model must declare its pooling in the sentence-transformers "
+    f"'{POOLING_DIRNAME}/{POOLING_CONFIG_FILENAME}' with exactly one of "
+    f"{' / '.join(POOLING_MODE_KEYS)} set to true."
+)
+
+
+def read_pooling_mode(model_dir: Path) -> str:
+    """Read the pooling mode an embedding model directory declares.
+
+    Args:
+        model_dir: Local HuggingFace-format model directory, expected to
+            carry a sentence-transformers pooling module.
+
+    Returns:
+        ``"mean"`` or ``"cls"``.
+
+    Raises:
+        ValueError: If the pooling declaration is missing, unreadable,
+            malformed, or does not select exactly one supported mode.
+    """
+    path = model_dir / POOLING_DIRNAME / POOLING_CONFIG_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(
+            f"cannot read the pooling module '{path}': {exc}. {_POOLING_REQUIREMENT}"
+        ) from exc
+    try:
+        declaration = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"'{path}' is not valid JSON: {exc}. {_POOLING_REQUIREMENT}") from exc
+    if not isinstance(declaration, dict):
+        raise ValueError(f"'{path}' does not contain a JSON object. {_POOLING_REQUIREMENT}")
+    # Only a literal ``true`` counts: anything else (a string, a number)
+    # is a declaration this backend cannot claim to understand.
+    enabled = [
+        key
+        for key, value in declaration.items()
+        if key.startswith(POOLING_MODE_PREFIX) and value is True
+    ]
+    if len(enabled) != 1 or enabled[0] not in POOLING_MODE_KEYS:
+        declared = ", ".join(sorted(enabled)) if enabled else "none"
+        raise ValueError(
+            f"'{path}' does not enable exactly one supported pooling mode "
+            f"(enabled: {declared}). {_POOLING_REQUIREMENT}"
+        )
+    return POOLING_MODE_KEYS[enabled[0]]
 
 
 def mean_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

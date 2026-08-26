@@ -29,7 +29,7 @@ import pytest
 import torch
 from transformers.models.modernbert import modeling_modernbert
 
-from eeane.compiler.backends import base
+from eeane.compiler.backends import base, bert
 from eeane.compiler.backends import modernbert as mb
 from eeane.compiler.backends import xlm_roberta as xlmr
 
@@ -212,7 +212,7 @@ _PROTOCOL_METHODS = sorted(
 
 # Every registered backend implementation, so that a new architecture is
 # held to the same interface as the existing ones.
-_BACKEND_CLASSES = [mb.ModernBertBackend, xlmr.XlmRobertaBackend]
+_BACKEND_CLASSES = [bert.BertBackend, mb.ModernBertBackend, xlmr.XlmRobertaBackend]
 
 
 def _parameters(function: Any) -> list[tuple[str, Any]]:
