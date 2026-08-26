@@ -32,6 +32,7 @@ def test_build_parser_compile_defaults() -> None:
     assert args.attn == "eager"
     assert args.keep_mlpackage is False
     assert args.skip_selfcheck is False
+    assert args.allow_pickle is False
 
 
 def test_build_parser_compile_parses_buckets_option() -> None:
@@ -91,6 +92,7 @@ def test_build_parser_compile_parses_all_other_options(tmp_path: Path) -> None:
             "sdpa",
             "--keep-mlpackage",
             "--skip-selfcheck",
+            "--allow-pickle",
         ]
     )
 
@@ -106,6 +108,7 @@ def test_build_parser_compile_parses_all_other_options(tmp_path: Path) -> None:
     assert args.attn == "sdpa"
     assert args.keep_mlpackage is True
     assert args.skip_selfcheck is True
+    assert args.allow_pickle is True
 
 
 # --- dependency guard --------------------------------------------------------
@@ -179,11 +182,12 @@ def test_compile_cli_delegates_to_the_pipeline(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(pipeline, "run", fake_run)
 
-    exit_code = cli.main(["compile", "some/path", "--buckets", "128"])
+    exit_code = cli.main(["compile", "some/path", "--buckets", "128", "--allow-pickle"])
 
     assert exit_code == 0
     assert received[0].source == "some/path"
     assert received[0].buckets == [128]
+    assert received[0].allow_pickle is True
     assert received_selfcheck_fn[0] is selfcheck.run_selfcheck
 
 

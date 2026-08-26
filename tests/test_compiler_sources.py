@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +22,17 @@ def _make_snapshot(root: Path, filenames: list[str]) -> Path:
 
 @pytest.fixture
 def download_calls(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
-    """Patch huggingface_hub.snapshot_download and record how it is called."""
-    calls: dict[str, Any] = {"kwargs": None, "snapshot": tmp_path / "snapshot"}
+    """Patch huggingface_hub.snapshot_download and record how it is called.
+
+    ``kwargs`` holds the most recent call (for tests that only make one);
+    ``calls`` holds every call in order (for tests asserting on a second,
+    ``--allow-pickle``-triggered download).
+    """
+    calls: dict[str, Any] = {"kwargs": None, "calls": [], "snapshot": tmp_path / "snapshot"}
 
     def fake_snapshot_download(**kwargs: Any) -> str:
         calls["kwargs"] = kwargs
+        calls["calls"].append(kwargs)
         return str(calls["snapshot"])
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
@@ -56,10 +63,55 @@ def test_resolve_source_does_not_write_into_the_model_directory(tmp_path: Path) 
     assert {p.name: p.stat().st_mtime_ns for p in model_dir.iterdir()} == before
 
 
-def test_resolve_source_local_directory_without_safetensors_is_accepted(tmp_path: Path) -> None:
-    """A local directory is the user's own; only downloads are weight-format checked."""
+def test_resolve_source_local_directory_bin_only_without_allow_pickle_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A local bin-only directory must be rejected unless --allow-pickle was passed."""
     model_dir = tmp_path / "local-model"
     _make_snapshot(model_dir, ["config.json", "pytorch_model.bin"])
+
+    with pytest.raises(sources.MissingSafetensorsError) as excinfo:
+        sources.resolve_source(str(model_dir))
+
+    assert "--allow-pickle" in str(excinfo.value)
+
+
+def test_resolve_source_local_directory_bin_only_with_allow_pickle_warns_and_succeeds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """--allow-pickle must accept a local bin-only directory, after logging a WARNING."""
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(model_dir, ["config.json", "pytorch_model.bin"])
+
+    with caplog.at_level(logging.WARNING):
+        resolved = sources.resolve_source(str(model_dir), allow_pickle=True)
+
+    assert resolved == model_dir.resolve()
+    assert any(
+        record.levelno == logging.WARNING and "pickle" in record.message.lower()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("allow_pickle", [False, True])
+def test_resolve_source_local_directory_with_safetensors_ignores_allow_pickle(
+    tmp_path: Path, allow_pickle: bool
+) -> None:
+    """A local directory with safetensors must be accepted regardless of --allow-pickle."""
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(model_dir, ["config.json", "model.safetensors"])
+
+    resolved = sources.resolve_source(str(model_dir), allow_pickle=allow_pickle)
+
+    assert resolved == model_dir.resolve()
+
+
+def test_resolve_source_local_directory_without_any_weights_is_passed_through(
+    tmp_path: Path,
+) -> None:
+    """A directory with neither safetensors nor .bin weights is left to transformers."""
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(model_dir, ["config.json"])
 
     assert sources.resolve_source(str(model_dir)) == model_dir.resolve()
 
@@ -162,7 +214,7 @@ def test_resolve_source_accepts_sharded_safetensors(download_calls: dict[str, An
 def test_resolve_source_rejects_snapshot_without_safetensors(
     download_calls: dict[str, Any],
 ) -> None:
-    """A bin-only repo downloads no weights and must raise a clear error."""
+    """A repo whose safetensors-only download carries no weights must raise a clear error."""
     _make_snapshot(download_calls["snapshot"], ["config.json"])
 
     with pytest.raises(sources.MissingSafetensorsError) as excinfo:
@@ -171,6 +223,57 @@ def test_resolve_source_rejects_snapshot_without_safetensors(
     message = str(excinfo.value)
     assert "safetensors" in message
     assert "org/name" in message
+    assert "--allow-pickle" in message
+
+
+def test_resolve_source_hf_bin_only_without_allow_pickle_error_mentions_allow_pickle(
+    download_calls: dict[str, Any],
+) -> None:
+    """A bin-only repo's error message must point at --allow-pickle as the opt-in."""
+    _make_snapshot(download_calls["snapshot"], ["config.json", "pytorch_model.bin"])
+
+    with pytest.raises(sources.MissingSafetensorsError) as excinfo:
+        sources.resolve_source("org/name")
+
+    assert "--allow-pickle" in str(excinfo.value)
+    # Only the safetensors-only patterns must have been requested; the fallback
+    # download only happens with --allow-pickle.
+    assert len(download_calls["calls"]) == 1
+
+
+def test_resolve_source_hf_bin_only_with_allow_pickle_redownloads_with_bin_patterns(
+    download_calls: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """--allow-pickle must trigger a second download that also requests .bin weights."""
+    _make_snapshot(download_calls["snapshot"], ["config.json", "pytorch_model.bin"])
+
+    with caplog.at_level(logging.WARNING):
+        resolved = sources.resolve_source("org/name", allow_pickle=True)
+
+    assert resolved == Path(download_calls["snapshot"]).resolve()
+    calls = download_calls["calls"]
+    assert len(calls) == 2
+    assert list(calls[0]["allow_patterns"]) == list(sources.HF_ALLOW_PATTERNS)
+    assert "*.bin" not in calls[0]["allow_patterns"]
+    assert "*.bin" in calls[1]["allow_patterns"]
+    assert "*.bin.index.json" in calls[1]["allow_patterns"]
+    assert calls[1]["repo_id"] == "org/name"
+    assert any(
+        record.levelno == logging.WARNING and "pickle" in record.message.lower()
+        for record in caplog.records
+    )
+
+
+def test_resolve_source_hf_with_safetensors_does_not_redownload_even_with_allow_pickle(
+    download_calls: dict[str, Any],
+) -> None:
+    """A repo that already has safetensors must not trigger a second (.bin) download."""
+    _make_snapshot(download_calls["snapshot"], ["config.json", "model.safetensors"])
+
+    resolved = sources.resolve_source("org/name", allow_pickle=True)
+
+    assert resolved == Path(download_calls["snapshot"]).resolve()
+    assert len(download_calls["calls"]) == 1
 
 
 def test_resolve_source_wraps_download_failures(

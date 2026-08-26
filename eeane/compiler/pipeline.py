@@ -270,7 +270,7 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     batch_size = _validate_batch(args.batch)
 
     _progress(f"[1/6] Resolving source '{args.source}'")
-    model_dir = sources.resolve_source(args.source)
+    model_dir = sources.resolve_source(args.source, allow_pickle=args.allow_pickle)
     dispatch = resolve_dispatch(model_dir, args.kind)
     backend = dispatch.load_backend()
     kind = dispatch.kind
