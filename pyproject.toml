@@ -1,10 +1,35 @@
 [project]
 name = "eeane"
 version = "1.1.0.dev0"
-description = "Embedding engine for Apple Neural Engine"
+description = "Run text embedding and reranking models on the Apple Neural Engine of Apple Silicon Macs"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "GPL-3.0-or-later"
+keywords = [
+    "apple-neural-engine",
+    "ane",
+    "coreml",
+    "apple-silicon",
+    "macos",
+    "embeddings",
+    "text-embeddings",
+    "reranker",
+    "modernbert",
+    "xlm-roberta",
+    "inference-server",
+    "openai-compatible",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: MacOS X",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
 dependencies = [
     "fastapi>=0.141,<1",
     "uvicorn>=0.52,<1",
@@ -24,8 +49,10 @@ compile = [
 eeane = "eeane.cli:main"
 
 [project.urls]
+Homepage = "https://github.com/xhighhongo41/eeANE"
 Repository = "https://github.com/xhighhongo41/eeANE"
 Issues = "https://github.com/xhighhongo41/eeANE/issues"
+Changelog = "https://github.com/xhighhongo41/eeANE#changelog"
 
 [dependency-groups]
 dev = [
