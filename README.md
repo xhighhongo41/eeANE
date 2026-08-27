@@ -151,25 +151,23 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 ### About `eeane compile`
 
 `eeane compile` picks the model backend from the model's `config.json`.
-Three architecture families are supported: **ModernBERT** (verified on
-cl-nagoya/ruri-v3-310m and its reranker), **XLM-RoBERTa** (verified on
-intfloat/multilingual-e5-base, intfloat/multilingual-e5-large,
-BAAI/bge-reranker-v2-m3, BAAI/bge-m3, BAAI/bge-reranker-base and
-BAAI/bge-reranker-large; for embedding models the mean/CLS pooling
-declared by the model directory is applied automatically), and **BERT**
-(embedding models only, verified on BAAI/bge-small-en-v1.5,
-BAAI/bge-base-en-v1.5 and BAAI/bge-large-en-v1.5 — a BERT
-cross-encoder reranker is rejected instead, because the compiled graph
-would have to pin its segment ids to zero, which changes the meaning
-of a query/document pair for this architecture). More families are
-planned. The compiler detects whether a model is
+Three architecture families are supported: **ModernBERT** and
+**XLM-RoBERTa** (both embedding and cross-encoder reranker models), and
+**BERT** (embedding models only — a BERT cross-encoder reranker is
+rejected instead, because the compiled graph would have to pin its
+segment ids to zero, which changes the meaning of a query/document pair
+for this architecture). More families are planned. For embedding models
+the mean/CLS pooling declared by the model directory is applied
+automatically on the BERT and XLM-RoBERTa backends; the ModernBERT
+backend currently compiles mean pooling only. See [Verified
+models](#verified-models) for the models that have been run end to end.
+The compiler detects whether a model is
 an embedding model or a reranker and defaults to buckets 128/512/1024
 (embedding) or 512/1024 (reranker), clipped to the model's maximum
-sequence length (multilingual-e5, capped at 512 tokens, compiles as
-128/512; BAAI/bge-reranker-base and BAAI/bge-reranker-large, also
-capped at 512, compile with just the 512 bucket, dropping the default
-1024 one); `--buckets 512,2048` compiles a custom set (S2048 is verified
-on M2 at ~518 ms/inference). Re-running
+sequence length — a model capped at 512 tokens compiles as 128/512
+(embedding) or just 512 (reranker), and the compile log names each
+bucket it drops; `--buckets 512,2048` compiles a custom set (S2048 is
+verified on M2 at ~518 ms/inference). Re-running
 skips up-to-date artifacts (`--force` reconverts). After every
 conversion a **self-check** verifies accuracy against the FP32 original,
 measures how many operations landed on the Neural Engine, and records
@@ -183,6 +181,85 @@ directory and verified to reproduce the original tokenization exactly,
 so the server needs neither the original model files nor the
 transformers library at run time (see
 [docs/dependency-policy.md](docs/dependency-policy.md)).
+
+### Verified models
+
+Every model below was compiled from its stock Hugging Face
+distribution, passed the self-check, and had its output compared
+against the reference `sentence-transformers` / `CrossEncoder`
+implementation on an M2 Mac. **Buckets** is what `eeane compile`
+produces with no `--buckets` flag, after clipping to the model's
+maximum sequence length. Models are grouped by the backend their
+`config.json` selects — note that a model's name does not always
+predict it (`paraphrase-multilingual-mpnet-base-v2` is an
+XLM-RoBERTa model, and `multilingual-e5-small` is a BERT one).
+
+Any other model built on one of these three architectures is likely to
+work as well; these are simply the ones that have been run end to end.
+
+**ModernBERT**
+
+| Model | Type | Buckets |
+|---|---|---|
+| cl-nagoya/ruri-v3-30m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-70m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-130m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-310m | embedding | 128/512/1024 |
+| hotchpotch/bekko-embedding-v1-a25m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-reranker-310m | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-tiny-v2 | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-xsmall-v2 | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-small-v2 | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-base-v2 | reranker | 512/1024 |
+| ibm-granite/granite-embedding-reranker-english-r2 | reranker | 512/1024 |
+
+**XLM-RoBERTa**
+
+| Model | Type | Buckets |
+|---|---|---|
+| BAAI/bge-m3 <sup>1</sup> | embedding | 128/512/1024 |
+| Snowflake/snowflake-arctic-embed-l-v2.0 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-107m-multilingual | embedding | 128/512 |
+| ibm-granite/granite-embedding-278m-multilingual | embedding | 128/512 |
+| intfloat/multilingual-e5-base | embedding | 128/512 |
+| intfloat/multilingual-e5-large | embedding | 128/512 |
+| intfloat/multilingual-e5-large-instruct | embedding | 128/512 |
+| sentence-transformers/paraphrase-multilingual-mpnet-base-v2 | embedding | 128/512 |
+| BAAI/bge-reranker-v2-m3 | reranker | 512/1024 |
+| BAAI/bge-reranker-base | reranker | 512 |
+| BAAI/bge-reranker-large | reranker | 512 |
+
+**BERT** (embedding models only)
+
+| Model | Type | Buckets |
+|---|---|---|
+| BAAI/bge-small-en | embedding | 128/512 |
+| BAAI/bge-small-en-v1.5 | embedding | 128/512 |
+| BAAI/bge-base-en-v1.5 | embedding | 128/512 |
+| BAAI/bge-large-en-v1.5 | embedding | 128/512 |
+| BAAI/bge-small-zh-v1.5 | embedding | 128/512 |
+| BAAI/bge-base-zh-v1.5 <sup>1</sup> | embedding | 128/512 |
+| BAAI/bge-large-zh-v1.5 <sup>1</sup> | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-xs | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-s | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-m | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-m-v1.5 | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-l | embedding | 128/512 |
+| intfloat/e5-small-v2 | embedding | 128/512 |
+| intfloat/e5-base-v2 | embedding | 128/512 |
+| intfloat/e5-large-v2 | embedding | 128/512 |
+| intfloat/multilingual-e5-small | embedding | 128/512 |
+| thenlper/gte-base | embedding | 128/512 |
+| thenlper/gte-large | embedding | 128/512 |
+| mixedbread-ai/mxbai-embed-large-v1 | embedding | 128/512 |
+| sentence-transformers/all-MiniLM-L6-v2 | embedding | 128/512 |
+| sentence-transformers/all-MiniLM-L12-v2 | embedding | 128/512 |
+| sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | embedding | 128/512 |
+| sentence-transformers/paraphrase-MiniLM-L6-v2 | embedding | 128/512 |
+| sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | embedding | 128/512 |
+
+<sup>1</sup> Ships `pytorch_model.bin` only, so compiling it needs
+`--allow-pickle` (see [Checkpoint formats](#checkpoint-formats)).
 
 ### Checkpoint formats
 
@@ -450,11 +527,20 @@ exactly (`tools/verify_server.py` in a repository checkout).
   compile` above — pinning the compiled graph's segment ids to zero
   would change the meaning of a query/document pair for this
   architecture. BERT embedding models are unaffected.
-- **Chinese bge v1.5 models are unverified**: the `zh` variants (e.g.
-  bge-large-zh-v1.5) are expected to work on the same BERT backend as
-  their English counterparts, but have not been verified by the
-  maintainer; the `zh` large and base variants also ship
-  `pytorch_model.bin` only, so compiling them needs `--allow-pickle`.
+- **CLS-pooling ModernBERT embedding models are not supported yet**:
+  the ModernBERT backend compiles mean pooling only, so an embedding
+  model of that family which declares CLS pooling (for example the
+  ibm-granite `granite-embedding-*-r2` embedding models) would be
+  compiled with the wrong pooling. Support is planned. The BERT and
+  XLM-RoBERTa backends read the declared pooling and handle both, and
+  ModernBERT *rerankers* are unaffected.
+- **Accuracy on out-of-vocabulary input**: compiled models run in
+  fp16. For input a model's tokenizer cannot represent well — feeding
+  English text to a Chinese-only model, say — the rounding difference
+  against an fp32 reference grows noticeably, because the input is
+  already far outside what the model was trained on. Within a model's
+  intended languages the agreement is far tighter (cosine ≥ 0.9999 on
+  every model listed above).
 
 ## Development
 
@@ -539,6 +625,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.2.0 | 35 more verified models across all three backends (granite, Snowflake Arctic Embed, GTE, mxbai, MiniLM, e5, small ruri-v3, Chinese bge v1.5, Japanese rerankers) and a Verified models table; no engine changes |
 | 1.1.0 | BERT embedding backend; six more verified BAAI/bge models (bge-m3, bge-reranker-base/large, bge-small/base/large-en-v1.5); `--allow-pickle` opt-in for pickle-based checkpoints; expanded PyPI metadata |
 | 1.0.0 | First stable release: published on PyPI, launchd service guide, documentation overhaul |
 | 0.10.0 | Installable straight from GitHub with uv/pipx/pip; `eeane` console command |
