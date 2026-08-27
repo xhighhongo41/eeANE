@@ -153,24 +153,23 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 ### `eeane compile`について
 
 `eeane compile`はモデルの`config.json`からバックエンドを自動選択
-します。対応するアーキテクチャ系統は3つです: **ModernBERT**
-(cl-nagoya/ruri-v3-310mと同rerankerで検証済み)、**XLM-RoBERTa**
-(intfloat/multilingual-e5-base・intfloat/multilingual-e5-large・
-BAAI/bge-reranker-v2-m3・BAAI/bge-m3・BAAI/bge-reranker-base・
-BAAI/bge-reranker-largeで検証済み。embeddingモデルではモデル
-ディレクトリが宣言するmean/CLSプーリングが自動的に適用されます)、
-そして**BERT**(embeddingモデルのみに対応。BAAI/bge-small-en-v1.5・
-BAAI/bge-base-en-v1.5・BAAI/bge-large-en-v1.5で検証済み — BERT系
-クロスエンコーダrerankerは代わりに明確なエラーで拒否されます。理由
-は、コンパイル済みグラフではsegment idをゼロに固定せざるを得ず、
-それがこのアーキテクチャにおけるquery/documentペアの意味を変えて
-しまうためです)。さらなる系統の追加を計画中です。コンパイラは
+します。対応するアーキテクチャ系統は3つです: **ModernBERT**と
+**XLM-RoBERTa**(embeddingとクロスエンコーダrerankerの両方に対応)、
+そして**BERT**(embeddingモデルのみに対応 — BERT系クロスエンコーダ
+rerankerは代わりに明確なエラーで拒否されます。理由は、コンパイル
+済みグラフではsegment idをゼロに固定せざるを得ず、それがこの
+アーキテクチャにおけるquery/documentペアの意味を変えてしまうため
+です)。さらなる系統の追加を計画中です。embeddingモデルでは、BERTと
+XLM-RoBERTaのバックエンドについてはモデルディレクトリが宣言する
+mean/CLSプーリングが自動的に適用されます。ModernBERTバックエンドは
+現在meanプーリングのみをコンパイルします。実際に一通り動作を検証
+したモデルは[検証済みモデル](#検証済みモデル)を参照してください。
+コンパイラは
 モデルがembeddingモデルかrerankerかを自動判別し、既定のバケツは
 embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
-にクリップされます(最大512トークンのmultilingual-e5は128/512として
-コンパイルされます。同じく最大512トークンのBAAI/bge-reranker-base・
-BAAI/bge-reranker-largeは512バケツのみでコンパイルされ、既定の1024
-バケツは外れます)。`--buckets 512,2048`のようにカスタムの集合を
+にクリップされます — 最大512トークンのモデルはembeddingなら
+128/512、rerankerなら512のみとしてコンパイルされ、外したバケツは
+コンパイルのログに表示されます。`--buckets 512,2048`のようにカスタムの集合を
 コンパイルすることもできます(S2048はM2実機で約518ms/推論を検証
 済み)。再実行時は最新の成果物をスキップします(`--force`で再変換)。
 変換のたびに**セルフチェック**が走り、FP32オリジナルに対する精度を
@@ -184,6 +183,85 @@ BAAI/bge-reranker-largeは512バケツのみでコンパイルされ、既定の
 凍結され、元のトークナイズを完全に再現することが検証されるため、
 サーバーは実行時に元のモデルファイルもtransformersライブラリも
 必要としません([docs/dependency-policy.md](docs/dependency-policy.md)
+を参照)。
+
+### 検証済みモデル
+
+以下のモデルはいずれも、Hugging Faceの配布形式そのままからコンパイル
+し、セルフチェックに通過し、参照実装(`sentence-transformers` /
+`CrossEncoder`)の出力とM2実機で突き合わせたものです。**バケツ**は
+`--buckets`を指定しない場合に`eeane compile`が生成する構成(モデルの
+最大系列長でクリップした後)です。分類は`config.json`が選択する
+バックエンドごとで、モデル名からは必ずしも判別できない点に注意して
+ください(`paraphrase-multilingual-mpnet-base-v2`はXLM-RoBERTa系、
+`multilingual-e5-small`はBERT系です)。
+
+これら3系統のアーキテクチャに基づく他のモデルも動作する可能性が高く、
+以下は実際に一通り動作を確認したものの一覧にすぎません。
+
+**ModernBERT**
+
+| モデル | 種別 | バケツ |
+|---|---|---|
+| cl-nagoya/ruri-v3-30m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-70m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-130m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-310m | embedding | 128/512/1024 |
+| hotchpotch/bekko-embedding-v1-a25m | embedding | 128/512/1024 |
+| cl-nagoya/ruri-v3-reranker-310m | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-tiny-v2 | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-xsmall-v2 | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-small-v2 | reranker | 512/1024 |
+| hotchpotch/japanese-reranker-base-v2 | reranker | 512/1024 |
+| ibm-granite/granite-embedding-reranker-english-r2 | reranker | 512/1024 |
+
+**XLM-RoBERTa**
+
+| モデル | 種別 | バケツ |
+|---|---|---|
+| BAAI/bge-m3 <sup>1</sup> | embedding | 128/512/1024 |
+| Snowflake/snowflake-arctic-embed-l-v2.0 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-107m-multilingual | embedding | 128/512 |
+| ibm-granite/granite-embedding-278m-multilingual | embedding | 128/512 |
+| intfloat/multilingual-e5-base | embedding | 128/512 |
+| intfloat/multilingual-e5-large | embedding | 128/512 |
+| intfloat/multilingual-e5-large-instruct | embedding | 128/512 |
+| sentence-transformers/paraphrase-multilingual-mpnet-base-v2 | embedding | 128/512 |
+| BAAI/bge-reranker-v2-m3 | reranker | 512/1024 |
+| BAAI/bge-reranker-base | reranker | 512 |
+| BAAI/bge-reranker-large | reranker | 512 |
+
+**BERT**(embeddingモデルのみ)
+
+| モデル | 種別 | バケツ |
+|---|---|---|
+| BAAI/bge-small-en | embedding | 128/512 |
+| BAAI/bge-small-en-v1.5 | embedding | 128/512 |
+| BAAI/bge-base-en-v1.5 | embedding | 128/512 |
+| BAAI/bge-large-en-v1.5 | embedding | 128/512 |
+| BAAI/bge-small-zh-v1.5 | embedding | 128/512 |
+| BAAI/bge-base-zh-v1.5 <sup>1</sup> | embedding | 128/512 |
+| BAAI/bge-large-zh-v1.5 <sup>1</sup> | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-xs | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-s | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-m | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-m-v1.5 | embedding | 128/512 |
+| Snowflake/snowflake-arctic-embed-l | embedding | 128/512 |
+| intfloat/e5-small-v2 | embedding | 128/512 |
+| intfloat/e5-base-v2 | embedding | 128/512 |
+| intfloat/e5-large-v2 | embedding | 128/512 |
+| intfloat/multilingual-e5-small | embedding | 128/512 |
+| thenlper/gte-base | embedding | 128/512 |
+| thenlper/gte-large | embedding | 128/512 |
+| mixedbread-ai/mxbai-embed-large-v1 | embedding | 128/512 |
+| sentence-transformers/all-MiniLM-L6-v2 | embedding | 128/512 |
+| sentence-transformers/all-MiniLM-L12-v2 | embedding | 128/512 |
+| sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | embedding | 128/512 |
+| sentence-transformers/paraphrase-MiniLM-L6-v2 | embedding | 128/512 |
+| sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | embedding | 128/512 |
+
+<sup>1</sup> `pytorch_model.bin`のみを配布しているため、コンパイルには
+`--allow-pickle`が必要です([チェックポイント形式](#チェックポイント形式)
 を参照)。
 
 ### チェックポイント形式
@@ -465,11 +543,20 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   segment idをゼロに固定せざるを得ず、それがこのアーキテクチャに
   おけるquery/documentペアの意味を変えてしまうためです。BERT系
   embeddingモデルはこの影響を受けず、対応しています。
-- **中国語版bge v1.5系は未検証**: `zh`系(例: bge-large-zh-v1.5)は
-  英語版と同じBERTバックエンドで動作する見込みですが、メンテナに
-  よる検証は行われていません。また`zh`系のlarge/baseは
-  `pytorch_model.bin`のみを配布しているため、コンパイルには
-  `--allow-pickle`が必要になります。
+- **CLSプーリングのModernBERT系embeddingモデルは未対応**:
+  ModernBERTバックエンドはmeanプーリングのみをコンパイルするため、
+  CLSプーリングを宣言する同系統のembeddingモデル(例: ibm-graniteの
+  `granite-embedding-*-r2`のembeddingモデル)は誤った
+  プーリングでコンパイルされてしまいます。対応を計画中です。
+  BERTとXLM-RoBERTaのバックエンドは宣言されたプーリングを読み取り
+  両方に対応しており、ModernBERT系の*reranker*も影響を受けません。
+- **語彙外の入力に対する精度**: コンパイル済みモデルはfp16で動作
+  します。モデルのトークナイザがうまく表現できない入力 — たとえば
+  中国語専用モデルに英語の文を与えるような場合 — では、入力自体が
+  モデルの学習範囲から大きく外れているため、fp32の参照実装との
+  丸め差が目に見えて大きくなります。モデルが想定する言語の範囲内
+  では一致度はずっと高くなります(上記一覧の全モデルでコサイン
+  0.9999以上)。
 
 ## 開発
 
@@ -556,6 +643,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 1.2.0 | 3つのバックエンド全体で35モデルを追加検証(granite・Snowflake Arctic Embed・GTE・mxbai・MiniLM・e5・ruri-v3の小型・中国語版bge v1.5・日本語reranker)し、検証済みモデルの一覧表を新設。エンジンの変更なし |
 | 1.1.0 | BERT embeddingバックエンドを新設。BAAI/bge系モデルを6件追加検証(bge-m3・bge-reranker-base/large・bge-small/base/large-en-v1.5)。pickleベースのチェックポイント向けopt-inの`--allow-pickle`。PyPIメタデータの拡充 |
 | 1.0.0 | 最初の安定版リリース: PyPIで公開、launchdサービス化ガイド、ドキュメント全面改訂 |
 | 0.10.0 | uv/pipx/pipでGitHubから直接インストール可能に、`eeane`コンソールコマンドを追加 |
