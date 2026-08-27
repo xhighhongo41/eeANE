@@ -1,6 +1,6 @@
 [project]
 name = "eeane"
-version = "1.2.0.dev0"
+version = "1.2.0"
 description = "Run text embedding and reranking models on the Apple Neural Engine of Apple Silicon Macs"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
