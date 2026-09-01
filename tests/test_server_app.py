@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from conftest import (
     STUB_BUCKETS,
+    STUB_DIM,
     StubEngine,
     make_config,
     make_model_entry,
@@ -85,6 +86,33 @@ class TruncatingStubEngine(StubEngine):
         batch.orig_tokens = [2000] * len(documents)
         batch.used_tokens = [512] * len(documents)
         batch.truncated_indices = list(range(len(documents)))
+        return batch
+
+
+class VectorCapturingStubEngine(StubEngine):
+    """Stub recording the exact array object returned by its last :meth:`embed` call.
+
+    Used to prove that truncating to a requested ``dimensions`` never
+    mutates the engine's vectors in place (basic column slicing returns a
+    view, and a merged batch's vectors may be shared with another
+    request).
+
+    Attributes:
+        last_vectors: The ``vectors`` array of the most recent
+            :meth:`embed` call, or ``None`` before any call.
+    """
+
+    def __init__(self, config: EeaneConfig) -> None:
+        """Register the configured models and start with no recorded call."""
+        super().__init__(config)
+        self.last_vectors: np.ndarray | None = None
+
+    def embed(
+        self, texts: list[str], model_id: str | None = None, *, deadline: float | None = None
+    ) -> EmbeddingBatch:
+        """Record the returned batch's vectors, then serve it normally."""
+        batch = super().embed(texts, model_id)
+        self.last_vectors = batch.vectors
         return batch
 
 
@@ -485,6 +513,105 @@ def test_embeddings_require_input(client: TestClient) -> None:
     response = client.post("/v1/embeddings", json={"model": "ruri-v3-310m"})
 
     assert response.status_code == 422
+
+
+def test_embeddings_dimensions_truncates_to_the_requested_width(client: TestClient) -> None:
+    """dimensions must cut every returned vector down to its first N components."""
+    response = client.post("/v1/embeddings", json={"input": ["a", "bbb"], "dimensions": 2})
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    for item, text in zip(data, ["a", "bbb"], strict=True):
+        assert len(item["embedding"]) == 2
+        np.testing.assert_allclose(item["embedding"], stub_vector(text)[:2])
+
+
+def test_embeddings_dimensions_only_truncates_when_normalization_is_disabled(
+    client: TestClient,
+) -> None:
+    """Without normalization, dimensions must truncate but not renormalize."""
+    response = client.post("/v1/embeddings", json={"input": "bbb", "dimensions": 2})
+
+    assert response.status_code == 200
+    embedding = response.json()["data"][0]["embedding"]
+    np.testing.assert_allclose(embedding, stub_vector("bbb")[:2])
+    assert np.linalg.norm(embedding) != pytest.approx(1.0, abs=1e-6)
+
+
+def test_embeddings_dimensions_renormalizes_when_enabled(
+    normalizing_client: TestClient,
+) -> None:
+    """With normalization enabled, a truncated vector must be re-normalized to unit norm."""
+    response = normalizing_client.post(
+        "/v1/embeddings", json={"input": ["a", "bbb"], "dimensions": 2}
+    )
+
+    assert response.status_code == 200
+    for item in response.json()["data"]:
+        assert len(item["embedding"]) == 2
+        assert np.linalg.norm(item["embedding"]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_embeddings_dimensions_base64_matches_the_float_path(client: TestClient) -> None:
+    """base64 and float encodings must agree on the same truncated values."""
+    body = {"input": ["hello"], "dimensions": 2}
+
+    float_response = client.post("/v1/embeddings", json=body)
+    base64_response = client.post("/v1/embeddings", json={**body, "encoding_format": "base64"})
+
+    assert float_response.status_code == 200 and base64_response.status_code == 200
+    decoded = runtime.base64_to_floats(base64_response.json()["data"][0]["embedding"])
+    np.testing.assert_allclose(decoded, float_response.json()["data"][0]["embedding"])
+
+
+def test_embeddings_dimensions_equal_to_full_width_matches_the_baseline(
+    client: TestClient,
+) -> None:
+    """dimensions equal to the model's actual width must match an unset-dimensions request."""
+    baseline = client.post("/v1/embeddings", json={"input": ["hello"]})
+    full_width = client.post("/v1/embeddings", json={"input": ["hello"], "dimensions": STUB_DIM})
+
+    assert baseline.status_code == 200 and full_width.status_code == 200
+    assert baseline.json()["data"] == full_width.json()["data"]
+
+
+def test_embeddings_dimensions_beyond_the_model_width_returns_400(client: TestClient) -> None:
+    """A dimensions value larger than the model's embedding width must be rejected."""
+    response = client.post("/v1/embeddings", json={"input": "hello", "dimensions": STUB_DIM + 1})
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert str(STUB_DIM + 1) in detail
+    assert str(STUB_DIM) in detail
+
+
+def test_embeddings_without_dimensions_response_is_byte_for_byte_unchanged(
+    client: TestClient,
+) -> None:
+    """Omitting dimensions must leave the response identical to a request with no such field."""
+    with_field_absent = client.post("/v1/embeddings", json={"input": ["hello", "world"]})
+    with_field_null = client.post(
+        "/v1/embeddings", json={"input": ["hello", "world"], "dimensions": None}
+    )
+
+    assert with_field_absent.status_code == 200 and with_field_null.status_code == 200
+    assert with_field_absent.content == with_field_null.content
+
+
+def test_embeddings_dimensions_does_not_mutate_the_engines_vectors() -> None:
+    """Truncating to dimensions must leave the engine's returned vectors array untouched.
+
+    A merged batch's ``vectors`` array may be shared with another
+    request's texts, so the endpoint must never write into it in place.
+    """
+    config = make_config(normalize=False)
+    engine = VectorCapturingStubEngine(config)
+    with TestClient(create_app(config, engine=engine)) as test_client:
+        response = test_client.post("/v1/embeddings", json={"input": ["a", "bbb"], "dimensions": 2})
+
+    assert response.status_code == 200
+    expected = np.stack([stub_vector("a"), stub_vector("bbb")])
+    np.testing.assert_allclose(engine.last_vectors, expected)
 
 
 @pytest.mark.parametrize("path", ["/rerank", "/v1/rerank"])

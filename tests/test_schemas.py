@@ -92,6 +92,32 @@ def test_embeddings_request_defaults() -> None:
     assert request.model is None
 
 
+def test_embeddings_request_accepts_dimensions() -> None:
+    """dimensions must be accepted as a positive int (OpenAI-compatible MRL truncation)."""
+    request = EmbeddingsRequest(input="hello", dimensions=256)
+
+    assert request.dimensions == 256
+
+
+def test_embeddings_request_dimensions_defaults_to_none() -> None:
+    """Omitting dimensions must leave it unset (full embedding width returned)."""
+    request = EmbeddingsRequest(input="hello")
+
+    assert request.dimensions is None
+
+
+def test_embeddings_request_rejects_dimensions_zero() -> None:
+    """dimensions must be >= 1; 0 must fail validation."""
+    with pytest.raises(ValidationError):
+        EmbeddingsRequest(input="hello", dimensions=0)
+
+
+def test_embeddings_request_rejects_negative_dimensions() -> None:
+    """A negative dimensions value must fail validation."""
+    with pytest.raises(ValidationError):
+        EmbeddingsRequest(input="hello", dimensions=-1)
+
+
 # --- RerankRequest -------------------------------------------------
 
 

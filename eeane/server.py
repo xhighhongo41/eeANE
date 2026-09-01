@@ -591,10 +591,12 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
 
         Raises:
             HTTPException: 404 when ``body.model`` names no configured
-                model, 400 when it names a model of another kind, 503
-                when the request's wait exceeded ``server.queue_timeout``
-                (either before or while it waited its turn at the
-                engine), 500 when the model produced a non-finite output.
+                model, 400 when it names a model of another kind or when
+                ``body.dimensions`` exceeds the resolved model's
+                embedding width, 503 when the request's wait exceeded
+                ``server.queue_timeout`` (either before or while it
+                waited its turn at the engine), 500 when the model
+                produced a non-finite output.
         """
         started = time.perf_counter()
         deadline = _compute_deadline(request, config)
@@ -613,6 +615,23 @@ def create_app(config: EeaneConfig, engine: InferenceEngine | None = None) -> Fa
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         vectors = batch.vectors
+        if body.dimensions is not None:
+            embedding_width = vectors.shape[1]
+            if body.dimensions > embedding_width:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"dimensions={body.dimensions} exceeds the embedding width "
+                        f"of model '{entry.id}' ({embedding_width}); request at "
+                        f"most {embedding_width}."
+                    ),
+                )
+            # Basic column slicing returns a view, never a copy: batch.vectors
+            # may be shared with another request merged into the same
+            # inference call, so it must never be mutated in place.
+            # l2_normalize below always allocates a fresh array, so passing
+            # this view through unmodified (the normalize=False case) is safe.
+            vectors = vectors[:, : body.dimensions]
         # Normalization is a per-model decision, and an empty request is
         # skipped so the (0, D) shape is never divided by an empty norm.
         if entry.normalize and vectors.shape[0] > 0:

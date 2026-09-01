@@ -43,6 +43,15 @@ class EmbeddingsRequest(BaseModel):
         encoding_format: Either ``"float"`` (plain JSON floats) or
             ``"base64"`` (base64-encoded little-endian float32 bytes, as
             requested by the official OpenAI SDK by default).
+        dimensions: Optional Matryoshka representation learning (MRL)
+            truncation target, as accepted by the OpenAI API. When set,
+            only the first ``dimensions`` components of the model's
+            embedding are kept before normalization; a model trained with
+            an MRL objective produces meaningful embeddings at any prefix
+            length, so this approximates a smaller embedding size without
+            re-running inference. Must be at least 1 when provided.
+            Omitting it (or sending ``null``) returns the full embedding
+            width unchanged.
         user: Opaque client identifier. Accepted but ignored.
     """
 
@@ -51,6 +60,7 @@ class EmbeddingsRequest(BaseModel):
     input: list[str]
     model: str | None = None
     encoding_format: Literal["float", "base64"] = "float"
+    dimensions: int | None = Field(default=None, ge=1)
     user: str | None = None
 
     @field_validator("input", mode="before")
