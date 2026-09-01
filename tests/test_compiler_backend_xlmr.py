@@ -320,12 +320,14 @@ def test_fixtures_have_the_expected_shape_per_kind() -> None:
     backend = xlmr.XlmRobertaBackend()
 
     assert isinstance(backend.trace_example("embedding"), str)
-    assert all(isinstance(text, str) and text for text in backend.sanity_spec("embedding").inputs)
+    assert all(
+        isinstance(text, str) and text for text in backend.sanity_spec("embedding").all_inputs
+    )
     assert backend.padding_input("embedding") == ""
 
     trace_pair = backend.trace_example("reranker")
     assert isinstance(trace_pair, tuple) and len(trace_pair) == 2
-    assert all(len(pair) == 2 for pair in backend.sanity_spec("reranker").inputs)
+    assert all(len(pair) == 2 for pair in backend.sanity_spec("reranker").all_inputs)
     assert backend.padding_input("reranker") == ("", "")
 
 
@@ -333,7 +335,7 @@ def test_embedding_sanity_spec_declares_no_ordering() -> None:
     """Embedding fixtures are compared row-wise; there is no expected ordering."""
     spec = xlmr.XlmRobertaBackend().sanity_spec("embedding")
 
-    assert spec.inputs
+    assert spec.input_sets
     assert spec.relevant_index is None
     assert spec.irrelevant_index is None
 
@@ -341,22 +343,23 @@ def test_embedding_sanity_spec_declares_no_ordering() -> None:
 def test_reranker_sanity_spec_points_at_the_relevant_and_irrelevant_pairs() -> None:
     """The reranker ordering check must be driven by the spec, not by module constants."""
     spec = xlmr.XlmRobertaBackend().sanity_spec("reranker")
+    japanese = dict(spec.input_sets)["ja"]
 
     assert spec.relevant_index == 0
     assert spec.irrelevant_index == 1
     # The relevant pair shares its query with the irrelevant one, so only the
     # document decides the expected ordering.
-    assert spec.inputs[0][0] == spec.inputs[1][0]
-    assert spec.inputs[0][1] != spec.inputs[1][1]
+    assert japanese[0][0] == japanese[1][0]
+    assert japanese[0][1] != japanese[1][1]
 
 
 def test_sanity_spec_inputs_are_immutable() -> None:
     """The fixtures a caller receives must not be corruptible module state."""
-    inputs = xlmr.XlmRobertaBackend().sanity_spec("embedding").inputs
+    input_sets = xlmr.XlmRobertaBackend().sanity_spec("embedding").input_sets
 
-    assert isinstance(inputs, tuple)
+    assert isinstance(input_sets, tuple)
     with pytest.raises(TypeError):
-        inputs[0] = "mutated"  # type: ignore[index]
+        input_sets[0][1][0] = "mutated"  # type: ignore[index]
 
 
 @pytest.mark.parametrize(

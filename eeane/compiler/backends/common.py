@@ -3,10 +3,11 @@
 Everything in here is plumbing that does not depend on a particular model
 architecture: masked pooling, the stable sigmoid used for reranker
 post-processing, fixed-shape tokenization, the FP32 PyTorch baselines,
-the traceable wrapper modules and the reader for the pooling mode a
-sentence-transformers model directory declares. Architecture-specific
-code (graph patches, fixtures, position-embedding offsets) stays in the
-per-family backend modules that import from here.
+the traceable wrapper modules, the reader for the pooling mode a
+sentence-transformers model directory declares, and the self-check's
+per-language sanity fixtures. Architecture-specific code (graph patches,
+position-embedding offsets, and the fixtures a family overrides) stays in
+the per-family backend modules that import from here.
 
 The pooling helpers and the wrappers are the single source of truth for
 both sides of the self-check: the module that is traced into the Core ML
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -55,6 +57,168 @@ _POOLING_REQUIREMENT = (
     f"'{POOLING_DIRNAME}/{POOLING_CONFIG_FILENAME}' with exactly one of "
     f"{' / '.join(POOLING_MODE_KEYS)} set to true."
 )
+
+
+# --- sanity fixtures, one set per language -----------------------------------
+#
+# The self-check evaluates every set and accepts a variant as soon as one
+# of them clears the threshold, so these sets are what decides which
+# checkpoints can be compiled at all: fixtures in a language a model has
+# no vocabulary for encode to little more than unknown-token rows, whose
+# FP16-vs-FP32 difference says nothing about the model yet can still miss
+# the threshold. Offering English, Japanese and Chinese means a model
+# covering any one of them is measured on inputs it can actually read.
+#
+# Every set is built the same way, so the sets stay comparable:
+#
+# * an embedding set holds three sentences -- short, medium and long -- so
+#   one fixed sequence length exercises three different amounts of padding;
+# * a reranker set holds three pairs -- relevant, irrelevant, partially
+#   related -- of which the first two share their query, so only the
+#   document decides which of them must score higher.
+#
+# Existing fixtures are never reworded: the accuracy numbers recorded for
+# already-verified models were measured on these exact strings.
+
+SANITY_LANGUAGE_EN = "en"
+SANITY_LANGUAGE_JA = "ja"
+SANITY_LANGUAGE_ZH = "zh"
+
+# Position of the relevant and the irrelevant pair inside every reranker
+# set, as handed to a SanitySpec: the sets share one pair ordering, so
+# they share these indices too.
+SANITY_RELEVANT_INDEX = 0
+SANITY_IRRELEVANT_INDEX = 1
+
+SANITY_TEXTS_EN: tuple[str, ...] = (
+    "Question: how tall is the highest mountain in Japan?",
+    "Document: Mount Fuji rises 3,776 metres above sea level on the border between "
+    "Shizuoka and Yamanashi, and is the highest mountain in Japan.",
+    "Topic: turning a large collection of documents into vectors ahead of time makes it "
+    "possible to retrieve passages with a similar meaning without reading every text again.",
+)
+
+SANITY_TEXTS_JA: tuple[str, ...] = (
+    "質問: 富士山の標高は何メートルですか。",
+    "文書: 富士山は静岡県と山梨県にまたがる標高3776メートルの山であり、"
+    "日本の最高峰として知られている。",
+    "話題: 大量の文書をあらかじめベクトルに変換して保存しておくと、"
+    "検索のたびに本文を読み直さずに近い意味の文書を取り出せる。",
+)
+
+SANITY_TEXTS_ZH: tuple[str, ...] = (
+    "问题：长江全长大约有多少公里？",
+    "文档：长江全长约6300公里，发源于青藏高原，自西向东流经中国多个省份，最终注入东海。",
+    "主题：将大量文档预先转换为向量并建立索引，可以在检索时快速找到语义相近的内容，"
+    "而无需逐篇重新阅读原文。",
+)
+
+SANITY_PAIRS_EN: tuple[tuple[str, str], ...] = (
+    # Relevant pair
+    (
+        "How tall is the highest mountain in Japan?",
+        "Mount Fuji rises 3,776 metres above sea level on the border between Shizuoka "
+        "and Yamanashi, and is the highest mountain in Japan.",
+    ),
+    # Irrelevant pair
+    (
+        "How tall is the highest mountain in Japan?",
+        "Brewing coffee with freshly ground beans is said to bring out a richer aroma "
+        "than using pre-ground coffee.",
+    ),
+    # Partially related pair
+    (
+        "How does vector search work?",
+        "Public libraries usually arrange the books on their shelves in alphabetical "
+        "order by the author's surname.",
+    ),
+)
+
+SANITY_PAIRS_JA: tuple[tuple[str, str], ...] = (
+    # Relevant pair
+    (
+        "富士山の標高は何メートルですか。",
+        "富士山は静岡県と山梨県にまたがる標高3776メートルの山であり、日本の最高峰として知られている。",
+    ),
+    # Irrelevant pair
+    (
+        "富士山の標高は何メートルですか。",
+        "味噌汁の出汁は昆布と鰹節を組み合わせると香りが良くなると言われている。",
+    ),
+    # Partially related pair
+    (
+        "ベクトル検索の仕組みを知りたい。",
+        "図書館では蔵書を著者名の五十音順に並べて管理している。",
+    ),
+)
+
+SANITY_PAIRS_ZH: tuple[tuple[str, str], ...] = (
+    # Relevant pair
+    (
+        "长江全长大约有多少公里？",
+        "长江全长约6300公里，发源于青藏高原，自西向东流经中国多个省份，最终注入东海。",
+    ),
+    # Irrelevant pair
+    (
+        "长江全长大约有多少公里？",
+        "泡茶时水温对茶叶的香气和口感有明显影响，绿茶一般适合用八十度左右的热水冲泡。",
+    ),
+    # Partially related pair
+    (
+        "向量检索是如何工作的？",
+        "图书馆通常按照作者姓氏的拼音顺序整理书架上的藏书。",
+    ),
+)
+
+# The sets as a backend hands them to a SanitySpec. The order is the
+# evaluation order of the self-check and the tie-break between two equally
+# good sets, so it is fixed here rather than derived from a mapping.
+SANITY_TEXT_SETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (SANITY_LANGUAGE_EN, SANITY_TEXTS_EN),
+    (SANITY_LANGUAGE_JA, SANITY_TEXTS_JA),
+    (SANITY_LANGUAGE_ZH, SANITY_TEXTS_ZH),
+)
+
+SANITY_PAIR_SETS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (SANITY_LANGUAGE_EN, SANITY_PAIRS_EN),
+    (SANITY_LANGUAGE_JA, SANITY_PAIRS_JA),
+    (SANITY_LANGUAGE_ZH, SANITY_PAIRS_ZH),
+)
+
+
+def override_sanity_set(
+    input_sets: tuple[tuple[str, tuple[Any, ...]], ...],
+    language: str,
+    inputs: tuple[Any, ...],
+) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    """Replace one language's fixtures, keeping every other set and the order.
+
+    A backend whose already-verified models were measured on fixtures of
+    its own keeps those for that language -- rewording them would move
+    the recorded numbers -- while still offering the shared sets for the
+    languages it has nothing special to say about.
+
+    Args:
+        input_sets: Sets to start from, typically :data:`SANITY_TEXT_SETS`
+            or :data:`SANITY_PAIR_SETS`.
+        language: Language whose inputs are replaced.
+        inputs: Replacement inputs for that language.
+
+    Returns:
+        A new tuple of sets, in the order of ``input_sets``.
+
+    Raises:
+        ValueError: If ``language`` is not among ``input_sets``; silently
+            returning the shared fixtures would hide the typo until a
+            model was measured against the wrong ones.
+    """
+    if language not in {declared for declared, _ in input_sets}:
+        declared = ", ".join(declared for declared, _ in input_sets)
+        raise ValueError(f"cannot override the '{language}' sanity set (declared: {declared})")
+    return tuple(
+        (declared, inputs if declared == language else declared_inputs)
+        for declared, declared_inputs in input_sets
+    )
 
 
 def read_pooling_mode(model_dir: Path) -> str:

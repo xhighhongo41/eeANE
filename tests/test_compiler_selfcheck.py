@@ -82,7 +82,7 @@ class _FakeBackend:
     def __init__(
         self,
         kind: str,
-        sanity: list[Any],
+        sanity_sets: dict[str, list[Any]],
         padding: Any,
         reference: np.ndarray,
         *,
@@ -92,27 +92,36 @@ class _FakeBackend:
 
         Args:
             kind: Model kind the fake backend answers for.
-            sanity: Inputs of the :class:`~eeane.compiler.backends.base.SanitySpec`
-                returned by :meth:`sanity_spec`.
+            sanity_sets: Inputs per language of the
+                :class:`~eeane.compiler.backends.base.SanitySpec` returned
+                by :meth:`sanity_spec`, in evaluation order.
             padding: Value returned by :meth:`padding_input`.
-            reference: Value returned by :meth:`reference_outputs`.
+            reference: Value returned by :meth:`reference_outputs`: one row
+                per input of every set, concatenated in set order.
             ordering: Whether a reranker's spec declares the
                 relevant/irrelevant indices (index 0 / index 1) its
                 ordering check needs. An embedding spec never declares
                 them, as in a real backend.
         """
         self._kind = kind
-        self._sanity = sanity
+        self._sanity_sets = sanity_sets
         self._padding = padding
         self._reference = reference
         self._ordering = ordering
+        # Recorded so a test can prove the FP32 baseline is computed once
+        # for every set together, not once per set (each call reloads the
+        # model in a real backend).
+        self.reference_calls: list[list[Any]] = []
 
     def sanity_spec(self, kind: str) -> base.SanitySpec:
         """Return the fixed sanity specification, asserting the expected kind."""
         assert kind == self._kind
+        input_sets = tuple(
+            (language, tuple(inputs)) for language, inputs in self._sanity_sets.items()
+        )
         if kind != "reranker" or not self._ordering:
-            return base.SanitySpec(inputs=tuple(self._sanity))
-        return base.SanitySpec(inputs=tuple(self._sanity), relevant_index=0, irrelevant_index=1)
+            return base.SanitySpec(input_sets=input_sets)
+        return base.SanitySpec(input_sets=input_sets, relevant_index=0, irrelevant_index=1)
 
     def padding_input(self, kind: str) -> Any:
         """Return the fixed padding fixture, asserting the expected kind."""
@@ -122,15 +131,16 @@ class _FakeBackend:
     def reference_outputs(
         self, model_dir: Path, kind: str, inputs: list[Any], seq_len: int
     ) -> np.ndarray:
-        """Return the fixed FP32 baseline, ignoring everything but ``kind``."""
+        """Return the fixed FP32 baseline, recording which inputs were asked for."""
         assert kind == self._kind
+        self.reference_calls.append(list(inputs))
         return self._reference
 
 
 def _make_context(
     tmp_path: Path,
     kind: str,
-    sanity_inputs: list[Any],
+    sanity_sets: dict[str, list[Any]],
     padding_input: Any,
     reference: np.ndarray,
     seq_len: int = 16,
@@ -142,8 +152,8 @@ def _make_context(
     Args:
         tmp_path: Test-scoped scratch directory.
         kind: ``"embedding"`` or ``"reranker"``.
-        sanity_inputs: Inputs of the spec served by the fake backend's
-            ``sanity_spec``.
+        sanity_sets: Inputs per language of the spec served by the fake
+            backend's ``sanity_spec``, in evaluation order.
         padding_input: Fixture served by the fake backend's ``padding_input``.
         reference: Fixture served by the fake backend's ``reference_outputs``.
         seq_len: Fixed sequence length S.
@@ -160,7 +170,7 @@ def _make_context(
     frozen = runtime.load_frozen_tokenizer(tokenizer_path)
     mlmodelc_path = tmp_path / "variant.mlmodelc"
     mlmodelc_path.mkdir()
-    backend = _FakeBackend(kind, sanity_inputs, padding_input, reference, ordering=ordering)
+    backend = _FakeBackend(kind, sanity_sets, padding_input, reference, ordering=ordering)
     context = pipeline.SelfcheckContext(
         backend=backend,
         model_dir=tmp_path,
@@ -179,9 +189,33 @@ def _row_key(row: np.ndarray) -> tuple[int, ...]:
     return tuple(int(value) for value in row)
 
 
+def _row_outputs(
+    frozen: runtime.FrozenTokenizer,
+    kind: str,
+    inputs: list[Any],
+    seq_len: int,
+    outputs: np.ndarray,
+) -> dict[tuple[int, ...], np.ndarray]:
+    """Map every fixture's tokenized row to the raw output predict() must return.
+
+    Args:
+        frozen: Tokenizer the self-check will encode the fixtures with.
+        kind: ``"embedding"`` or ``"reranker"``; decides the encoding.
+        inputs: Every set's fixtures, concatenated in set order.
+        seq_len: Fixed sequence length S.
+        outputs: One raw output row per input, in the same order.
+
+    Returns:
+        The lookup :func:`_install_row_predict` takes.
+    """
+    tokenize = runtime.tokenize_pairs if kind == "reranker" else runtime.tokenize_texts
+    rows = tokenize(frozen, inputs, seq_len)["input_ids"]
+    return {_row_key(rows[index]): outputs[index] for index in range(len(inputs))}
+
+
 def _install_row_predict(
     monkeypatch: pytest.MonkeyPatch, output_key: str, row_outputs: dict[tuple[int, ...], np.ndarray]
-) -> None:
+) -> list[dict[str, np.ndarray]]:
     """Patch ``ct.models.CompiledMLModel`` so predict() looks up a fixed row per input.
 
     Every row of a predict() call's ``input_ids`` is looked up in
@@ -194,9 +228,15 @@ def _install_row_predict(
         output_key: Output name the fake prediction dict is keyed by.
         row_outputs: Map from a tokenized row (see :func:`_row_key`) to its
             desired raw output row.
+
+    Returns:
+        The list every predict() input is appended to, so a test can assert
+        which rows were predicted, and in how many calls.
     """
+    calls: list[dict[str, np.ndarray]] = []
 
     def _predict(inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        calls.append(inputs)
         rows = inputs["input_ids"]
         stacked = np.stack([row_outputs[_row_key(row)] for row in rows])
         return {output_key: stacked}
@@ -205,6 +245,7 @@ def _install_row_predict(
     monkeypatch.setattr(
         selfcheck.ct.models, "CompiledMLModel", lambda *args, **kwargs: fake_compiled
     )
+    return calls
 
 
 class _FakeOp:
@@ -364,7 +405,7 @@ def test_run_selfcheck_embedding_passed(monkeypatch: pytest.MonkeyPatch, tmp_pat
     """A high-NE, on-threshold-accuracy embedding variant must report status='passed'."""
     sanity_texts = ["alpha", "beta", "gamma"]
     reference = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32)
-    context, frozen = _make_context(tmp_path, "embedding", sanity_texts, "", reference)
+    context, frozen = _make_context(tmp_path, "embedding", {"en": sanity_texts}, "", reference)
     rows = runtime.tokenize_texts(frozen, sanity_texts, context.seq_len)["input_ids"]
     row_outputs = {_row_key(rows[i]): reference[i] for i in range(len(sanity_texts))}
     _install_row_predict(monkeypatch, "embedding", row_outputs)
@@ -388,7 +429,7 @@ def test_run_selfcheck_embedding_warned_on_low_ne_placement(
     """Passing accuracy with NE placement below the threshold must warn, not fail."""
     sanity_texts = ["alpha", "beta"]
     reference = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
-    context, frozen = _make_context(tmp_path, "embedding", sanity_texts, "", reference)
+    context, frozen = _make_context(tmp_path, "embedding", {"en": sanity_texts}, "", reference)
     rows = runtime.tokenize_texts(frozen, sanity_texts, context.seq_len)["input_ids"]
     row_outputs = {_row_key(rows[i]): reference[i] for i in range(len(sanity_texts))}
     _install_row_predict(monkeypatch, "embedding", row_outputs)
@@ -408,7 +449,7 @@ def test_run_selfcheck_embedding_failed_on_low_cosine(
     """A coreml output far from the FP32 baseline must fail the sanity check."""
     sanity_texts = ["alpha", "beta"]
     reference = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
-    context, frozen = _make_context(tmp_path, "embedding", sanity_texts, "", reference)
+    context, frozen = _make_context(tmp_path, "embedding", {"en": sanity_texts}, "", reference)
     rows = runtime.tokenize_texts(frozen, sanity_texts, context.seq_len)["input_ids"]
     # Orthogonal to the reference row: cosine == 0.0, far below the threshold.
     orthogonal = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
@@ -430,7 +471,7 @@ def test_run_selfcheck_embedding_failed_on_nan(
     """A non-finite coreml output must fail the sanity check regardless of cosine."""
     sanity_texts = ["alpha", "beta"]
     reference = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
-    context, frozen = _make_context(tmp_path, "embedding", sanity_texts, "", reference)
+    context, frozen = _make_context(tmp_path, "embedding", {"en": sanity_texts}, "", reference)
     rows = runtime.tokenize_texts(frozen, sanity_texts, context.seq_len)["input_ids"]
     outputs = {
         _row_key(rows[0]): np.array([np.nan, 0.0], dtype=np.float32),
@@ -453,7 +494,7 @@ def test_run_selfcheck_compute_plan_unavailable_does_not_change_status(
     """A passing sanity check plus an unavailable compute plan must still report 'passed'."""
     sanity_texts = ["alpha"]
     reference = np.array([[1.0, 0.0]], dtype=np.float32)
-    context, frozen = _make_context(tmp_path, "embedding", sanity_texts, "", reference)
+    context, frozen = _make_context(tmp_path, "embedding", {"en": sanity_texts}, "", reference)
     rows = runtime.tokenize_texts(frozen, sanity_texts, context.seq_len)["input_ids"]
     _install_row_predict(monkeypatch, "embedding", {_row_key(rows[0]): reference[0]})
     _install_compute_plan_failure(monkeypatch, "MLComputePlan API missing")
@@ -477,7 +518,7 @@ def test_run_selfcheck_internal_exception_returns_failed_with_error(
     monkeypatch.setattr(selfcheck.ct.models, "CompiledMLModel", _raise)
     tokenizer_path = tmp_path / "tokenizer.json"
     _build_toy_tokenizer(tokenizer_path)
-    backend = _FakeBackend("embedding", ["alpha"], "", np.zeros((1, 2), dtype=np.float32))
+    backend = _FakeBackend("embedding", {"en": ["alpha"]}, "", np.zeros((1, 2), dtype=np.float32))
     context = pipeline.SelfcheckContext(
         backend=backend,
         model_dir=tmp_path,
@@ -500,6 +541,265 @@ def test_run_selfcheck_internal_exception_returns_failed_with_error(
     json.dumps(report)
 
 
+# --- run_selfcheck: one embedding set per language ------------------------------
+
+# Two sanity sets whose four texts are all different, so a tokenized row
+# identifies both the set it belongs to and the text it came from.
+_TWO_SET_TEXTS: dict[str, list[Any]] = {"en": ["alpha", "beta"], "ja": ["gamma", "delta"]}
+_TWO_SET_ALL_TEXTS: list[Any] = ["alpha", "beta", "gamma", "delta"]
+
+# One FP32 baseline embedding per row of _TWO_SET_ALL_TEXTS.
+_TWO_SET_REFERENCE = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+
+# Compiled outputs orthogonal to the baseline on the English rows and
+# identical to it on the Japanese ones: only the second set can pass.
+_JAPANESE_ONLY = np.array([[0.0, 1.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+
+
+def _run_two_set_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    coreml_outputs: np.ndarray,
+    batch_size: int = 1,
+) -> tuple[dict[str, Any], pipeline.SelfcheckContext, list[dict[str, np.ndarray]]]:
+    """Run the self-check over one English and one Japanese embedding set.
+
+    Args:
+        monkeypatch: Test's monkeypatch fixture.
+        tmp_path: Test-scoped scratch directory.
+        coreml_outputs: One compiled-model output row per text of
+            :data:`_TWO_SET_ALL_TEXTS`.
+        batch_size: Fixed batch size B of the variant.
+
+    Returns:
+        Tuple of the report, the context (whose fake backend records the
+        ``reference_outputs`` calls) and every predict() input.
+    """
+    context, frozen = _make_context(
+        tmp_path, "embedding", _TWO_SET_TEXTS, "", _TWO_SET_REFERENCE, batch_size=batch_size
+    )
+    calls = _install_row_predict(
+        monkeypatch,
+        "embedding",
+        _row_outputs(frozen, "embedding", _TWO_SET_ALL_TEXTS, context.seq_len, coreml_outputs),
+    )
+    _install_compute_plan(monkeypatch, _build_fake_plan(ne_count=99, cpu_count=1))
+    return selfcheck.run_selfcheck(context), context, calls
+
+
+def test_run_selfcheck_passes_when_a_single_language_set_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One set clearing the threshold carries the variant, however the others scored."""
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, _JAPANESE_ONLY)
+
+    assert report["status"] == selfcheck.STATUS_PASSED
+    assert report["sanity"]["passed"] is True
+    assert report["sanity"]["best_set"] == "ja"
+    json.dumps(report)
+
+
+def test_run_selfcheck_records_the_result_of_every_language_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A set that missed the threshold must still be reported, with its own numbers."""
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, _JAPANESE_ONLY)
+    sets = report["sanity"]["sets"]
+
+    assert list(sets) == ["en", "ja"]
+    assert sets["en"]["passed"] is False
+    assert sets["ja"]["passed"] is True
+    assert sets["en"]["cosine_min"] == pytest.approx(0.0)
+    assert sets["ja"]["cosine_min"] == pytest.approx(1.0)
+    assert sets["en"]["cosine_per_text"] == [pytest.approx(0.0), pytest.approx(0.0)]
+
+
+def test_run_selfcheck_top_level_values_describe_the_best_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reader of the established keys must see the set the variant was accepted on."""
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, _JAPANESE_ONLY)
+    sanity = report["sanity"]
+    best = sanity["sets"][sanity["best_set"]]
+
+    assert sanity["cosine_min"] == best["cosine_min"]
+    assert sanity["cosine_mean"] == best["cosine_mean"]
+    assert sanity["cosine_per_text"] == best["cosine_per_text"]
+    assert sanity["finite"] == best["finite"]
+    assert sanity["cosine_threshold"] == selfcheck.SANITY_COSINE_THRESHOLD
+    assert sanity["embedding_dim"] == _TWO_SET_REFERENCE.shape[1]
+
+
+def test_run_selfcheck_fails_when_no_language_set_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every set missing the threshold is a failure, with the closest one reported."""
+    # English rows orthogonal to their baseline (cosine 0.0), Japanese rows
+    # at cosine 0.6 -- closer, but still far below the threshold.
+    outputs = np.array(
+        [[0.0, 1.0], [1.0, 0.0], [0.6, 0.8], [0.8, 0.6]],
+        dtype=np.float32,
+    )
+
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, outputs)
+
+    assert report["status"] == selfcheck.STATUS_FAILED
+    assert report["sanity"]["passed"] is False
+    assert report["sanity"]["best_set"] == "ja"
+    assert report["sanity"]["cosine_min"] == pytest.approx(0.6)
+    assert not any(set_report["passed"] for set_report in report["sanity"]["sets"].values())
+    json.dumps(report)
+
+
+@pytest.mark.parametrize(
+    ("outputs", "expected_best"),
+    [
+        ([[1.0, 0.1], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], "ja"),
+        ([[1.0, 0.0], [0.0, 1.0], [1.0, 0.1], [0.0, 1.0]], "en"),
+    ],
+    ids=["japanese-closer", "english-closer"],
+)
+def test_run_selfcheck_reports_the_closest_of_the_passing_sets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outputs: list[list[float]],
+    expected_best: str,
+) -> None:
+    """With more than one set passing, the one nearest its baseline is the reported one."""
+    report, _, _ = _run_two_set_embedding(
+        monkeypatch, tmp_path, np.array(outputs, dtype=np.float32)
+    )
+
+    assert report["sanity"]["passed"] is True
+    assert all(set_report["passed"] for set_report in report["sanity"]["sets"].values())
+    assert report["sanity"]["best_set"] == expected_best
+    assert report["sanity"]["cosine_min"] == pytest.approx(1.0)
+
+
+def test_run_selfcheck_breaks_a_tie_between_sets_by_declaration_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two equally good sets must always resolve to the same one, run after run."""
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, _TWO_SET_REFERENCE.copy())
+
+    assert report["sanity"]["best_set"] == "en"
+
+
+def test_run_selfcheck_never_reports_a_non_finite_set_as_the_best_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A NaN row makes a cosine meaningless, so that set must not represent the variant."""
+    outputs = np.array(
+        [[np.nan, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, outputs)
+
+    assert report["sanity"]["sets"]["en"]["finite"] is False
+    assert report["sanity"]["sets"]["en"]["passed"] is False
+    assert report["sanity"]["best_set"] == "ja"
+    assert report["sanity"]["passed"] is True
+    assert report["status"] == selfcheck.STATUS_PASSED
+    json.dumps(report)
+
+
+def test_run_selfcheck_computes_the_fp32_baseline_of_every_set_in_one_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One call per set would reload the FP32 model once per set; the sets share one."""
+    _, context, _ = _run_two_set_embedding(monkeypatch, tmp_path, _JAPANESE_ONLY)
+
+    assert context.backend.reference_calls == [_TWO_SET_ALL_TEXTS]
+
+
+def test_run_selfcheck_predicts_every_row_of_every_set_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sets are evaluated from one pass over the compiled model, not one pass each."""
+
+    def _no_latency(compiled: Any, batch: dict[str, np.ndarray]) -> dict[str, Any]:
+        return {"n": 0, "median_ms": 0.0, "p95_ms": 0.0, "min_ms": 0.0}
+
+    # The warm-latency measurement predicts too; leaving it out keeps the
+    # count to the rows the sanity check itself runs.
+    monkeypatch.setattr(selfcheck, "_measure_latency", _no_latency)
+
+    _, _, calls = _run_two_set_embedding(monkeypatch, tmp_path, _JAPANESE_ONLY)
+
+    predicted = [row for call in calls for row in call["input_ids"]]
+    assert len(predicted) == len(_TWO_SET_ALL_TEXTS)
+
+
+def test_run_selfcheck_measures_latency_on_the_best_sets_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The warm-latency batch must hold tokens the reported set was actually verified on."""
+    batches: list[dict[str, np.ndarray]] = []
+
+    def _fake_latency(compiled: Any, batch: dict[str, np.ndarray]) -> dict[str, Any]:
+        batches.append(batch)
+        return {"n": 0, "median_ms": 0.0, "p95_ms": 0.0, "min_ms": 0.0}
+
+    monkeypatch.setattr(selfcheck, "_measure_latency", _fake_latency)
+    context, frozen = _make_context(tmp_path, "embedding", _TWO_SET_TEXTS, "", _TWO_SET_REFERENCE)
+    _install_row_predict(
+        monkeypatch,
+        "embedding",
+        _row_outputs(frozen, "embedding", _TWO_SET_ALL_TEXTS, context.seq_len, _JAPANESE_ONLY),
+    )
+    _install_compute_plan(monkeypatch, _build_fake_plan(ne_count=99, cpu_count=1))
+
+    report = selfcheck.run_selfcheck(context)
+
+    assert report["sanity"]["best_set"] == "ja"
+    expected = runtime.tokenize_texts(frozen, ["gamma"], context.seq_len)
+    assert np.array_equal(batches[0]["input_ids"], expected["input_ids"])
+
+
+def test_run_selfcheck_checks_batch_consistency_on_the_best_sets_first_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A batch is only worth checking on an input the model demonstrably handles."""
+    texts: list[str] = []
+
+    def _fake_consistency(
+        compiled: Any,
+        frozen_tokenizer: Any,
+        text: str,
+        seq_len: int,
+        batch_size: int,
+        output_key: str,
+    ) -> dict[str, Any]:
+        texts.append(text)
+        return {"passed": True}
+
+    monkeypatch.setattr(selfcheck, "_check_batch_consistency_embedding", _fake_consistency)
+
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, _JAPANESE_ONLY, batch_size=2)
+
+    assert report["sanity"]["best_set"] == "ja"
+    assert texts == [_TWO_SET_TEXTS["ja"][0]]
+
+
+def test_run_selfcheck_fails_an_inconsistent_batch_even_when_a_set_passed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Rows influencing each other invalidates the accuracy the sets just proved."""
+    monkeypatch.setattr(
+        selfcheck,
+        "_check_batch_consistency_embedding",
+        lambda *args, **kwargs: {"passed": False, "cosine_min": 0.5},
+    )
+
+    report, _, _ = _run_two_set_embedding(monkeypatch, tmp_path, _JAPANESE_ONLY, batch_size=2)
+
+    assert report["sanity"]["sets"]["ja"]["passed"] is True
+    assert report["sanity"]["passed"] is False
+    assert report["status"] == selfcheck.STATUS_FAILED
+    assert report["sanity"]["batch_consistency"] == {"passed": False, "cosine_min": 0.5}
+
+
 # --- run_selfcheck: reranker ----------------------------------------------------
 
 
@@ -507,7 +807,7 @@ def test_run_selfcheck_reranker_passed(monkeypatch: pytest.MonkeyPatch, tmp_path
     """A reranker variant must be scored via sigmoid difference and pair ordering."""
     sanity_pairs = [("q-relevant", "d-relevant"), ("q-irrelevant", "d-irrelevant")]
     reference = np.array([2.0, -2.0], dtype=np.float32)
-    context, frozen = _make_context(tmp_path, "reranker", sanity_pairs, ("", ""), reference)
+    context, frozen = _make_context(tmp_path, "reranker", {"en": sanity_pairs}, ("", ""), reference)
     rows = runtime.tokenize_pairs(frozen, sanity_pairs, context.seq_len)["input_ids"]
     row_outputs = {
         _row_key(rows[i]): np.array([reference[i]], dtype=np.float32)
@@ -534,7 +834,7 @@ def test_run_selfcheck_reranker_failed_on_wrong_ordering(
     """A compiled model ranking the irrelevant pair higher must fail the sanity check."""
     sanity_pairs = [("q-relevant", "d-relevant"), ("q-irrelevant", "d-irrelevant")]
     reference = np.array([2.0, -2.0], dtype=np.float32)
-    context, frozen = _make_context(tmp_path, "reranker", sanity_pairs, ("", ""), reference)
+    context, frozen = _make_context(tmp_path, "reranker", {"en": sanity_pairs}, ("", ""), reference)
     rows = runtime.tokenize_pairs(frozen, sanity_pairs, context.seq_len)["input_ids"]
     # The compiled model returns the two logits swapped, so the relevant
     # pair scores lower than the irrelevant one.
@@ -562,7 +862,7 @@ def test_run_selfcheck_reranker_without_ordering_metadata_skips_that_check(
     sanity_pairs = [("q-a", "d-a"), ("q-b", "d-b")]
     reference = np.array([2.0, -2.0], dtype=np.float32)
     context, frozen = _make_context(
-        tmp_path, "reranker", sanity_pairs, ("", ""), reference, ordering=False
+        tmp_path, "reranker", {"en": sanity_pairs}, ("", ""), reference, ordering=False
     )
     rows = runtime.tokenize_pairs(frozen, sanity_pairs, context.seq_len)["input_ids"]
     row_outputs = {
@@ -580,6 +880,170 @@ def test_run_selfcheck_reranker_without_ordering_metadata_skips_that_check(
     assert report["sanity"]["ordering_ok_fp32"] is None
     assert report["sanity"]["passed"] is True
     json.dumps(report)
+
+
+# --- run_selfcheck: one reranker set per language --------------------------------
+
+# Two pair sets whose four pairs are all different, so a tokenized row
+# identifies the set it belongs to. Within a set the two pairs share their
+# query, exactly as a backend's fixtures do, so only the document decides
+# which of them must score higher.
+_TWO_SET_PAIRS: dict[str, list[Any]] = {
+    "en": [("q-en", "d-en-relevant"), ("q-en", "d-en-irrelevant")],
+    "ja": [("q-ja", "d-ja-relevant"), ("q-ja", "d-ja-irrelevant")],
+}
+_TWO_SET_ALL_PAIRS: list[Any] = [*_TWO_SET_PAIRS["en"], *_TWO_SET_PAIRS["ja"]]
+
+
+def _run_two_set_reranker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fp32_logits: list[float],
+    coreml_logits: list[float],
+    batch_size: int = 1,
+) -> tuple[dict[str, Any], pipeline.SelfcheckContext]:
+    """Run the self-check over one English and one Japanese pair set.
+
+    Args:
+        monkeypatch: Test's monkeypatch fixture.
+        tmp_path: Test-scoped scratch directory.
+        fp32_logits: FP32 baseline logit per pair of
+            :data:`_TWO_SET_ALL_PAIRS`.
+        coreml_logits: Compiled-model logit per pair, in the same order.
+        batch_size: Fixed batch size B of the variant.
+
+    Returns:
+        Tuple of the report and the context it was produced from.
+    """
+    reference = np.array(fp32_logits, dtype=np.float32)
+    context, frozen = _make_context(
+        tmp_path, "reranker", _TWO_SET_PAIRS, ("", ""), reference, batch_size=batch_size
+    )
+    _install_row_predict(
+        monkeypatch,
+        "logits",
+        _row_outputs(
+            frozen,
+            "reranker",
+            _TWO_SET_ALL_PAIRS,
+            context.seq_len,
+            np.array(coreml_logits, dtype=np.float32).reshape(-1, 1),
+        ),
+    )
+    _install_compute_plan(monkeypatch, _build_fake_plan(ne_count=99, cpu_count=1))
+    return selfcheck.run_selfcheck(context), context
+
+
+def test_run_selfcheck_reranker_passes_when_one_language_set_orders_correctly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ordering expectation holds within a set, so one set may order wrongly."""
+    # English: the relevant pair scores below the irrelevant one; Japanese:
+    # the expected way round. The compiled logits match the baseline in both.
+    report, _ = _run_two_set_reranker(
+        monkeypatch, tmp_path, [-2.0, 2.0, 2.0, -2.0], [-2.0, 2.0, 2.0, -2.0]
+    )
+    sets = report["sanity"]["sets"]
+
+    assert report["status"] == selfcheck.STATUS_PASSED
+    assert report["sanity"]["passed"] is True
+    assert report["sanity"]["best_set"] == "ja"
+    assert sets["en"]["ordering_ok_coreml"] is False
+    assert sets["en"]["ordering_ok_fp32"] is False
+    assert sets["en"]["passed"] is False
+    assert sets["ja"]["ordering_ok_coreml"] is True
+    assert sets["ja"]["passed"] is True
+    json.dumps(report)
+
+
+def test_run_selfcheck_reranker_fails_when_no_language_set_orders_correctly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both sets ordering the pairs wrongly is a failure, whatever the score difference."""
+    # Both sets order the relevant pair below the irrelevant one; the
+    # English compiled logits match their baseline exactly, so English is
+    # the closest set and the one the report is summarized by.
+    report, _ = _run_two_set_reranker(
+        monkeypatch, tmp_path, [-2.0, 2.0, -1.0, 1.0], [-2.0, 2.0, -1.5, 1.0]
+    )
+
+    assert report["status"] == selfcheck.STATUS_FAILED
+    assert report["sanity"]["passed"] is False
+    assert report["sanity"]["best_set"] == "en"
+    assert report["sanity"]["sigmoid_max_abs_diff"] == pytest.approx(0.0)
+    json.dumps(report)
+
+
+def test_run_selfcheck_reranker_set_can_miss_the_tolerance_while_ordering_correctly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A set is only passed when it clears the score tolerance too, not the ordering alone."""
+    # English: ordering preserved, but the compiled score is far from the
+    # baseline; Japanese: an exact match.
+    report, _ = _run_two_set_reranker(
+        monkeypatch, tmp_path, [2.0, -2.0, 2.0, -2.0], [0.5, -3.0, 2.0, -2.0]
+    )
+    sets = report["sanity"]["sets"]
+
+    assert sets["en"]["ordering_ok_coreml"] is True
+    assert sets["en"]["sigmoid_max_abs_diff"] > selfcheck.SANITY_SIGMOID_TOLERANCE
+    assert sets["en"]["passed"] is False
+    assert report["sanity"]["best_set"] == "ja"
+    assert report["sanity"]["passed"] is True
+
+
+def test_run_selfcheck_reranker_top_level_values_describe_the_best_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The established reranker keys must carry the numbers of the reported set alone."""
+    report, _ = _run_two_set_reranker(
+        monkeypatch, tmp_path, [-2.0, 2.0, 2.0, -2.0], [-2.0, 2.0, 2.0, -2.0]
+    )
+    sanity = report["sanity"]
+    best = sanity["sets"][sanity["best_set"]]
+
+    for key in (
+        "coreml_logits",
+        "fp32_logits",
+        "coreml_scores",
+        "fp32_scores",
+        "sigmoid_abs_diff",
+        "sigmoid_max_abs_diff",
+        "ordering_checked",
+        "ordering_ok_coreml",
+        "ordering_ok_fp32",
+        "finite",
+    ):
+        assert sanity[key] == best[key], key
+    assert sanity["coreml_logits"] == [pytest.approx(2.0), pytest.approx(-2.0)]
+    assert sanity["sigmoid_tolerance"] == selfcheck.SANITY_SIGMOID_TOLERANCE
+
+
+def test_run_selfcheck_reranker_checks_batch_consistency_on_the_best_sets_first_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A batch is only worth checking on a pair the model demonstrably handles."""
+    pairs: list[tuple[str, str]] = []
+
+    def _fake_consistency(
+        compiled: Any,
+        frozen_tokenizer: Any,
+        pair: tuple[str, str],
+        seq_len: int,
+        batch_size: int,
+        output_key: str,
+    ) -> dict[str, Any]:
+        pairs.append(pair)
+        return {"passed": True}
+
+    monkeypatch.setattr(selfcheck, "_check_batch_consistency_reranker", _fake_consistency)
+
+    report, _ = _run_two_set_reranker(
+        monkeypatch, tmp_path, [-2.0, 2.0, 2.0, -2.0], [-2.0, 2.0, 2.0, -2.0], batch_size=2
+    )
+
+    assert report["sanity"]["best_set"] == "ja"
+    assert pairs == [_TWO_SET_PAIRS["ja"][0]]
 
 
 # --- end-to-end on a synthetic ModernBERT (local only) --------------------------

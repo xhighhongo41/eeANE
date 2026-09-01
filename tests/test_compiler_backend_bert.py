@@ -257,39 +257,44 @@ def test_fixtures_are_single_texts() -> None:
     backend = bert.BertBackend()
 
     assert isinstance(backend.trace_example("embedding"), str)
-    assert all(isinstance(text, str) and text for text in backend.sanity_spec("embedding").inputs)
+    assert all(
+        isinstance(text, str) and text for text in backend.sanity_spec("embedding").all_inputs
+    )
     assert backend.padding_input("embedding") == ""
 
 
-def test_fixtures_are_english() -> None:
+def test_the_trace_example_and_the_english_sanity_set_are_english() -> None:
     """Checkpoints of this family commonly ship an English-only WordPiece vocabulary.
 
-    Fixtures in another language would encode to little more than [UNK]
-    rows, which still compare cleanly against their own FP32 baseline but
-    tell the self-check nothing about the model.
+    The trace example is the single fixed input the graph is traced with,
+    so it has to be one this family can encode. The sanity fixtures come
+    in one set per language and the self-check accepts the variant when
+    any set passes, so the other sets need no such guarantee -- but the
+    English one, which is what carries an English-only checkpoint, does.
     """
     backend = bert.BertBackend()
-    texts = [backend.trace_example("embedding"), *backend.sanity_spec("embedding").inputs]
+    english = dict(backend.sanity_spec("embedding").input_sets)["en"]
 
-    assert all(text.isascii() for text in texts), texts
+    assert backend.trace_example("embedding").isascii()
+    assert all(text.isascii() for text in english), english
 
 
 def test_embedding_sanity_spec_declares_no_ordering() -> None:
     """Embedding fixtures are compared row-wise; there is no expected ordering."""
     spec = bert.BertBackend().sanity_spec("embedding")
 
-    assert spec.inputs
+    assert spec.input_sets
     assert spec.relevant_index is None
     assert spec.irrelevant_index is None
 
 
 def test_sanity_spec_inputs_are_immutable() -> None:
     """The fixtures a caller receives must not be corruptible module state."""
-    inputs = bert.BertBackend().sanity_spec("embedding").inputs
+    input_sets = bert.BertBackend().sanity_spec("embedding").input_sets
 
-    assert isinstance(inputs, tuple)
+    assert isinstance(input_sets, tuple)
     with pytest.raises(TypeError):
-        inputs[0] = "mutated"  # type: ignore[index]
+        input_sets[0][1][0] = "mutated"  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
@@ -386,6 +391,7 @@ def test_the_module_offers_no_reranker_fixtures() -> None:
     assert "reranker" not in bert.SANITY_SPECS
     assert "reranker" not in bert.OUTPUT_NAMES
     assert not hasattr(bert, "SANITY_PAIRS")
+    assert not hasattr(bert, "SANITY_PAIR_SETS")
     assert not hasattr(bert, "TRACE_EXAMPLE_PAIR")
     assert not hasattr(bert, "BATCH_PADDING_PAIR")
 
@@ -849,7 +855,7 @@ def test_wrapper_matches_the_fp32_reference(embedding_dir: Path) -> None:
     show up here rather than only against real weights.
     """
     backend = bert.BertBackend()
-    inputs = list(backend.sanity_spec("embedding").inputs)
+    inputs = list(backend.sanity_spec("embedding").all_inputs)
     loaded = backend.load(embedding_dir, "embedding")
     wrapper = backend.wrap(loaded)
     tokens = backend.tokenize(loaded, inputs, _ROUND_TRIP_SEQ_LEN)

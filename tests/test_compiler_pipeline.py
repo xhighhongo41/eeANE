@@ -39,6 +39,7 @@ from transformers.models.modernbert import modeling_modernbert
 
 from eeane import __version__, cli
 from eeane.compiler import artifacts, pipeline
+from eeane.compiler.backends import base
 from eeane.compiler.backends import modernbert as mb
 from eeane.config import ModelEntry, load_config
 
@@ -1033,7 +1034,7 @@ def test_verification_inputs_are_self_contained_for_an_embedding_model() -> None
     assert any(len(text) == 1 for text in texts)  # single character
     assert max(len(text) for text in texts) > 4 * 128  # far longer than the bucket
     assert all(isinstance(text, str) for text in texts)
-    assert set(backend.sanity_spec("embedding").inputs).issubset(texts)
+    assert set(backend.sanity_spec("embedding").all_inputs).issubset(texts)
     assert pairs == []  # an embedding model never encodes pairs
 
 
@@ -1046,7 +1047,150 @@ def test_verification_inputs_include_pairs_for_a_reranker() -> None:
     assert texts and "" in texts
     assert ("", "") in pairs
     assert all(len(pair) == 2 for pair in pairs)
-    assert set(backend.sanity_spec("reranker").inputs).issubset(pairs)
+    assert set(backend.sanity_spec("reranker").all_inputs).issubset(pairs)
+
+
+@pytest.mark.parametrize("kind", ["embedding", "reranker"])
+def test_verification_inputs_cover_every_sanity_language_set(kind: str) -> None:
+    """The self-check may pick any language set, so the gate must cover them all.
+
+    Freezing is verified by comparing token sequences, which is
+    language-agnostic: taking every set in simply widens the gate.
+    """
+    backend = mb.ModernBertBackend()
+    spec = backend.sanity_spec(kind)
+
+    texts, pairs = pipeline.verification_inputs(backend, kind, [128])
+
+    assert len(spec.languages) == 3
+    for language, inputs in spec.input_sets:
+        if kind == "reranker":
+            assert set(inputs).issubset(pairs), language
+            # Both halves of every pair are legitimate standalone inputs.
+            assert {part for pair in inputs for part in pair}.issubset(texts), language
+        else:
+            assert set(inputs).issubset(texts), language
+
+
+# --- per-language sanity progress line ---------------------------------------
+
+
+def _sanity_report(
+    passed: bool, best_set: str, metric_key: str, metrics: dict[str, float]
+) -> dict[str, Any]:
+    """Build a self-check report carrying per-language sanity measurements.
+
+    Args:
+        passed: Overall sanity verdict recorded in the report.
+        best_set: Language the report's top-level values were taken from.
+        metric_key: Per-set metric key (``"cosine_min"`` for an embedding
+            report, ``"sigmoid_max_abs_diff"`` for a reranker one).
+        metrics: Metric value per language, in the order the sets were
+            evaluated in.
+
+    Returns:
+        A report shaped like the one :mod:`eeane.compiler.selfcheck`
+        produces, reduced to the keys the progress line reads.
+    """
+    return {
+        "status": "passed" if passed else "failed",
+        "sanity": {
+            "passed": passed,
+            "best_set": best_set,
+            metric_key: metrics[best_set],
+            "sets": {
+                language: {metric_key: value, "passed": language == best_set}
+                for language, value in metrics.items()
+            },
+        },
+    }
+
+
+def test_sanity_sets_line_names_the_best_set_first_then_the_others() -> None:
+    """A reader must see which language carried the variant and what the rest measured."""
+    report = _sanity_report(
+        True, "en", "cosine_min", {"en": 0.999612, "ja": 0.989234, "zh": 0.991201}
+    )
+
+    assert pipeline._sanity_sets_line(report) == "pass (best=en 0.99961; ja 0.98923, zh 0.99120)"
+
+
+def test_sanity_sets_line_keeps_the_recorded_set_order_for_the_others() -> None:
+    """The others are listed in evaluation order, whichever set turned out best."""
+    report = _sanity_report(
+        True, "zh", "cosine_min", {"en": 0.980000, "ja": 0.985000, "zh": 0.999000}
+    )
+
+    assert pipeline._sanity_sets_line(report) == "pass (best=zh 0.99900; en 0.98000, ja 0.98500)"
+
+
+def test_sanity_sets_line_reports_a_failure_verdict() -> None:
+    """No set passing must read as a failure, with the closest set still named."""
+    report = _sanity_report(False, "ja", "cosine_min", {"en": 0.900000, "ja": 0.980000})
+
+    assert pipeline._sanity_sets_line(report) == "fail (best=ja 0.98000; en 0.90000)"
+
+
+def test_sanity_sets_line_reports_the_reranker_metric() -> None:
+    """A reranker's sets are measured by their sigmoid difference, not by a cosine."""
+    report = _sanity_report(
+        True, "ja", "sigmoid_max_abs_diff", {"en": 0.031000, "ja": 0.001200, "zh": 0.004500}
+    )
+
+    assert pipeline._sanity_sets_line(report) == "pass (best=ja 0.00120; en 0.03100, zh 0.00450)"
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {"status": "skipped", "reason": "--skip-selfcheck was given"},
+        {"status": "failed", "error": "cannot load the compiled model"},
+        {"status": "passed", "sanity": {"passed": True, "cosine_min": 0.99}},
+        {"status": "passed", "sanity": {"passed": True, "sets": {}, "best_set": None}},
+        {"status": "passed", "sanity": {"passed": True, "sets": {"en": 0.99}, "best_set": "en"}},
+    ],
+    ids=["skipped", "internal-error", "no-sets", "empty-sets", "unreadable-set"],
+)
+def test_sanity_sets_line_is_absent_without_per_set_measurements(report: dict[str, Any]) -> None:
+    """A report that measured no set must produce no line rather than an empty one."""
+    assert pipeline._sanity_sets_line(report) is None
+
+
+def test_run_selfcheck_prints_the_sanity_language_sets(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The per-set measurements must reach stderr, alongside the bucket they belong to."""
+    report = _sanity_report(
+        True, "en", "cosine_min", {"en": 0.999612, "ja": 0.989234, "zh": 0.991201}
+    )
+    context = pipeline._CompileContext(
+        args=argparse.Namespace(source="stub-source", skip_selfcheck=False),
+        model_dir=tmp_path,
+        model_id="stub-model",
+        kind="embedding",
+        pooling="mean",
+        output_name="embedding",
+        batch_size=1,
+        model_root=tmp_path,
+        tokenizer_path=tmp_path / "tokenizer.json",
+        versions={"eeane": "0.0"},
+        recorded_args={},
+        backend=None,
+        selfcheck_fn=lambda selfcheck_context: report,
+    )
+    plan = artifacts.VariantPlan(
+        seq_len=128,
+        stem="s128_b1_eager_macos13",
+        mlpackage_path=tmp_path / "s128.mlpackage",
+        mlmodelc_path=tmp_path / "s128.mlmodelc",
+        metadata_path=tmp_path / "s128.json",
+        convert=True,
+    )
+
+    assert pipeline._run_selfcheck(context, plan) == report
+    stderr = capsys.readouterr().err
+    assert "s128: sanity" in stderr
+    assert "pass (best=en 0.99961; ja 0.98923, zh 0.99120)" in stderr
 
 
 def test_verification_long_input_scales_with_the_largest_bucket() -> None:
@@ -1724,10 +1868,10 @@ class _FamilyBackend(_StubBackend):
         """Report no known limit, so every requested bucket is compiled."""
         return None
 
-    def sanity_spec(self, kind: str) -> Any:
+    def sanity_spec(self, kind: str) -> base.SanitySpec:
         """Return the fixtures the tokenizer verification is built from."""
-        inputs: list[Any] = [("q", "d")] if kind == "reranker" else ["hello"]
-        return SimpleNamespace(inputs=inputs)
+        inputs: tuple[Any, ...] = (("q", "d"),) if kind == "reranker" else ("hello",)
+        return base.SanitySpec(input_sets=(("en", inputs),))
 
     def trace_example(self, kind: str) -> Any:
         """Return the fixed trace example of ``kind``."""

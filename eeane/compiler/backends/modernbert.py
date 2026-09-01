@@ -5,7 +5,8 @@ PoC scripts (``poc/convert_common.py``, ``poc/convert_embedding.py``,
 ``poc/convert_reranker.py`` and ``poc/common.py``). The PoC tree is frozen
 as a historical record, so the code here -- not ``poc/`` -- is from now on
 the single source of truth for the ModernBERT patches, the wrappers, the
-fixed trace/sanity fixtures and the FP32 reference computations.
+fixed trace fixtures, this family's own Japanese sanity fixtures and the
+FP32 reference computations.
 
 The two monkeypatches are mandatory parts of the conversion, not optional
 tweaks:
@@ -16,9 +17,10 @@ tweaks:
   the ANE for batch sizes greater than one.
 
 Everything that is not specific to this architecture -- pooling, the
-stable sigmoid, fixed-shape tokenization, the FP32 baselines and the
-traceable wrappers -- lives in :mod:`eeane.compiler.backends.common` and
-is re-exported here, so that the names stay reachable under this module.
+stable sigmoid, fixed-shape tokenization, the FP32 baselines, the
+traceable wrappers and the per-language sanity sets -- lives in
+:mod:`eeane.compiler.backends.common` and is re-exported here, so that
+the names stay reachable under this module.
 
 Importing this module pulls in ``torch``/``transformers``; it therefore
 requires the ``[compile]`` extra and must never be imported from the
@@ -48,16 +50,26 @@ from eeane.compiler.backends.common import (
     POOLING_MEAN,
     POOLING_MODE_KEYS,
     POOLING_MODE_PREFIX,
+    SANITY_IRRELEVANT_INDEX,
+    SANITY_LANGUAGE_JA,
+    SANITY_RELEVANT_INDEX,
     ClsEmbeddingWrapper,
     EmbeddingWrapper,
     RerankerWrapper,
     encode_pytorch,
     mean_pool,
+    override_sanity_set,
     read_pooling_mode,
     score_pytorch,
     sigmoid_np,
     tokenize_batch,
     tokenize_pairs,
+)
+from eeane.compiler.backends.common import (
+    SANITY_PAIR_SETS as SHARED_SANITY_PAIR_SETS,
+)
+from eeane.compiler.backends.common import (
+    SANITY_TEXT_SETS as SHARED_SANITY_TEXT_SETS,
 )
 
 # Public surface of this module, including the architecture-independent
@@ -69,8 +81,10 @@ __all__ = [
     "POOLING_MODE_KEYS",
     "POOLING_MODE_PREFIX",
     "SANITY_PAIRS",
+    "SANITY_PAIR_SETS",
     "SANITY_SPECS",
     "SANITY_TEXTS",
+    "SANITY_TEXT_SETS",
     "SUPPORTED_KINDS",
     "ClsEmbeddingWrapper",
     "EmbeddingWrapper",
@@ -111,8 +125,11 @@ MAX_POSITION_KEY = "max_position_embeddings"
 # Short Japanese sentence used as the example input for torch.jit.trace.
 TRACE_EXAMPLE_TEXT = "これは変換用のサンプル文です。"
 
-# Fixed sanity-check sentences (short / medium / long) exercising different
-# amounts of padding under the same fixed sequence length.
+# Fixed Japanese sanity-check sentences (short / medium / long) exercising
+# different amounts of padding under the same fixed sequence length. They
+# replace the shared Japanese set below: the accuracy numbers recorded for
+# the already-verified models of this family were measured on these exact
+# sentences, and rewording them would move those numbers.
 SANITY_TEXTS: list[str] = [
     "検索クエリ: 日本の首都はどこですか。",
     "検索文書: 東京は日本の首都であり、政治と経済の中心地として発展してきた都市である。",
@@ -127,7 +144,9 @@ TRACE_EXAMPLE_PAIR: tuple[str, str] = (
     "これは変換用のサンプル文書です。",
 )
 
-# Fixed sanity-check pairs: relevant / irrelevant / partially related.
+# Fixed Japanese sanity-check pairs: relevant / irrelevant / partially
+# related. They replace the shared Japanese set below, for the reason the
+# sentences above are kept for.
 SANITY_PAIRS: list[tuple[str, str]] = [
     # Relevant pair
     (
@@ -146,13 +165,27 @@ SANITY_PAIRS: list[tuple[str, str]] = [
     ),
 ]
 
+# The per-language sanity sets this backend serves: the shared ones, with
+# the Japanese set replaced by the fixtures above.
+SANITY_TEXT_SETS: tuple[tuple[str, tuple[str, ...]], ...] = override_sanity_set(
+    SHARED_SANITY_TEXT_SETS, SANITY_LANGUAGE_JA, tuple(SANITY_TEXTS)
+)
+SANITY_PAIR_SETS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = override_sanity_set(
+    SHARED_SANITY_PAIR_SETS, SANITY_LANGUAGE_JA, tuple(SANITY_PAIRS)
+)
+
 # Sanity fixtures per kind, as handed to the pipeline and the self-check.
-# SANITY_PAIRS is ordered relevant, irrelevant, partially related, so the
-# reranker is expected to score pair 0 above pair 1; embeddings are compared
-# row by row against their own baseline and carry no ordering expectation.
+# Every pair set is ordered relevant, irrelevant, partially related, so the
+# reranker is expected to score pair 0 of a set above pair 1; embeddings are
+# compared row by row against their own baseline and carry no ordering
+# expectation.
 SANITY_SPECS: dict[str, SanitySpec] = {
-    KIND_EMBEDDING: SanitySpec(inputs=tuple(SANITY_TEXTS)),
-    KIND_RERANKER: SanitySpec(inputs=tuple(SANITY_PAIRS), relevant_index=0, irrelevant_index=1),
+    KIND_EMBEDDING: SanitySpec(input_sets=SANITY_TEXT_SETS),
+    KIND_RERANKER: SanitySpec(
+        input_sets=SANITY_PAIR_SETS,
+        relevant_index=SANITY_RELEVANT_INDEX,
+        irrelevant_index=SANITY_IRRELEVANT_INDEX,
+    ),
 }
 
 # Filler rows used to pad the last sanity batch when the number of sanity

@@ -108,6 +108,12 @@ _VERIFICATION_LONG_UNIT = "これはトークナイザ凍結検証用の長い�
 # single-character strings (both ASCII and Japanese).
 _VERIFICATION_BOUNDARY_TEXTS: tuple[str, ...] = ("", " ", "a", "あ")
 
+# Headline metric of one sanity language set, per model kind, as recorded
+# by a self-check report. The progress line below reads whichever of them
+# the report carries, so it describes an embedding and a reranker variant
+# without knowing which one it was handed.
+_SANITY_SET_METRIC_KEYS: tuple[str, ...] = ("cosine_min", "sigmoid_max_abs_diff")
+
 
 class SelfcheckFailedError(CompileError):
     """Raised when a variant's self-check reported ``status='failed'``."""
@@ -233,6 +239,11 @@ def verification_inputs(
     (empty, whitespace-only, single character, and a text far longer than
     the largest bucket) -- never repository test data.
 
+    Every language set of the sanity fixtures is taken in, not just one:
+    the self-check may accept a variant on any of them, and this gate
+    compares token sequences, which is language-agnostic -- so covering
+    all of them only widens it.
+
     Args:
         backend: Loaded compile backend instance.
         kind: Resolved model kind.
@@ -247,7 +258,7 @@ def verification_inputs(
     texts: list[str] = [*_VERIFICATION_BOUNDARY_TEXTS, long_text]
     pairs: list[tuple[str, str]] = []
 
-    sanity_inputs = list(backend.sanity_spec(kind).inputs)
+    sanity_inputs = list(backend.sanity_spec(kind).all_inputs)
     if kind == "reranker":
         sanity_pairs = [(query, document) for query, document in sanity_inputs]
         trace_pair = tuple(backend.trace_example(kind))
@@ -852,7 +863,69 @@ def _run_selfcheck(context: _CompileContext, plan: VariantPlan) -> dict[str, Any
             f"the self-check of bucket {plan.seq_len} returned {type(report).__name__}, "
             "expected a report dict"
         )
+    sets_line = _sanity_sets_line(report)
+    if sets_line is not None:
+        _progress(f"      s{plan.seq_len}: sanity : {sets_line}")
     return report
+
+
+def _sanity_sets_line(report: Mapping[str, Any]) -> str | None:
+    """Summarize a self-check report's per-language sanity sets in one line.
+
+    The accuracy sanity is evaluated once per language set and the variant
+    is accepted as soon as one of them clears the threshold, so the number
+    the self-check's own summary prints is the *best* set's. This line
+    adds what that summary cannot show: which set that was, and how close
+    the others came -- the two facts a reader needs to tell a genuinely
+    accurate variant from one that only one language happened to carry.
+
+    Args:
+        report: A self-check report, as stored under the variant
+            metadata's ``selfcheck`` key. Any shape is tolerated: the hook
+            is pluggable, and a run must not fail over its progress line.
+
+    Returns:
+        A line like ``"pass (best=en 0.99961; ja 0.98923, zh 0.99120)"``,
+        or ``None`` when the report carries no per-set measurements at all
+        (a skipped self-check, or one that failed before measuring).
+    """
+    sanity = report.get("sanity")
+    if not isinstance(sanity, dict):
+        return None
+    sets = sanity.get("sets")
+    best = sanity.get("best_set")
+    if not isinstance(sets, dict) or not isinstance(best, str) or best not in sets:
+        return None
+    best_report = sets[best]
+    if not isinstance(best_report, Mapping):
+        return None
+    metric_key = next((key for key in _SANITY_SET_METRIC_KEYS if key in best_report), None)
+    if metric_key is None:
+        return None
+
+    verdict = "pass" if sanity.get("passed") else "fail"
+    line = f"{verdict} (best={best} {_sanity_metric(best_report, metric_key)}"
+    others = [language for language in sets if language != best]
+    if others:
+        line += "; " + ", ".join(
+            f"{language} {_sanity_metric(sets[language], metric_key)}" for language in others
+        )
+    return f"{line})"
+
+
+def _sanity_metric(set_report: Any, metric_key: str) -> str:
+    """Format one sanity set's headline metric for the progress line.
+
+    Args:
+        set_report: That set's entry in the report's ``sets`` table.
+        metric_key: Key the metric is recorded under.
+
+    Returns:
+        The value to five decimals, or ``"n/a"`` when the set did not
+        record a number under ``metric_key``.
+    """
+    value = set_report.get(metric_key) if isinstance(set_report, Mapping) else None
+    return f"{value:.5f}" if isinstance(value, int | float) else "n/a"
 
 
 def _build_metadata(

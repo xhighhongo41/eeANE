@@ -33,10 +33,13 @@ is declared by the sentence-transformers pooling module in the model
 directory, which this backend reads (and refuses to guess) through the
 shared reader in :mod:`eeane.compiler.backends.common`.
 
-The fixtures below are English on purpose: checkpoints of this family
-commonly ship an English-only WordPiece vocabulary, and fixtures in
-another language would encode to little more than unknown-token rows,
-which tell the self-check nothing about the model.
+The trace example below is English on purpose: checkpoints of this family
+commonly ship an English-only WordPiece vocabulary, and a trace example
+in another language would encode to little more than unknown-token rows.
+The sanity fixtures are the shared per-language sets, of which the
+self-check needs only one to clear its threshold, so an English-only
+checkpoint is carried by the English set while a multilingual one of this
+family is measured on whichever set it reads best.
 
 Importing this module pulls in ``torch``/``transformers``; it therefore
 requires the ``[compile]`` extra and must never be imported from the
@@ -58,6 +61,7 @@ from eeane.compiler.backends.base import LoadedModel, SanitySpec
 from eeane.compiler.backends.common import (
     POOLING_CLS,
     POOLING_MEAN,
+    SANITY_TEXT_SETS,
     ClsEmbeddingWrapper,
     EmbeddingWrapper,
     encode_pytorch,
@@ -97,20 +101,10 @@ MAX_POSITION_KEY = "max_position_embeddings"
 # Short English sentence used as the example input for torch.jit.trace.
 TRACE_EXAMPLE_TEXT = "A short English sentence used as the conversion sample."
 
-# Fixed sanity-check sentences (short / medium / long) exercising different
-# amounts of padding under the same fixed sequence length.
-SANITY_TEXTS: list[str] = [
-    "Question: how tall is the highest mountain in Japan?",
-    "Document: Mount Fuji rises 3,776 metres above sea level on the border between "
-    "Shizuoka and Yamanashi, and is the highest mountain in Japan.",
-    "Topic: turning a large collection of documents into vectors ahead of time makes it "
-    "possible to retrieve passages with a similar meaning without reading every text again.",
-]
-
-# Sanity fixtures per kind, as handed to the pipeline and the self-check.
-# Embeddings are compared row by row against their own baseline and carry
-# no ordering expectation.
-SANITY_SPECS: dict[str, SanitySpec] = {KIND_EMBEDDING: SanitySpec(inputs=tuple(SANITY_TEXTS))}
+# Sanity fixtures per kind, as handed to the pipeline and the self-check:
+# the shared per-language sets, unchanged. Embeddings are compared row by
+# row against their own baseline and carry no ordering expectation.
+SANITY_SPECS: dict[str, SanitySpec] = {KIND_EMBEDDING: SanitySpec(input_sets=SANITY_TEXT_SETS)}
 
 # Filler row used to pad the last sanity batch when the number of sanity
 # inputs is not a multiple of B. The empty string encodes to special tokens
