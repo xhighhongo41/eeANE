@@ -17,8 +17,9 @@ tweaks:
   the ANE for batch sizes greater than one.
 
 Everything that is not specific to this architecture -- pooling, the
-stable sigmoid, fixed-shape tokenization, the FP32 baselines, the
-traceable wrappers and the per-language sanity sets -- lives in
+sentence-transformers declaration readers, the stable sigmoid,
+fixed-shape tokenization, the FP32 baselines, the traceable wrappers and
+the per-language sanity sets -- lives in
 :mod:`eeane.compiler.backends.common` and is re-exported here, so that
 the names stay reachable under this module.
 
@@ -57,6 +58,7 @@ from eeane.compiler.backends.common import (
     EmbeddingWrapper,
     RerankerWrapper,
     encode_pytorch,
+    load_dense,
     mean_pool,
     override_sanity_set,
     read_pooling_mode,
@@ -91,6 +93,7 @@ __all__ = [
     "ModernBertBackend",
     "RerankerWrapper",
     "encode_pytorch",
+    "load_dense",
     "mean_pool",
     "patch_eager_attention_rank4",
     "patch_mask_fill_value",
@@ -382,19 +385,25 @@ class ModernBertBackend:
             A handle holding the model in eval/FP32 mode with
             ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
             outputs), its tokenizer, its configuration and -- for an
-            embedding model -- the pooling declared by the model directory.
+            embedding model -- the pooling and the Dense projection
+            declared by the model directory.
 
         Raises:
-            ValueError: If ``kind`` is not supported by this backend, or if
-                the pooling of an embedding model cannot be determined.
+            ValueError: If ``kind`` is not supported by this backend, if
+                the pooling of an embedding model cannot be determined, or
+                if its declared module chain cannot be reproduced.
         """
         self._check_kind(kind)
-        # Detected before the weights are read: an undeclared pooling makes
-        # the model uncompilable, and finding that out first avoids loading
-        # gigabytes of FP32 parameters for nothing.
-        pooling = read_pooling_mode(model_dir) if kind == KIND_EMBEDDING else None
+        # Both declarations are read before the weights: an undeclared
+        # pooling or an unreproducible module chain makes the model
+        # uncompilable, and finding that out first avoids loading
+        # gigabytes of FP32 parameters for nothing. A reranker has
+        # neither: its score comes from its own classification head.
+        embedding = kind == KIND_EMBEDDING
+        pooling = read_pooling_mode(model_dir) if embedding else None
+        dense, dense_config = load_dense(model_dir) if embedding else (None, None)
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        loader = AutoModel if kind == KIND_EMBEDDING else AutoModelForSequenceClassification
+        loader = AutoModel if embedding else AutoModelForSequenceClassification
         model = loader.from_pretrained(model_dir, attn_implementation=attn, dtype=torch.float32)
         model.config.return_dict = False
         return LoadedModel(
@@ -405,6 +414,8 @@ class ModernBertBackend:
             kind=kind,
             attn=attn,
             pooling=pooling,
+            dense=dense,
+            dense_config=dense_config,
         )
 
     def apply_patches(
@@ -456,7 +467,8 @@ class ModernBertBackend:
 
         Args:
             loaded: Handle returned by :meth:`load`; for an embedding
-                model its ``pooling`` selects the wrapper.
+                model its ``pooling`` selects the wrapper and its
+                ``dense`` is applied after that pooling.
 
         Returns:
             The pooling wrapper matching ``loaded.pooling`` for an
@@ -477,7 +489,7 @@ class ModernBertBackend:
             raise ValueError(
                 f"unsupported pooling '{loaded.pooling}' for {self.name} (supported: {supported})"
             )
-        return wrapper_class(loaded.model).eval()
+        return wrapper_class(loaded.model, dense=loaded.dense).eval()
 
     def output_name(self, kind: str) -> str:
         """Return the Core ML graph output name used for ``kind``.
@@ -618,14 +630,16 @@ class ModernBertBackend:
         loaded = self.load(model_dir, kind, attn="sdpa")
         try:
             if kind == KIND_EMBEDDING:
-                # The baseline must pool exactly like the traced wrapper,
-                # so it follows the pooling detected for this directory.
+                # The baseline must pool and project exactly like the
+                # traced wrapper, so it follows both declarations of this
+                # directory.
                 return encode_pytorch(
                     loaded.model,
                     loaded.tokenizer,
                     list(inputs),
                     seq_len,
                     pooling=loaded.pooling,
+                    dense=loaded.dense,
                 )
             return score_pytorch(
                 loaded.model, loaded.tokenizer, [(q, d) for q, d in inputs], seq_len

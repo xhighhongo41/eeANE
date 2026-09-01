@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -11,12 +12,34 @@ import pytest
 
 from eeane.compiler import sources
 
+# Module directory name and type strings of a sentence-transformers Dense
+# projection, as they appear in a model's ``modules.json``. A Dense module
+# carries weights of its own, so it goes through the same safetensors gate
+# as the main checkpoint.
+_DENSE_DIRNAME = "2_Dense"
+_DENSE_CHAIN: list[dict[str, Any]] = [
+    {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+    {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+    {"idx": 2, "name": "2", "path": _DENSE_DIRNAME, "type": "sentence_transformers.models.Dense"},
+]
+
 
 def _make_snapshot(root: Path, filenames: list[str]) -> Path:
     """Create a fake snapshot directory holding ``filenames``."""
     root.mkdir(parents=True, exist_ok=True)
     for name in filenames:
-        (root / name).write_text("{}", encoding="utf-8")
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    return root
+
+
+def _declare_dense(root: Path, chain: Any = None) -> Path:
+    """Write a ``modules.json`` declaring a Dense module directory."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "modules.json").write_text(
+        json.dumps(_DENSE_CHAIN if chain is None else chain), encoding="utf-8"
+    )
     return root
 
 
@@ -135,6 +158,153 @@ def test_resolve_source_rejects_unusable_sources(source: str) -> None:
     """Anything that is neither an existing directory nor a repo id must raise."""
     with pytest.raises(sources.SourceError):
         sources.resolve_source(source)
+
+
+# --- declared Dense modules go through the same gate -------------------------
+
+
+def test_resolve_source_local_dense_module_with_safetensors_is_accepted(tmp_path: Path) -> None:
+    """A declared Dense module carrying safetensors weights needs no opt-in."""
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(
+        model_dir,
+        ["config.json", "model.safetensors", f"{_DENSE_DIRNAME}/model.safetensors"],
+    )
+    _declare_dense(model_dir)
+
+    assert sources.resolve_source(str(model_dir)) == model_dir.resolve()
+
+
+def test_resolve_source_local_dense_module_bin_only_is_rejected(tmp_path: Path) -> None:
+    """A Dense module's weights are loaded like any other; pickle stays opt-in for them too."""
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(
+        model_dir, ["config.json", "model.safetensors", f"{_DENSE_DIRNAME}/pytorch_model.bin"]
+    )
+    _declare_dense(model_dir)
+
+    with pytest.raises(sources.MissingSafetensorsError) as excinfo:
+        sources.resolve_source(str(model_dir))
+
+    message = str(excinfo.value)
+    assert "--allow-pickle" in message
+    assert _DENSE_DIRNAME in message
+
+
+def test_resolve_source_local_dense_module_bin_only_with_allow_pickle_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """--allow-pickle must accept a bin-only Dense module, after the same WARNING."""
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(
+        model_dir, ["config.json", "model.safetensors", f"{_DENSE_DIRNAME}/pytorch_model.bin"]
+    )
+    _declare_dense(model_dir)
+
+    with caplog.at_level(logging.WARNING):
+        resolved = sources.resolve_source(str(model_dir), allow_pickle=True)
+
+    assert resolved == model_dir.resolve()
+    assert any(
+        record.levelno == logging.WARNING and "pickle" in record.message.lower()
+        for record in caplog.records
+    )
+
+
+def test_resolve_source_ignores_bin_weights_of_an_undeclared_directory(tmp_path: Path) -> None:
+    """Only the module directories modules.json declares are part of the conversion."""
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(model_dir, ["config.json", "model.safetensors", "onnx/model.bin"])
+    _declare_dense(model_dir)
+
+    assert sources.resolve_source(str(model_dir)) == model_dir.resolve()
+
+
+@pytest.mark.parametrize("chain", ["not-a-chain", [{"type": 3}]], ids=["string", "malformed"])
+def test_resolve_source_with_an_unreadable_modules_json_still_gates_the_main_weights(
+    tmp_path: Path, chain: Any
+) -> None:
+    """An unreadable declaration leaves the gate to the main checkpoint alone.
+
+    The compile backend refuses such a declaration with a full explanation
+    of its own; this gate must not turn it into a different, misleading
+    error about missing safetensors.
+    """
+    model_dir = tmp_path / "local-model"
+    _make_snapshot(model_dir, ["config.json", "model.safetensors", f"{_DENSE_DIRNAME}/x.bin"])
+    _declare_dense(model_dir, chain)
+
+    assert sources.resolve_source(str(model_dir)) == model_dir.resolve()
+
+
+def test_resolve_source_hf_dense_module_without_safetensors_is_rejected(
+    download_calls: dict[str, Any],
+) -> None:
+    """A repo whose Dense module has no safetensors must point at --allow-pickle."""
+    snapshot = _make_snapshot(
+        download_calls["snapshot"], ["config.json", "model.safetensors", f"{_DENSE_DIRNAME}/c.json"]
+    )
+    _declare_dense(snapshot)
+
+    with pytest.raises(sources.MissingSafetensorsError) as excinfo:
+        sources.resolve_source("org/name")
+
+    assert "--allow-pickle" in str(excinfo.value)
+    assert len(download_calls["calls"]) == 1
+
+
+def test_resolve_source_hf_dense_module_with_allow_pickle_redownloads(
+    download_calls: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """--allow-pickle must fetch the .bin weights of a Dense module too."""
+    snapshot = _make_snapshot(
+        download_calls["snapshot"], ["config.json", "model.safetensors", f"{_DENSE_DIRNAME}/c.json"]
+    )
+    _declare_dense(snapshot)
+
+    with caplog.at_level(logging.WARNING):
+        resolved = sources.resolve_source("org/name", allow_pickle=True)
+
+    assert resolved == Path(download_calls["snapshot"]).resolve()
+    calls = download_calls["calls"]
+    assert len(calls) == 2
+    assert "*.bin" in calls[1]["allow_patterns"]
+
+
+def test_resolve_source_hf_dense_module_with_safetensors_downloads_once(
+    download_calls: dict[str, Any],
+) -> None:
+    """A complete safetensors repo must not pay for a second download."""
+    snapshot = _make_snapshot(
+        download_calls["snapshot"],
+        ["config.json", "model.safetensors", f"{_DENSE_DIRNAME}/model.safetensors"],
+    )
+    _declare_dense(snapshot)
+
+    resolved = sources.resolve_source("org/name", allow_pickle=True)
+
+    assert resolved == Path(download_calls["snapshot"]).resolve()
+    assert len(download_calls["calls"]) == 1
+
+
+def test_hf_allow_patterns_request_the_module_declaration_and_its_dense(
+    download_calls: dict[str, Any],
+) -> None:
+    """The declaration and the Dense files it points at must be fetched by name.
+
+    They are matched by the broader patterns too, but are requested
+    explicitly so that a change to those cannot silently stop shipping a
+    file the conversion now depends on.
+    """
+    assert "modules.json" in sources.HF_ALLOW_PATTERNS
+    assert any(
+        pattern.startswith("*_Dense/") and pattern.endswith(".json")
+        for pattern in sources.HF_ALLOW_PATTERNS
+    )
+    assert any(
+        pattern.startswith("*_Dense/") and pattern.endswith(".safetensors")
+        for pattern in sources.HF_ALLOW_PATTERNS
+    )
 
 
 # --- repo id detection -------------------------------------------------------

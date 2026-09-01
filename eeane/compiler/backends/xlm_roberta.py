@@ -19,9 +19,10 @@ Two properties set this family apart from the other backends:
 
 The pooling of an embedding model is not part of the HF configuration; it
 is declared by the sentence-transformers pooling module in the model
-directory, which this backend reads (and refuses to guess) through the
-shared reader in :mod:`eeane.compiler.backends.common`, re-exported here
-so that the names stay reachable under this module.
+directory, as are the Dense projections that may follow it. This backend
+reads both (and refuses to guess either) through the shared readers in
+:mod:`eeane.compiler.backends.common`, re-exported here so that the names
+stay reachable under this module.
 
 Importing this module pulls in ``torch``/``transformers``; it therefore
 requires the ``[compile]`` extra and must never be imported from the
@@ -54,6 +55,7 @@ from eeane.compiler.backends.common import (
     EmbeddingWrapper,
     RerankerWrapper,
     encode_pytorch,
+    load_dense,
     read_pooling_mode,
     score_pytorch,
     tokenize_batch,
@@ -77,6 +79,7 @@ __all__ = [
     "SANITY_TEXT_SETS",
     "SUPPORTED_KINDS",
     "XlmRobertaBackend",
+    "load_dense",
     "read_pooling_mode",
 ]
 
@@ -164,17 +167,22 @@ class XlmRobertaBackend:
             A handle holding the model in eval/FP32 mode with
             ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
             outputs), its tokenizer, its configuration and -- for an
-            embedding model -- the pooling declared by the model directory.
+            embedding model -- the pooling and the Dense projection
+            declared by the model directory.
 
         Raises:
-            ValueError: If ``kind`` is not supported by this backend, or if
-                the pooling of an embedding model cannot be determined.
+            ValueError: If ``kind`` is not supported by this backend, if
+                the pooling of an embedding model cannot be determined, or
+                if its declared module chain cannot be reproduced.
         """
         self._check_kind(kind)
-        # Detected before the weights are read: an undeclared pooling makes
-        # the model uncompilable, and finding that out first avoids loading
-        # gigabytes of FP32 parameters for nothing.
+        # Both declarations are read before the weights: an undeclared
+        # pooling or an unreproducible module chain makes the model
+        # uncompilable, and finding that out first avoids loading
+        # gigabytes of FP32 parameters for nothing. A reranker has
+        # neither: its score comes from its own classification head.
         pooling = read_pooling_mode(model_dir) if kind == KIND_EMBEDDING else None
+        dense, dense_config = load_dense(model_dir) if kind == KIND_EMBEDDING else (None, None)
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         if kind == KIND_EMBEDDING:
             # Pooling happens in the wrapper; the HF pooler head is unused
@@ -199,6 +207,8 @@ class XlmRobertaBackend:
             kind=kind,
             attn=attn,
             pooling=pooling,
+            dense=dense,
+            dense_config=dense_config,
         )
 
     def apply_patches(
@@ -234,7 +244,8 @@ class XlmRobertaBackend:
 
         Args:
             loaded: Handle returned by :meth:`load`; for an embedding
-                model its ``pooling`` selects the wrapper.
+                model its ``pooling`` selects the wrapper and its
+                ``dense`` is applied after that pooling.
 
         Returns:
             The pooling wrapper matching ``loaded.pooling`` for an
@@ -255,7 +266,7 @@ class XlmRobertaBackend:
             raise ValueError(
                 f"unsupported pooling '{loaded.pooling}' for {self.name} (supported: {supported})"
             )
-        return wrapper_class(loaded.model).eval()
+        return wrapper_class(loaded.model, dense=loaded.dense).eval()
 
     def output_name(self, kind: str) -> str:
         """Return the Core ML graph output name used for ``kind``.
@@ -397,14 +408,16 @@ class XlmRobertaBackend:
         loaded = self.load(model_dir, kind, attn="sdpa")
         try:
             if kind == KIND_EMBEDDING:
-                # The baseline must pool exactly like the traced wrapper,
-                # so it follows the pooling detected for this directory.
+                # The baseline must pool and project exactly like the
+                # traced wrapper, so it follows both declarations of this
+                # directory.
                 return encode_pytorch(
                     loaded.model,
                     loaded.tokenizer,
                     list(inputs),
                     seq_len,
                     pooling=loaded.pooling,
+                    dense=loaded.dense,
                 )
             return score_pytorch(
                 loaded.model, loaded.tokenizer, [(q, d) for q, d in inputs], seq_len

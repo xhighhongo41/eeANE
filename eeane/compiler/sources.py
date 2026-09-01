@@ -12,6 +12,7 @@ modifies, or deletes anything inside a resolved model directory.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Sequence
@@ -37,7 +38,23 @@ HF_ALLOW_PATTERNS: tuple[str, ...] = (
     # "*config*.json" above, but is requested explicitly so that pattern
     # change cannot silently stop shipping a file conversion now depends on.
     "1_Pooling/*.json",
+    # The module declaration, plus the declaration and weights of the Dense
+    # projections it can name: a model declaring them publishes the
+    # projected vector, so the conversion needs those files. They too match
+    # the broader patterns above and are requested by name for the same
+    # reason. ``.bin`` weights stay out, as everywhere else here: they are
+    # only fetched through the explicit opt-in below.
+    "modules.json",
+    "*_Dense/*.json",
+    "*_Dense/*.safetensors",
 )
+
+# Name of the sentence-transformers module declaration and the type suffix
+# of the modules that carry weights of their own. A Dense projection is a
+# checkpoint like any other, so it goes through the same safetensors gate
+# as the main weights.
+ST_MODULES_FILENAME = "modules.json"
+ST_DENSE_TYPE_SUFFIX = ".Dense"
 
 # Extra patterns added to a Hub download when ``allow_pickle=True`` and no
 # safetensors weights were found with :data:`HF_ALLOW_PATTERNS` alone.
@@ -97,7 +114,9 @@ def resolve_source(source: str, revision: str | None = None, *, allow_pickle: bo
     pickle-based ``.bin`` weights are accepted only when
     ``allow_pickle=True`` (and a WARNING is logged when they are used). A
     source with neither is passed through unchanged and left to
-    ``transformers`` to report.
+    ``transformers`` to report. The policy covers the Dense modules a
+    source declares as well as its main checkpoint, since the conversion
+    loads their weights too.
 
     Args:
         source: Local directory path or Hub repo id (``org/name``).
@@ -144,10 +163,11 @@ def _download_snapshot(repo_id: str, revision: str | None, *, allow_pickle: bool
     (``HF_TOKEN``, ``huggingface-cli login``); eeANE never handles tokens.
 
     Only :data:`HF_ALLOW_PATTERNS` (safetensors) is requested at first. If
-    the resulting snapshot has no safetensors weights and
-    ``allow_pickle=True``, a second download is made with
-    :data:`HF_BIN_PATTERNS` added, so a repo that already has safetensors
-    never pays for a ``.bin`` download it does not need.
+    the resulting snapshot has no safetensors weights -- for the model
+    itself or for a Dense module it declares -- and ``allow_pickle=True``,
+    a second download is made with :data:`HF_BIN_PATTERNS` added, so a
+    repo that already has safetensors never pays for a ``.bin`` download
+    it does not need.
 
     Args:
         repo_id: Hub repo id (``org/name``).
@@ -174,7 +194,7 @@ def _download_snapshot(repo_id: str, revision: str | None, *, allow_pickle: bool
         ) from exc
 
     snapshot_dir = _fetch_snapshot(huggingface_hub, repo_id, revision, HF_ALLOW_PATTERNS)
-    if _has_safetensors(snapshot_dir):
+    if all(_has_safetensors(weights_dir) for weights_dir in _weight_directories(snapshot_dir)):
         return snapshot_dir.resolve()
     if not allow_pickle:
         raise _missing_safetensors_error(repo_id)
@@ -234,12 +254,12 @@ def _fetch_snapshot(
 
 
 def _check_pickle_gate(directory: Path, location: str, *, allow_pickle: bool) -> None:
-    """Enforce the safetensors-first / opt-in-pickle policy on one directory.
+    """Enforce the safetensors-first / opt-in-pickle policy on a model source.
 
     Applied identically to a downloaded snapshot and a local model
-    directory. A directory with no weight files at all (neither
-    safetensors nor ``.bin``) is left untouched: ``transformers`` reports
-    that case with its own, already clear, error.
+    directory, and to every directory of it that carries weights: the main
+    checkpoint plus the Dense modules the source declares, which the
+    conversion loads just as it loads the main one.
 
     Args:
         directory: Directory to inspect (a downloaded snapshot or a local
@@ -250,18 +270,99 @@ def _check_pickle_gate(directory: Path, location: str, *, allow_pickle: bool) ->
             as a fallback.
 
     Raises:
+        MissingSafetensorsError: If one of those directories has ``.bin``
+            weights but no safetensors weights, and ``allow_pickle`` is
+            ``False``.
+    """
+    for weights_dir in _weight_directories(directory):
+        where = (
+            location
+            if weights_dir == directory
+            else f"{location} ({weights_dir.relative_to(directory)})"
+        )
+        _check_directory_pickle_gate(weights_dir, where, allow_pickle=allow_pickle)
+
+
+def _check_directory_pickle_gate(directory: Path, location: str, *, allow_pickle: bool) -> None:
+    """Enforce the policy on one weight-carrying directory.
+
+    A directory with no weight files at all (neither safetensors nor
+    ``.bin``) is left untouched: ``transformers`` reports a missing main
+    checkpoint with its own, already clear, error, and a declared module
+    without weights is reported by the backend that reads its declaration.
+
+    Args:
+        directory: Directory to inspect.
+        location: Human-readable identifier of ``directory`` for log/error
+            messages.
+        allow_pickle: Whether pickle-based ``.bin`` weights are accepted
+            as a fallback.
+
+    Raises:
         MissingSafetensorsError: If ``directory`` has ``.bin`` weights but
             no safetensors weights, and ``allow_pickle`` is ``False``.
     """
     if _has_safetensors(directory):
         return
     if not _has_bin_weights(directory):
-        # No weights of either kind: nothing for this policy to enforce.
-        # transformers itself reports the absence of any checkpoint.
         return
     if not allow_pickle:
         raise _missing_safetensors_error(location)
     _warn_pickle_checkpoint(location)
+
+
+def _weight_directories(directory: Path) -> list[Path]:
+    """List every directory of a source that carries weights of its own.
+
+    Args:
+        directory: A downloaded snapshot or a local model directory.
+
+    Returns:
+        ``directory`` itself, followed by the existing directories of the
+        Dense modules its ``modules.json`` declares.
+    """
+    return [directory, *_declared_dense_directories(directory)]
+
+
+def _declared_dense_directories(directory: Path) -> list[Path]:
+    """Read the Dense module directories a source declares.
+
+    Deliberately best-effort: a declaration that cannot be read is left
+    entirely to the compile backend, which refuses an unusable module
+    chain with a full explanation. Turning it into a misleading
+    "no safetensors" error here would only hide that.
+
+    Args:
+        directory: A downloaded snapshot or a local model directory.
+
+    Returns:
+        The declared module directories that exist inside ``directory``,
+        in declaration order; empty when nothing usable is declared.
+    """
+    try:
+        declaration = json.loads((directory / ST_MODULES_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(declaration, list):
+        return []
+    module_dirs: list[Path] = []
+    for entry in declaration:
+        if not isinstance(entry, dict):
+            continue
+        module_type = entry.get("type")
+        path = entry.get("path")
+        if not isinstance(module_type, str) or not module_type.endswith(ST_DENSE_TYPE_SUFFIX):
+            continue
+        if not isinstance(path, str) or not path.strip():
+            continue
+        module_dir = directory / path
+        # A declaration may only address the source it belongs to; a path
+        # pointing anywhere else is not part of this model.
+        if directory.resolve() not in module_dir.resolve().parents:
+            continue
+        if module_dir.is_dir():
+            module_dirs.append(module_dir)
+    return module_dirs
 
 
 def _has_safetensors(directory: Path) -> bool:

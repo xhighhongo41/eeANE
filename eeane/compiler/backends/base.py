@@ -140,6 +140,17 @@ class LoadedModel:
         pooling: Pooling mode of an embedding model (e.g. ``"mean"`` or
             ``"cls"``); ``None`` for a reranker, whose head is part of the
             model itself.
+        dense: ``torch.nn.Module`` projecting the pooled vector of an
+            embedding model whose sentence-transformers module chain
+            declares one; ``None`` when nothing is declared (the common
+            case) and always for a reranker. Both the traced wrapper and
+            the FP32 baseline apply this very module, so that the two
+            sides of the self-check keep computing the same function.
+        dense_config: JSON-serializable description of ``dense`` -- one
+            entry per projection stage -- recorded in the compiled
+            variant's metadata so a later run can tell whether the model's
+            declaration still matches the artifact. ``None`` whenever
+            ``dense`` is.
     """
 
     model: Any
@@ -149,6 +160,8 @@ class LoadedModel:
     kind: str
     attn: str
     pooling: str | None = None
+    dense: Any = None
+    dense_config: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True)

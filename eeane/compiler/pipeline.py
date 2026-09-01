@@ -70,7 +70,11 @@ from eeane.compiler.artifacts import (
     write_config_snippet,
     write_json_record,
 )
-from eeane.compiler.backends.common import read_pooling_mode
+from eeane.compiler.backends.common import (
+    dense_record,
+    read_dense_modules,
+    read_pooling_mode,
+)
 from eeane.compiler.dispatch import DispatchError, resolve_dispatch
 from eeane.compiler.tokenizer_freeze import (
     TokenizerFreezeError,
@@ -173,6 +177,10 @@ class _CompileContext:
             declaration) or when the declaration could not be read; the
             backend's own ``load()`` is what raises on that for an
             embedding model, this field simply has nothing to record.
+        dense: Dense projections the embedding model declares after its
+            pooling, resolved once via :func:`_declared_dense`; ``None``
+            when it declares none, for a reranker, or when the
+            declaration could not be read.
         output_name: Core ML graph output name for ``kind``.
         batch_size: Fixed batch size B.
         model_root: ``<out-dir>/compiled/<model-name>`` directory.
@@ -188,6 +196,7 @@ class _CompileContext:
     model_id: str
     kind: str
     pooling: str | None
+    dense: tuple[dict[str, Any], ...] | None
     output_name: str
     batch_size: int
     model_root: Path
@@ -303,6 +312,9 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     pooling = _declared_pooling(kind, model_dir)
     if pooling is not None:
         _progress(f"      pooling         : {pooling}")
+    dense = _declared_dense(kind, model_dir)
+    if dense is not None:
+        _progress(f"      dense           : {_dense_summary(dense)}")
 
     out_root = resolve_out_root(args.out_dir)
     model_root = out_root / CACHE_SUBDIR / model_cache_name(args.source, model_dir)
@@ -333,6 +345,7 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
         model_id=model_identifier(args.source, model_dir),
         kind=kind,
         pooling=pooling,
+        dense=dense,
         output_name=output_name,
         batch_size=batch_size,
         model_root=model_root,
@@ -564,6 +577,48 @@ def _declared_pooling(kind: str, model_dir: Path) -> str | None:
         return None
 
 
+def _declared_dense(kind: str, model_dir: Path) -> tuple[dict[str, Any], ...] | None:
+    """Best-effort read of the Dense projection an embedding model declares.
+
+    Like :func:`_declared_pooling`, this is for *recording and comparing*
+    what a run compiled rather than an authoritative gate: an embedding
+    backend's own ``load()`` is what refuses a module chain it cannot
+    reproduce, with a full explanation, and that error must reach the user
+    unchanged.
+
+    Args:
+        kind: Resolved model kind.
+        model_dir: Read-only model directory.
+
+    Returns:
+        One record per declared projection stage, or ``None`` for a model
+        that declares none, for a reranker (whose score comes from its own
+        classification head, never from a sentence-transformers chain), or
+        when the declaration cannot be read.
+    """
+    if kind == "reranker":
+        return None
+    try:
+        return dense_record(read_dense_modules(model_dir))
+    except ValueError:
+        return None
+
+
+def _dense_summary(dense: Sequence[Mapping[str, Any]]) -> str:
+    """Summarize the declared projection for the progress log.
+
+    Args:
+        dense: Records of the declared stages, in application order.
+
+    Returns:
+        A line like ``"384 -> 1024 (identity)"``, with the stages of a
+        multi-stage projection separated by commas.
+    """
+    return ", ".join(
+        f"{stage.get('in')} -> {stage.get('out')} ({stage.get('activation')})" for stage in dense
+    )
+
+
 def _convert_variants(
     context: _CompileContext, plans: Sequence[VariantPlan]
 ) -> dict[int, dict[str, Any]]:
@@ -775,6 +830,7 @@ def _plan_variants(context: _CompileContext, buckets: Sequence[int]) -> list[Var
                     context.versions,
                     force=bool(context.args.force),
                     pooling=context.pooling,
+                    dense=context.dense,
                 ),
             )
         )
@@ -950,10 +1006,10 @@ def _build_metadata(
         selfcheck: Self-check report (possibly ``status="skipped"``).
 
     Returns:
-        A JSON-serializable metadata record. Its ``variant.pooling`` is
-        ``None`` (JSON ``null``) for a reranker, or when the embedding
-        model's declaration could not be read; see
-        :attr:`_CompileContext.pooling`.
+        A JSON-serializable metadata record. Its ``variant.pooling`` and
+        ``variant.dense`` are ``None`` (JSON ``null``) for a reranker, or
+        when the embedding model's declaration could not be read; see
+        :attr:`_CompileContext.pooling` and :attr:`_CompileContext.dense`.
     """
     return {
         "format_version": METADATA_FORMAT_VERSION,
@@ -965,6 +1021,7 @@ def _build_metadata(
             "kind": context.kind,
             "output_name": context.output_name,
             "pooling": context.pooling,
+            "dense": context.dense,
         },
         "args": dict(context.recorded_args),
         "versions": dict(context.versions),
@@ -1012,15 +1069,17 @@ def _build_model_info(
         A JSON-serializable summary; the input ``eeane.config``'s cache
         auto-resolution reads, hence the ``format_version``. The batched
         table is an addition a reader that does not know it simply
-        ignores, so it needs no new ``format_version``. ``pooling`` is
-        another such addition: ``None`` (JSON ``null``) for a reranker,
-        or when the embedding model's declaration could not be read.
+        ignores, so it needs no new ``format_version``. ``pooling`` and
+        ``dense`` are two more such additions: both are ``None`` (JSON
+        ``null``) for a reranker, or when the embedding model's
+        declaration could not be read.
     """
     record: dict[str, Any] = {
         "format_version": MODEL_INFO_FORMAT_VERSION,
         "id": context.model_id,
         "kind": context.kind,
         "pooling": context.pooling,
+        "dense": context.dense,
         "output_name": context.output_name,
         "buckets": sorted(artifacts),
         "tokenizer": TOKENIZER_FILENAME,
