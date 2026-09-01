@@ -1177,15 +1177,18 @@ def test_run_reports_explicit_buckets_beyond_the_model_limit(
 # --- end-to-end on a synthetic ModernBERT (local only) -----------------------
 
 
-def _build_synthetic_model(path: Path) -> Path:
+def _build_synthetic_model(path: Path, pooling_flag: str = "pooling_mode_mean_tokens") -> Path:
     """Create a tiny randomly initialised ModernBERT model directory.
 
     The directory is a complete HuggingFace distribution-format model
-    (config.json + safetensors weights + a byte-level fast tokenizer), so
-    the pipeline can be driven exactly as it would be for a real model.
+    (config.json + safetensors weights + a byte-level fast tokenizer + a
+    sentence-transformers pooling declaration), so the pipeline can be
+    driven exactly as it would be for a real model.
 
     Args:
         path: Directory to create (parents are created as needed).
+        pooling_flag: sentence-transformers pooling flag to declare
+            (``"pooling_mode_mean_tokens"`` or ``"pooling_mode_cls_token"``).
 
     Returns:
         ``path``.
@@ -1224,6 +1227,13 @@ def _build_synthetic_model(path: Path) -> Path:
         eos_token="</s>",
         model_max_length=64,
     ).save_pretrained(path)
+
+    # An embedding model must declare its pooling now that the modernbert
+    # backend detects it instead of hard-coding mean, so this is not optional.
+    (path / mb.POOLING_DIRNAME).mkdir(parents=True, exist_ok=True)
+    (path / mb.POOLING_DIRNAME / "config.json").write_text(
+        json.dumps({"word_embedding_dimension": 32, pooling_flag: True}), encoding="utf-8"
+    )
     return path
 
 
@@ -1565,6 +1575,34 @@ def test_e2e_incremental_bucket_keeps_earlier_buckets(
     # Neither self-check ran (no --skip-selfcheck override here, but no
     # selfcheck_fn either): both buckets stay recommended (unmeasured).
     assert model_info["recommended_buckets"] == [E2E_SEQ_LEN, second_bucket]
+
+
+def test_e2e_cls_pooling_embedding_model_converts(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A directory declaring CLS pooling must also convert through the full pipeline.
+
+    Every other end-to-end test in this module shares the module-scoped
+    ``synthetic_model_dir`` fixture, which declares mean pooling, so this
+    builds its own directory to exercise the CLS branch as well.
+    """
+    if not _E2E_AVAILABLE:
+        pytest.skip("end-to-end conversion needs a local machine with xcrun")
+    model_dir = _build_synthetic_model(
+        tmp_path_factory.mktemp("synthetic-cls") / "tiny-modernbert-cls",
+        pooling_flag="pooling_mode_cls_token",
+    )
+    out_dir = tmp_path_factory.mktemp("compile-cls") / "cache"
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exit_code = pipeline.run(
+            _compile_args(str(model_dir), "--buckets", str(E2E_SEQ_LEN), "--out-dir", str(out_dir))
+        )
+
+    model_root = out_dir / "compiled" / model_dir.name
+    assert exit_code == 0
+    assert (model_root / f"{E2E_STEM}.mlmodelc").is_dir()
 
 
 # --- batch families in the record and the snippet ----------------------------

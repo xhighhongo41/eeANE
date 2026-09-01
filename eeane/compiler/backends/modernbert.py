@@ -43,10 +43,17 @@ from transformers.models.modernbert import modeling_modernbert
 
 from eeane.compiler.backends.base import LoadedModel, SanitySpec
 from eeane.compiler.backends.common import (
+    POOLING_CLS,
+    POOLING_DIRNAME,
+    POOLING_MEAN,
+    POOLING_MODE_KEYS,
+    POOLING_MODE_PREFIX,
+    ClsEmbeddingWrapper,
     EmbeddingWrapper,
     RerankerWrapper,
     encode_pytorch,
     mean_pool,
+    read_pooling_mode,
     score_pytorch,
     sigmoid_np,
     tokenize_batch,
@@ -56,12 +63,16 @@ from eeane.compiler.backends.common import (
 # Public surface of this module, including the architecture-independent
 # helpers it re-exports from :mod:`eeane.compiler.backends.common`.
 __all__ = [
-    "EMBEDDING_POOLING",
+    "EMBEDDING_WRAPPERS",
     "OUTPUT_NAMES",
+    "POOLING_DIRNAME",
+    "POOLING_MODE_KEYS",
+    "POOLING_MODE_PREFIX",
     "SANITY_PAIRS",
     "SANITY_SPECS",
     "SANITY_TEXTS",
     "SUPPORTED_KINDS",
+    "ClsEmbeddingWrapper",
     "EmbeddingWrapper",
     "ModernBertBackend",
     "RerankerWrapper",
@@ -70,6 +81,7 @@ __all__ = [
     "patch_eager_attention_rank4",
     "patch_mask_fill_value",
     "patch_rotate_half",
+    "read_pooling_mode",
     "score_pytorch",
     "sigmoid_np",
     "tokenize_batch",
@@ -84,10 +96,11 @@ SUPPORTED_KINDS: tuple[str, ...] = (KIND_EMBEDDING, KIND_RERANKER)
 # Core ML graph output name per kind (embeddings vs raw relevance logits).
 OUTPUT_NAMES: dict[str, str] = {KIND_EMBEDDING: "embedding", KIND_RERANKER: "logits"}
 
-# Pooling this backend's embedding wrapper performs in-graph. Recorded on
-# the loaded handle so later stages can report it without knowing the
-# wrapper's internals.
-EMBEDDING_POOLING = "mean"
+# Traceable wrapper per detected pooling mode.
+EMBEDDING_WRAPPERS: dict[str, type[torch.nn.Module]] = {
+    POOLING_MEAN: EmbeddingWrapper,
+    POOLING_CLS: ClsEmbeddingWrapper,
+}
 
 # Model directory file and key the effective maximum sequence length is
 # read from. This architecture indexes positions from 0 with no reserved
@@ -335,13 +348,18 @@ class ModernBertBackend:
         Returns:
             A handle holding the model in eval/FP32 mode with
             ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
-            outputs), its tokenizer, its configuration and the pooling the
-            embedding wrapper applies.
+            outputs), its tokenizer, its configuration and -- for an
+            embedding model -- the pooling declared by the model directory.
 
         Raises:
-            ValueError: If ``kind`` is not supported by this backend.
+            ValueError: If ``kind`` is not supported by this backend, or if
+                the pooling of an embedding model cannot be determined.
         """
         self._check_kind(kind)
+        # Detected before the weights are read: an undeclared pooling makes
+        # the model uncompilable, and finding that out first avoids loading
+        # gigabytes of FP32 parameters for nothing.
+        pooling = read_pooling_mode(model_dir) if kind == KIND_EMBEDDING else None
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         loader = AutoModel if kind == KIND_EMBEDDING else AutoModelForSequenceClassification
         model = loader.from_pretrained(model_dir, attn_implementation=attn, dtype=torch.float32)
@@ -353,7 +371,7 @@ class ModernBertBackend:
             model_dir=model_dir,
             kind=kind,
             attn=attn,
-            pooling=EMBEDDING_POOLING if kind == KIND_EMBEDDING else None,
+            pooling=pooling,
         )
 
     def apply_patches(
@@ -404,17 +422,28 @@ class ModernBertBackend:
         """Wrap the loaded model into the traceable module for its kind.
 
         Args:
-            loaded: Handle returned by :meth:`load`.
+            loaded: Handle returned by :meth:`load`; for an embedding
+                model its ``pooling`` selects the wrapper.
 
         Returns:
-            :class:`EmbeddingWrapper` (in-graph mean pooling) or
-            :class:`RerankerWrapper` (raw logits), in eval mode.
+            The pooling wrapper matching ``loaded.pooling`` for an
+            embedding model, or the raw-logits wrapper for a reranker, in
+            eval mode.
 
         Raises:
-            ValueError: If ``loaded.kind`` is not supported by this backend.
+            ValueError: If ``loaded.kind`` is not supported by this
+                backend, or if an embedding handle carries a pooling mode
+                no wrapper implements.
         """
         self._check_kind(loaded.kind)
-        wrapper_class = EmbeddingWrapper if loaded.kind == KIND_EMBEDDING else RerankerWrapper
+        if loaded.kind == KIND_RERANKER:
+            return RerankerWrapper(loaded.model).eval()
+        wrapper_class = EMBEDDING_WRAPPERS.get(loaded.pooling or "")
+        if wrapper_class is None:
+            supported = ", ".join(EMBEDDING_WRAPPERS)
+            raise ValueError(
+                f"unsupported pooling '{loaded.pooling}' for {self.name} (supported: {supported})"
+            )
         return wrapper_class(loaded.model).eval()
 
     def output_name(self, kind: str) -> str:
@@ -556,7 +585,15 @@ class ModernBertBackend:
         loaded = self.load(model_dir, kind, attn="sdpa")
         try:
             if kind == KIND_EMBEDDING:
-                return encode_pytorch(loaded.model, loaded.tokenizer, list(inputs), seq_len)
+                # The baseline must pool exactly like the traced wrapper,
+                # so it follows the pooling detected for this directory.
+                return encode_pytorch(
+                    loaded.model,
+                    loaded.tokenizer,
+                    list(inputs),
+                    seq_len,
+                    pooling=loaded.pooling,
+                )
             return score_pytorch(
                 loaded.model, loaded.tokenizer, [(q, d) for q, d in inputs], seq_len
             )
