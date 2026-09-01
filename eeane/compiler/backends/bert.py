@@ -31,12 +31,19 @@ Three properties set this family apart from the other backends:
 The pooling of an embedding model is not part of the HF configuration; it
 is declared by the sentence-transformers pooling module in the model
 directory, which this backend reads (and refuses to guess) through the
-shared reader in :mod:`eeane.compiler.backends.common`.
+shared reader in :mod:`eeane.compiler.backends.common`. The same directory
+may declare Dense projections applied after that pooling, which the shared
+readers describe, build and hand to both the traced wrapper and the FP32
+baseline; a declared module chain that cannot be reproduced is refused
+before any weight is read.
 
-The fixtures below are English on purpose: checkpoints of this family
-commonly ship an English-only WordPiece vocabulary, and fixtures in
-another language would encode to little more than unknown-token rows,
-which tell the self-check nothing about the model.
+The trace example below is English on purpose: checkpoints of this family
+commonly ship an English-only WordPiece vocabulary, and a trace example
+in another language would encode to little more than unknown-token rows.
+The sanity fixtures are the shared per-language sets, of which the
+self-check needs only one to clear its threshold, so an English-only
+checkpoint is carried by the English set while a multilingual one of this
+family is measured on whichever set it reads best.
 
 Importing this module pulls in ``torch``/``transformers``; it therefore
 requires the ``[compile]`` extra and must never be imported from the
@@ -58,9 +65,11 @@ from eeane.compiler.backends.base import LoadedModel, SanitySpec
 from eeane.compiler.backends.common import (
     POOLING_CLS,
     POOLING_MEAN,
+    SANITY_TEXT_SETS,
     ClsEmbeddingWrapper,
     EmbeddingWrapper,
     encode_pytorch,
+    load_dense,
     read_pooling_mode,
     tokenize_batch,
 )
@@ -97,20 +106,10 @@ MAX_POSITION_KEY = "max_position_embeddings"
 # Short English sentence used as the example input for torch.jit.trace.
 TRACE_EXAMPLE_TEXT = "A short English sentence used as the conversion sample."
 
-# Fixed sanity-check sentences (short / medium / long) exercising different
-# amounts of padding under the same fixed sequence length.
-SANITY_TEXTS: list[str] = [
-    "Question: how tall is the highest mountain in Japan?",
-    "Document: Mount Fuji rises 3,776 metres above sea level on the border between "
-    "Shizuoka and Yamanashi, and is the highest mountain in Japan.",
-    "Topic: turning a large collection of documents into vectors ahead of time makes it "
-    "possible to retrieve passages with a similar meaning without reading every text again.",
-]
-
-# Sanity fixtures per kind, as handed to the pipeline and the self-check.
-# Embeddings are compared row by row against their own baseline and carry
-# no ordering expectation.
-SANITY_SPECS: dict[str, SanitySpec] = {KIND_EMBEDDING: SanitySpec(inputs=tuple(SANITY_TEXTS))}
+# Sanity fixtures per kind, as handed to the pipeline and the self-check:
+# the shared per-language sets, unchanged. Embeddings are compared row by
+# row against their own baseline and carry no ordering expectation.
+SANITY_SPECS: dict[str, SanitySpec] = {KIND_EMBEDDING: SanitySpec(input_sets=SANITY_TEXT_SETS)}
 
 # Filler row used to pad the last sanity batch when the number of sanity
 # inputs is not a multiple of B. The empty string encodes to special tokens
@@ -211,18 +210,22 @@ class BertBackend:
         Returns:
             A handle holding the model in eval/FP32 mode with
             ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
-            outputs), its tokenizer, its configuration and the pooling
-            declared by the model directory.
+            outputs), its tokenizer, its configuration, the pooling
+            declared by the model directory and the Dense projection it
+            declares after that pooling, if any.
 
         Raises:
-            ValueError: If ``kind`` is not supported by this backend, or if
-                the pooling of the model cannot be determined.
+            ValueError: If ``kind`` is not supported by this backend, if
+                the pooling of the model cannot be determined, or if the
+                declared module chain cannot be reproduced.
         """
         self._check_kind(kind)
-        # Detected before the weights are read: an undeclared pooling makes
-        # the model uncompilable, and finding that out first avoids loading
+        # Both declarations are read before the weights: an undeclared
+        # pooling or an unreproducible module chain makes the model
+        # uncompilable, and finding that out first avoids loading
         # gigabytes of FP32 parameters for nothing.
         pooling = read_pooling_mode(model_dir)
+        dense, dense_config = load_dense(model_dir)
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         # Pooling happens in the wrapper; the BERT pooler head is unused
         # here, so skip it instead of tracing a dead subgraph.
@@ -241,6 +244,8 @@ class BertBackend:
             kind=kind,
             attn=attn,
             pooling=pooling,
+            dense=dense,
+            dense_config=dense_config,
         )
 
     def apply_patches(
@@ -276,7 +281,8 @@ class BertBackend:
 
         Args:
             loaded: Handle returned by :meth:`load`; its ``pooling``
-                selects the wrapper.
+                selects the wrapper and its ``dense`` is applied after
+                that pooling.
 
         Returns:
             The pooling wrapper matching ``loaded.pooling``, in eval mode,
@@ -294,7 +300,7 @@ class BertBackend:
             raise ValueError(
                 f"unsupported pooling '{loaded.pooling}' for {self.name} (supported: {supported})"
             )
-        return wrapper_class(ZeroTokenTypeModel(loaded.model)).eval()
+        return wrapper_class(ZeroTokenTypeModel(loaded.model), dense=loaded.dense).eval()
 
     def output_name(self, kind: str) -> str:
         """Return the Core ML graph output name used for ``kind``.
@@ -433,14 +439,15 @@ class BertBackend:
             raise ValueError("no inputs to encode")
         loaded = self.load(model_dir, kind, attn="sdpa")
         try:
-            # The baseline must pool exactly like the traced wrapper, so it
-            # follows the pooling detected for this directory.
+            # The baseline must pool and project exactly like the traced
+            # wrapper, so it follows both declarations of this directory.
             return encode_pytorch(
                 loaded.model,
                 loaded.tokenizer,
                 list(inputs),
                 seq_len,
                 pooling=loaded.pooling,
+                dense=loaded.dense,
             )
         finally:
             del loaded

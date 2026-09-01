@@ -1,10 +1,14 @@
 """Tests for the compile-backend interface and its ModernBERT implementation.
 
-Two layers:
+Three layers:
 
 * The interface types of ``eeane.compiler.backends.base`` (the handle and
   the sanity specification every backend hands to the pipeline and the
   self-check), which are pure data and run anywhere.
+* The per-language sanity fixtures of
+  ``eeane.compiler.backends.common``, checked through every backend that
+  serves them, since the self-check's "any set may carry the variant"
+  rule only holds while each set really covers its own language.
 * ``eeane.compiler.backends.modernbert``: the numerics ported from the
   frozen PoC scripts (masked mean pooling, stable sigmoid, patched-eager
   == unpatched-sdpa forward outputs) plus the conformance of every
@@ -31,7 +35,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 from transformers.models.modernbert import modeling_modernbert
 
-from eeane.compiler.backends import base, bert
+from eeane.compiler.backends import base, bert, common
 from eeane.compiler.backends import modernbert as mb
 from eeane.compiler.backends import xlm_roberta as xlmr
 
@@ -142,21 +146,39 @@ def test_loaded_model_is_frozen_and_defaults_pooling_to_none() -> None:
 
 def test_sanity_spec_defaults_have_no_ordering_expectation() -> None:
     """Fixtures without expected ordering (embeddings) must default both indices to None."""
-    spec = base.SanitySpec(inputs=("a", "b"))
+    spec = base.SanitySpec(input_sets=(("en", ("a", "b")),))
 
     assert spec.relevant_index is None
     assert spec.irrelevant_index is None
 
 
 def test_sanity_spec_is_frozen_and_holds_immutable_inputs() -> None:
-    """Neither the spec nor its inputs may be modified by a consumer."""
-    spec = base.SanitySpec(inputs=("a", "b"), relevant_index=0, irrelevant_index=1)
+    """Neither the spec nor its sets may be modified by a consumer."""
+    spec = base.SanitySpec(
+        input_sets=(("en", ("a", "b")), ("ja", ("c", "d"))),
+        relevant_index=0,
+        irrelevant_index=1,
+    )
 
-    assert isinstance(spec.inputs, tuple)
+    assert isinstance(spec.input_sets, tuple)
     with pytest.raises(dataclasses.FrozenInstanceError):
         spec.relevant_index = 1  # type: ignore[misc]
     with pytest.raises(TypeError):
-        spec.inputs[0] = "mutated"  # type: ignore[index]
+        spec.input_sets[0][1][0] = "mutated"  # type: ignore[index]
+
+
+def test_sanity_spec_reports_its_languages_in_declaration_order() -> None:
+    """The evaluation order of the sets is part of the contract, so it must be readable."""
+    spec = base.SanitySpec(input_sets=(("en", ("a",)), ("ja", ("b",)), ("zh", ("c",))))
+
+    assert spec.languages == ("en", "ja", "zh")
+
+
+def test_sanity_spec_all_inputs_concatenates_the_sets_in_order() -> None:
+    """The flat view a language-agnostic consumer takes must keep every set's inputs."""
+    spec = base.SanitySpec(input_sets=(("en", ("a", "b")), ("ja", ("c",)), ("zh", ("d", "e"))))
+
+    assert spec.all_inputs == ("a", "b", "c", "d", "e")
 
 
 @pytest.mark.parametrize(
@@ -166,7 +188,177 @@ def test_sanity_spec_is_frozen_and_holds_immutable_inputs() -> None:
 def test_sanity_spec_rejects_out_of_range_indices(relevant: int, irrelevant: int) -> None:
     """An index that does not address an input would only fail deep inside the self-check."""
     with pytest.raises(ValueError, match="out of range"):
-        base.SanitySpec(inputs=("a", "b"), relevant_index=relevant, irrelevant_index=irrelevant)
+        base.SanitySpec(
+            input_sets=(("en", ("a", "b")),),
+            relevant_index=relevant,
+            irrelevant_index=irrelevant,
+        )
+
+
+def test_sanity_spec_rejects_an_index_out_of_range_for_a_later_set() -> None:
+    """The indices apply to every set, so validating only the first one would miss this."""
+    with pytest.raises(ValueError, match="out of range"):
+        base.SanitySpec(
+            input_sets=(("en", ("a", "b", "c")), ("ja", ("d", "e"))),
+            relevant_index=0,
+            irrelevant_index=2,
+        )
+
+
+def test_sanity_spec_rejects_a_repeated_language() -> None:
+    """Two sets under one language would overwrite each other in the per-set report."""
+    with pytest.raises(ValueError, match="ja"):
+        base.SanitySpec(input_sets=(("ja", ("a",)), ("ja", ("b",))))
+
+
+def test_sanity_spec_rejects_declaring_no_set_at_all() -> None:
+    """A spec without a single set leaves the self-check nothing to compare."""
+    with pytest.raises(ValueError, match="no sanity input set"):
+        base.SanitySpec(input_sets=())
+
+
+def test_sanity_spec_rejects_an_empty_set() -> None:
+    """An empty set would contribute no row, yet still be reported as a passing set."""
+    with pytest.raises(ValueError, match="zh"):
+        base.SanitySpec(input_sets=(("en", ("a",)), ("zh", ())))
+
+
+def test_sanity_spec_rejects_inputs_that_are_not_a_tuple() -> None:
+    """A mutable input sequence would let a consumer change the fixtures under the check."""
+    with pytest.raises(TypeError, match="tuple"):
+        base.SanitySpec(input_sets=(("en", ["a", "b"]),))  # type: ignore[arg-type]
+
+
+# --- shared sanity language sets (backends/common.py) ------------------------
+
+# Every (backend, kind) pair that hands the pipeline a sanity
+# specification, so the shared expectations below are checked against all
+# of them rather than one representative.
+_SANITY_SPEC_CASES = [
+    (bert.BertBackend(), "embedding"),
+    (mb.ModernBertBackend(), "embedding"),
+    (mb.ModernBertBackend(), "reranker"),
+    (xlmr.XlmRobertaBackend(), "embedding"),
+    (xlmr.XlmRobertaBackend(), "reranker"),
+]
+_SANITY_SPEC_IDS = [f"{backend.name}-{kind}" for backend, kind in _SANITY_SPEC_CASES]
+
+# The same cases split by kind, for the expectations only one kind's
+# fixtures can carry.
+_EMBEDDING_BACKENDS = [backend for backend, kind in _SANITY_SPEC_CASES if kind == "embedding"]
+_RERANKER_BACKENDS = [backend for backend, kind in _SANITY_SPEC_CASES if kind == "reranker"]
+
+# Number of inputs every language set holds: one short, one medium and one
+# long fixture, so a single fixed sequence length exercises three different
+# amounts of padding.
+_INPUTS_PER_SANITY_SET = 3
+
+
+@pytest.mark.parametrize(("backend", "kind"), _SANITY_SPEC_CASES, ids=_SANITY_SPEC_IDS)
+def test_every_sanity_spec_offers_the_three_languages_in_one_order(backend: Any, kind: str) -> None:
+    """A model whose vocabulary misses one language must still have two other sets to pass on."""
+    assert backend.sanity_spec(kind).languages == ("en", "ja", "zh")
+
+
+@pytest.mark.parametrize(("backend", "kind"), _SANITY_SPEC_CASES, ids=_SANITY_SPEC_IDS)
+def test_every_sanity_set_holds_three_inputs(backend: Any, kind: str) -> None:
+    """Every set must exercise the same short/medium/long shape, whatever its language."""
+    spec = backend.sanity_spec(kind)
+
+    assert all(len(inputs) == _INPUTS_PER_SANITY_SET for _, inputs in spec.input_sets)
+    assert len(spec.all_inputs) == _INPUTS_PER_SANITY_SET * len(spec.input_sets)
+
+
+@pytest.mark.parametrize("backend", _EMBEDDING_BACKENDS, ids=lambda backend: backend.name)
+def test_every_embedding_sanity_set_runs_from_the_shortest_to_the_longest(backend: Any) -> None:
+    """The padding an input leaves unused is what the three lengths per set exercise.
+
+    Only the embedding sets: a reranker's three pairs are ordered by the
+    role each plays in the expected ordering, not by length.
+    """
+    for language, texts in backend.sanity_spec("embedding").input_sets:
+        lengths = [len(text) for text in texts]
+        assert lengths == sorted(lengths), (language, lengths)
+
+
+@pytest.mark.parametrize(("backend", "kind"), _SANITY_SPEC_CASES, ids=_SANITY_SPEC_IDS)
+def test_no_sanity_input_is_empty_or_repeated(backend: Any, kind: str) -> None:
+    """A blank or duplicated fixture would spend a prediction on nothing new."""
+    inputs = backend.sanity_spec(kind).all_inputs
+
+    assert all(all(part.strip() for part in _parts(item)) for item in inputs)
+    assert len(set(inputs)) == len(inputs)
+
+
+def test_the_english_sanity_sets_are_written_in_ascii() -> None:
+    """The English sets are what carries a checkpoint with an English-only vocabulary."""
+    english_texts = dict(common.SANITY_TEXT_SETS)["en"]
+    english_pairs = dict(common.SANITY_PAIR_SETS)["en"]
+
+    assert all(text.isascii() for text in english_texts), english_texts
+    assert all(part.isascii() for pair in english_pairs for part in pair), english_pairs
+
+
+@pytest.mark.parametrize("language", ["ja", "zh"])
+def test_the_non_english_sanity_sets_are_not_ascii(language: str) -> None:
+    """A set that lost its own script would stop covering the vocabulary it stands for."""
+    texts = dict(common.SANITY_TEXT_SETS)[language]
+    pairs = dict(common.SANITY_PAIR_SETS)[language]
+
+    assert not any(text.isascii() for text in texts), texts
+    assert not any(pair[1].isascii() for pair in pairs), pairs
+
+
+@pytest.mark.parametrize("backend", _RERANKER_BACKENDS, ids=lambda backend: backend.name)
+def test_every_reranker_pair_set_shares_the_query_of_its_first_two_pairs(backend: Any) -> None:
+    """Only the document may decide the expected ordering, in every language."""
+    spec = backend.sanity_spec("reranker")
+    relevant, irrelevant = spec.relevant_index, spec.irrelevant_index
+
+    for language, pairs in spec.input_sets:
+        assert pairs[relevant][0] == pairs[irrelevant][0], language
+        assert pairs[relevant][1] != pairs[irrelevant][1], language
+
+
+def test_the_shared_sets_are_what_the_multilingual_backends_serve() -> None:
+    """XLM-RoBERTa and BERT take the shared fixtures; nothing is duplicated per backend."""
+    assert xlmr.XlmRobertaBackend().sanity_spec("embedding").input_sets == common.SANITY_TEXT_SETS
+    assert xlmr.XlmRobertaBackend().sanity_spec("reranker").input_sets == common.SANITY_PAIR_SETS
+    assert bert.BertBackend().sanity_spec("embedding").input_sets == common.SANITY_TEXT_SETS
+
+
+@pytest.mark.parametrize("kind", ["embedding", "reranker"])
+def test_modernbert_overrides_the_japanese_set_only(kind: str) -> None:
+    """Its Japanese fixtures are the ones its verified models were measured with."""
+    shared = dict(common.SANITY_TEXT_SETS if kind == "embedding" else common.SANITY_PAIR_SETS)
+    own = tuple(mb.SANITY_TEXTS if kind == "embedding" else mb.SANITY_PAIRS)
+
+    sets = dict(mb.ModernBertBackend().sanity_spec(kind).input_sets)
+
+    assert sets["ja"] == own
+    assert sets["ja"] != shared["ja"]
+    assert sets["en"] == shared["en"]
+    assert sets["zh"] == shared["zh"]
+
+
+def test_override_sanity_set_replaces_only_the_named_language() -> None:
+    """A backend with its own fixtures for one language must keep the shared rest."""
+    sets = (("en", ("a",)), ("ja", ("b",)), ("zh", ("c",)))
+
+    replaced = common.override_sanity_set(sets, "ja", ("own",))
+
+    assert replaced == (("en", ("a",)), ("ja", ("own",)), ("zh", ("c",)))
+
+
+def test_override_sanity_set_rejects_a_language_the_sets_do_not_hold() -> None:
+    """A typo would otherwise silently leave the shared fixtures in place."""
+    with pytest.raises(ValueError, match="ko"):
+        common.override_sanity_set((("en", ("a",)),), "ko", ("own",))
+
+
+def _parts(sanity_input: Any) -> tuple[str, ...]:
+    """Return the text parts of one sanity input (a text, or a pair's two halves)."""
+    return (sanity_input,) if isinstance(sanity_input, str) else tuple(sanity_input)
 
 
 # --- pooling / sigmoid (the numerics moved out of poc/common.py) -------------
@@ -285,12 +477,12 @@ def test_fixtures_have_the_expected_shape_per_kind() -> None:
     backend = mb.ModernBertBackend()
 
     assert isinstance(backend.trace_example("embedding"), str)
-    assert all(isinstance(text, str) for text in backend.sanity_spec("embedding").inputs)
+    assert all(isinstance(text, str) for text in backend.sanity_spec("embedding").all_inputs)
     assert backend.padding_input("embedding") == ""
 
     trace_pair = backend.trace_example("reranker")
     assert isinstance(trace_pair, tuple) and len(trace_pair) == 2
-    assert all(len(pair) == 2 for pair in backend.sanity_spec("reranker").inputs)
+    assert all(len(pair) == 2 for pair in backend.sanity_spec("reranker").all_inputs)
     assert backend.padding_input("reranker") == ("", "")
 
 
@@ -298,19 +490,19 @@ def test_sanity_spec_inputs_are_immutable() -> None:
     """The fixtures a caller receives must not be corruptible module state."""
     backend = mb.ModernBertBackend()
 
-    inputs = backend.sanity_spec("embedding").inputs
+    japanese = dict(backend.sanity_spec("embedding").input_sets)["ja"]
 
-    assert isinstance(inputs, tuple)
-    assert len(inputs) == len(mb.SANITY_TEXTS)
+    assert isinstance(japanese, tuple)
+    assert len(japanese) == len(mb.SANITY_TEXTS)
     with pytest.raises(TypeError):
-        inputs[0] = "mutated"  # type: ignore[index]
+        japanese[0] = "mutated"  # type: ignore[index]
 
 
 def test_embedding_sanity_spec_declares_no_ordering() -> None:
     """Embedding fixtures are compared row-wise; there is no expected ordering."""
     spec = mb.ModernBertBackend().sanity_spec("embedding")
 
-    assert spec.inputs
+    assert spec.input_sets
     assert spec.relevant_index is None
     assert spec.irrelevant_index is None
 
@@ -318,15 +510,12 @@ def test_embedding_sanity_spec_declares_no_ordering() -> None:
 def test_reranker_sanity_spec_points_at_the_relevant_and_irrelevant_pairs() -> None:
     """The reranker ordering check must be driven by the spec, not by module constants."""
     spec = mb.ModernBertBackend().sanity_spec("reranker")
+    japanese = dict(spec.input_sets)["ja"]
 
     assert spec.relevant_index == 0
     assert spec.irrelevant_index == 1
-    assert spec.inputs[0] == mb.SANITY_PAIRS[0]
-    assert spec.inputs[1] == mb.SANITY_PAIRS[1]
-    # The relevant pair shares its query with the irrelevant one, so only the
-    # document decides the expected ordering.
-    assert spec.inputs[0][0] == spec.inputs[1][0]
-    assert spec.inputs[0][1] != spec.inputs[1][1]
+    assert japanese[0] == mb.SANITY_PAIRS[0]
+    assert japanese[1] == mb.SANITY_PAIRS[1]
 
 
 @pytest.mark.parametrize(
@@ -665,7 +854,7 @@ def reranker_smoke() -> dict[str, Any]:
 def _run_smoke(model_dir: Path, kind: str, seq_len: int = SMOKE_SEQ_LEN) -> dict[str, Any]:
     """Compare one patched eager forward pass against the FP32 sdpa reference."""
     backend = mb.ModernBertBackend()
-    inputs = list(backend.sanity_spec(kind).inputs[:1])
+    inputs = list(backend.sanity_spec(kind).all_inputs[:1])
     loaded = backend.load(model_dir, kind, attn="eager")
     backend.apply_patches(loaded)
     wrapper = backend.wrap(loaded)

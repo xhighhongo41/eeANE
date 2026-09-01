@@ -33,12 +33,14 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 from transformers.models.modernbert import modeling_modernbert
 
 from eeane import __version__, cli
-from eeane.compiler import artifacts, pipeline
+from eeane.compiler import artifacts, pipeline, selfcheck
+from eeane.compiler.backends import base
 from eeane.compiler.backends import modernbert as mb
 from eeane.config import ModelEntry, load_config
 
@@ -54,6 +56,13 @@ _E2E_AVAILABLE = _LOCAL_MACHINE and shutil.which("xcrun") is not None
 # conversion within a few seconds.
 E2E_SEQ_LEN = 32
 E2E_STEM = f"s{E2E_SEQ_LEN}_b1_eager_macos13"
+
+# sentence-transformers module types and the conventional directory name of
+# a Dense projection, as they appear in a model's ``modules.json``.
+_TRANSFORMER_TYPE = "sentence_transformers.models.Transformer"
+_POOLING_TYPE = "sentence_transformers.models.Pooling"
+_DENSE_TYPE = "sentence_transformers.models.Dense"
+_DENSE_DIRNAME = "2_Dense"
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -77,6 +86,7 @@ def _write_variant(
     *,
     selfcheck_status: str = "skipped",
     pooling: str | None = None,
+    dense: Any = None,
 ) -> tuple[Path, Path]:
     """Create a fake compiled variant (``.mlmodelc`` + metadata) on disk.
 
@@ -87,6 +97,8 @@ def _write_variant(
         pooling: Value recorded under ``variant.pooling``, or ``None`` to
             omit the ``variant`` block entirely -- an old-format record
             that never recorded one.
+        dense: Value recorded under ``variant.dense``. Only reaches the
+            record when a ``variant`` block is written at all.
 
     Returns:
         Tuple of the ``.mlmodelc`` and metadata paths.
@@ -96,9 +108,15 @@ def _write_variant(
     metadata_path = directory / f"{E2E_STEM}.json"
     payload: dict[str, Any] = {"versions": versions, "selfcheck": {"status": selfcheck_status}}
     if pooling is not None:
-        payload["variant"] = {"pooling": pooling}
+        payload["variant"] = {"pooling": pooling, "dense": dense}
     metadata_path.write_text(json.dumps(payload), encoding="utf-8")
     return mlmodelc_path, metadata_path
+
+
+# One recorded Dense description, as ``variant.dense`` holds it.
+_DENSE_RECORD: tuple[dict[str, Any], ...] = (
+    {"in": 384, "out": 1024, "bias": False, "activation": "identity"},
+)
 
 
 # --- cache naming ------------------------------------------------------------
@@ -643,7 +661,74 @@ def test_needs_conversion_skips_the_pooling_check_when_none_is_given(tmp_path: P
     assert artifacts.needs_conversion(mlmodelc_path, metadata_path, versions, pooling=None) is False
 
 
-# --- declared pooling ---------------------------------------------------------
+def test_needs_conversion_when_the_recorded_dense_matches(tmp_path: Path) -> None:
+    """A recorded projection equal to the declared one is not a reason to reconvert."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(
+        tmp_path, versions, pooling="mean", dense=[dict(stage) for stage in _DENSE_RECORD]
+    )
+
+    assert (
+        artifacts.needs_conversion(
+            mlmodelc_path, metadata_path, versions, pooling="mean", dense=_DENSE_RECORD
+        )
+        is False
+    )
+
+
+def test_needs_conversion_when_the_recorded_dense_differs(tmp_path: Path) -> None:
+    """A projection whose width or activation changed bakes a different embedding."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(
+        tmp_path, versions, pooling="mean", dense=[dict(stage) for stage in _DENSE_RECORD]
+    )
+    changed = ({**_DENSE_RECORD[0], "out": 768},)
+
+    assert (
+        artifacts.needs_conversion(
+            mlmodelc_path, metadata_path, versions, pooling="mean", dense=changed
+        )
+        is True
+    )
+
+
+def test_needs_conversion_when_a_dense_was_added_to_the_model(tmp_path: Path) -> None:
+    """An artifact baked without the projection must not be served under one."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(tmp_path, versions, pooling="mean")
+
+    assert (
+        artifacts.needs_conversion(
+            mlmodelc_path, metadata_path, versions, pooling="mean", dense=_DENSE_RECORD
+        )
+        is True
+    )
+
+
+def test_needs_conversion_when_the_model_dropped_its_dense(tmp_path: Path) -> None:
+    """The reverse change must be noticed too: ``None`` is a declaration, not "skip"."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(
+        tmp_path, versions, pooling="mean", dense=[dict(stage) for stage in _DENSE_RECORD]
+    )
+
+    assert (
+        artifacts.needs_conversion(
+            mlmodelc_path, metadata_path, versions, pooling="mean", dense=None
+        )
+        is True
+    )
+
+
+def test_needs_conversion_of_a_record_that_never_knew_about_dense(tmp_path: Path) -> None:
+    """A cache compiled before projections were read stays reusable for a model without one."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(tmp_path, versions)
+
+    assert artifacts.needs_conversion(mlmodelc_path, metadata_path, versions, dense=None) is False
+
+
+# --- declared pooling and dense -----------------------------------------------
 
 
 def _write_pooling_declaration(model_dir: Path, pooling_flag: str) -> None:
@@ -682,6 +767,85 @@ def test_declared_pooling_is_none_for_a_reranker(tmp_path: Path) -> None:
     _write_pooling_declaration(tmp_path, "pooling_mode_mean_tokens")
 
     assert pipeline._declared_pooling("reranker", tmp_path) is None
+
+
+def _write_dense_declaration(
+    model_dir: Path,
+    *,
+    in_features: int = 32,
+    out_features: int = 48,
+    bias: bool = True,
+    activation: str = "torch.nn.modules.linear.Identity",
+) -> Path:
+    """Declare a Transformer/Pooling/Dense chain and the Dense module's own config.
+
+    Args:
+        model_dir: Model directory to write into.
+        in_features: Declared projection input width.
+        out_features: Declared projection output width.
+        bias: Whether the projection declares a bias.
+        activation: Declared activation class path.
+
+    Returns:
+        The Dense module directory (without any weights).
+    """
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "name": "0", "path": "", "type": _TRANSFORMER_TYPE},
+                {"idx": 1, "name": "1", "path": "1_Pooling", "type": _POOLING_TYPE},
+                {"idx": 2, "name": "2", "path": _DENSE_DIRNAME, "type": _DENSE_TYPE},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    dense_dir = model_dir / _DENSE_DIRNAME
+    dense_dir.mkdir(parents=True, exist_ok=True)
+    (dense_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "in_features": in_features,
+                "out_features": out_features,
+                "bias": bias,
+                "activation_function": activation,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dense_dir
+
+
+def test_declared_dense_reads_the_projection_an_embedding_model_declares(tmp_path: Path) -> None:
+    """The declared projection must be reported in the shape the metadata records."""
+    _write_dense_declaration(tmp_path, in_features=384, out_features=1024, bias=False)
+
+    assert pipeline._declared_dense("embedding", tmp_path) == (
+        {"in": 384, "out": 1024, "bias": False, "activation": "identity"},
+    )
+
+
+def test_declared_dense_is_none_without_a_module_declaration(tmp_path: Path) -> None:
+    """Most models declare no projection at all, which records as ``null``."""
+    assert pipeline._declared_dense("embedding", tmp_path) is None
+
+
+def test_declared_dense_is_none_when_the_declaration_cannot_be_read(tmp_path: Path) -> None:
+    """An unreadable declaration must not fail the run here.
+
+    The authoritative refusal comes from the backend's own load(); this
+    helper only records what it can for later comparison.
+    """
+    (tmp_path / "modules.json").write_text("{not json", encoding="utf-8")
+
+    assert pipeline._declared_dense("embedding", tmp_path) is None
+
+
+def test_declared_dense_is_none_for_a_reranker(tmp_path: Path) -> None:
+    """A reranker's output comes from its own head, so no chain is read for it."""
+    _write_dense_declaration(tmp_path)
+
+    assert pipeline._declared_dense("reranker", tmp_path) is None
 
 
 # --- calibration aggregation --------------------------------------------------
@@ -864,7 +1028,11 @@ def test_aggregate_calibration_embedding_dim_is_always_none_for_a_reranker(
 
 
 def _stub_compile_context(
-    tmp_path: Path, *, kind: str = "embedding", pooling: str | None = "mean"
+    tmp_path: Path,
+    *,
+    kind: str = "embedding",
+    pooling: str | None = "mean",
+    dense: tuple[dict[str, Any], ...] | None = None,
 ) -> pipeline._CompileContext:
     """Build a minimal ``_CompileContext`` for a ``_build_metadata`` unit test."""
     return pipeline._CompileContext(
@@ -873,6 +1041,7 @@ def _stub_compile_context(
         model_id="stub-model",
         kind=kind,
         pooling=pooling,
+        dense=dense,
         output_name="embedding",
         batch_size=1,
         model_root=tmp_path,
@@ -989,6 +1158,7 @@ def test_convert_variants_records_the_backends_own_patches(
         model_id="stub-model",
         kind="embedding",
         pooling="mean",
+        dense=None,
         output_name="embedding",
         batch_size=1,
         model_root=tmp_path,
@@ -1033,7 +1203,7 @@ def test_verification_inputs_are_self_contained_for_an_embedding_model() -> None
     assert any(len(text) == 1 for text in texts)  # single character
     assert max(len(text) for text in texts) > 4 * 128  # far longer than the bucket
     assert all(isinstance(text, str) for text in texts)
-    assert set(backend.sanity_spec("embedding").inputs).issubset(texts)
+    assert set(backend.sanity_spec("embedding").all_inputs).issubset(texts)
     assert pairs == []  # an embedding model never encodes pairs
 
 
@@ -1046,7 +1216,151 @@ def test_verification_inputs_include_pairs_for_a_reranker() -> None:
     assert texts and "" in texts
     assert ("", "") in pairs
     assert all(len(pair) == 2 for pair in pairs)
-    assert set(backend.sanity_spec("reranker").inputs).issubset(pairs)
+    assert set(backend.sanity_spec("reranker").all_inputs).issubset(pairs)
+
+
+@pytest.mark.parametrize("kind", ["embedding", "reranker"])
+def test_verification_inputs_cover_every_sanity_language_set(kind: str) -> None:
+    """The self-check may pick any language set, so the gate must cover them all.
+
+    Freezing is verified by comparing token sequences, which is
+    language-agnostic: taking every set in simply widens the gate.
+    """
+    backend = mb.ModernBertBackend()
+    spec = backend.sanity_spec(kind)
+
+    texts, pairs = pipeline.verification_inputs(backend, kind, [128])
+
+    assert len(spec.languages) == 3
+    for language, inputs in spec.input_sets:
+        if kind == "reranker":
+            assert set(inputs).issubset(pairs), language
+            # Both halves of every pair are legitimate standalone inputs.
+            assert {part for pair in inputs for part in pair}.issubset(texts), language
+        else:
+            assert set(inputs).issubset(texts), language
+
+
+# --- per-language sanity progress line ---------------------------------------
+
+
+def _sanity_report(
+    passed: bool, best_set: str, metric_key: str, metrics: dict[str, float]
+) -> dict[str, Any]:
+    """Build a self-check report carrying per-language sanity measurements.
+
+    Args:
+        passed: Overall sanity verdict recorded in the report.
+        best_set: Language the report's top-level values were taken from.
+        metric_key: Per-set metric key (``"cosine_min"`` for an embedding
+            report, ``"sigmoid_max_abs_diff"`` for a reranker one).
+        metrics: Metric value per language, in the order the sets were
+            evaluated in.
+
+    Returns:
+        A report shaped like the one :mod:`eeane.compiler.selfcheck`
+        produces, reduced to the keys the progress line reads.
+    """
+    return {
+        "status": "passed" if passed else "failed",
+        "sanity": {
+            "passed": passed,
+            "best_set": best_set,
+            metric_key: metrics[best_set],
+            "sets": {
+                language: {metric_key: value, "passed": language == best_set}
+                for language, value in metrics.items()
+            },
+        },
+    }
+
+
+def test_sanity_sets_line_names_the_best_set_first_then_the_others() -> None:
+    """A reader must see which language carried the variant and what the rest measured."""
+    report = _sanity_report(
+        True, "en", "cosine_min", {"en": 0.999612, "ja": 0.989234, "zh": 0.991201}
+    )
+
+    assert pipeline._sanity_sets_line(report) == "pass (best=en 0.99961; ja 0.98923, zh 0.99120)"
+
+
+def test_sanity_sets_line_keeps_the_recorded_set_order_for_the_others() -> None:
+    """The others are listed in evaluation order, whichever set turned out best."""
+    report = _sanity_report(
+        True, "zh", "cosine_min", {"en": 0.980000, "ja": 0.985000, "zh": 0.999000}
+    )
+
+    assert pipeline._sanity_sets_line(report) == "pass (best=zh 0.99900; en 0.98000, ja 0.98500)"
+
+
+def test_sanity_sets_line_reports_a_failure_verdict() -> None:
+    """No set passing must read as a failure, with the closest set still named."""
+    report = _sanity_report(False, "ja", "cosine_min", {"en": 0.900000, "ja": 0.980000})
+
+    assert pipeline._sanity_sets_line(report) == "fail (best=ja 0.98000; en 0.90000)"
+
+
+def test_sanity_sets_line_reports_the_reranker_metric() -> None:
+    """A reranker's sets are measured by their sigmoid difference, not by a cosine."""
+    report = _sanity_report(
+        True, "ja", "sigmoid_max_abs_diff", {"en": 0.031000, "ja": 0.001200, "zh": 0.004500}
+    )
+
+    assert pipeline._sanity_sets_line(report) == "pass (best=ja 0.00120; en 0.03100, zh 0.00450)"
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {"status": "skipped", "reason": "--skip-selfcheck was given"},
+        {"status": "failed", "error": "cannot load the compiled model"},
+        {"status": "passed", "sanity": {"passed": True, "cosine_min": 0.99}},
+        {"status": "passed", "sanity": {"passed": True, "sets": {}, "best_set": None}},
+        {"status": "passed", "sanity": {"passed": True, "sets": {"en": 0.99}, "best_set": "en"}},
+    ],
+    ids=["skipped", "internal-error", "no-sets", "empty-sets", "unreadable-set"],
+)
+def test_sanity_sets_line_is_absent_without_per_set_measurements(report: dict[str, Any]) -> None:
+    """A report that measured no set must produce no line rather than an empty one."""
+    assert pipeline._sanity_sets_line(report) is None
+
+
+def test_run_selfcheck_prints_the_sanity_language_sets(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The per-set measurements must reach stderr, alongside the bucket they belong to."""
+    report = _sanity_report(
+        True, "en", "cosine_min", {"en": 0.999612, "ja": 0.989234, "zh": 0.991201}
+    )
+    context = pipeline._CompileContext(
+        args=argparse.Namespace(source="stub-source", skip_selfcheck=False),
+        model_dir=tmp_path,
+        model_id="stub-model",
+        kind="embedding",
+        pooling="mean",
+        dense=None,
+        output_name="embedding",
+        batch_size=1,
+        model_root=tmp_path,
+        tokenizer_path=tmp_path / "tokenizer.json",
+        versions={"eeane": "0.0"},
+        recorded_args={},
+        backend=None,
+        selfcheck_fn=lambda selfcheck_context: report,
+    )
+    plan = artifacts.VariantPlan(
+        seq_len=128,
+        stem="s128_b1_eager_macos13",
+        mlpackage_path=tmp_path / "s128.mlpackage",
+        mlmodelc_path=tmp_path / "s128.mlmodelc",
+        metadata_path=tmp_path / "s128.json",
+        convert=True,
+    )
+
+    assert pipeline._run_selfcheck(context, plan) == report
+    stderr = capsys.readouterr().err
+    assert "s128: sanity" in stderr
+    assert "pass (best=en 0.99961; ja 0.98923, zh 0.99120)" in stderr
 
 
 def test_verification_long_input_scales_with_the_largest_bucket() -> None:
@@ -1267,7 +1581,12 @@ def test_run_reports_explicit_buckets_beyond_the_model_limit(
 # --- end-to-end on a synthetic ModernBERT (local only) -----------------------
 
 
-def _build_synthetic_model(path: Path, pooling_flag: str = "pooling_mode_mean_tokens") -> Path:
+def _build_synthetic_model(
+    path: Path,
+    pooling_flag: str = "pooling_mode_mean_tokens",
+    *,
+    dense_out: int | None = None,
+) -> Path:
     """Create a tiny randomly initialised ModernBERT model directory.
 
     The directory is a complete HuggingFace distribution-format model
@@ -1279,6 +1598,10 @@ def _build_synthetic_model(path: Path, pooling_flag: str = "pooling_mode_mean_to
         path: Directory to create (parents are created as needed).
         pooling_flag: sentence-transformers pooling flag to declare
             (``"pooling_mode_mean_tokens"`` or ``"pooling_mode_cls_token"``).
+        dense_out: Output width of a Dense projection to declare after the
+            pooling, complete with randomly initialised weights. ``None``
+            ships no ``modules.json`` at all, which is what most published
+            models look like.
 
     Returns:
         ``path``.
@@ -1324,6 +1647,16 @@ def _build_synthetic_model(path: Path, pooling_flag: str = "pooling_mode_mean_to
     (path / mb.POOLING_DIRNAME / "config.json").write_text(
         json.dumps({"word_embedding_dimension": 32, pooling_flag: True}), encoding="utf-8"
     )
+    if dense_out is not None:
+        dense_dir = _write_dense_declaration(path, in_features=32, out_features=dense_out)
+        generator = torch.Generator().manual_seed(7)
+        save_file(
+            {
+                "linear.weight": torch.rand(dense_out, 32, generator=generator) - 0.5,
+                "linear.bias": torch.rand(dense_out, generator=generator) - 0.5,
+            },
+            str(dense_dir / "model.safetensors"),
+        )
     return path
 
 
@@ -1695,6 +2028,51 @@ def test_e2e_cls_pooling_embedding_model_converts(
     assert (model_root / f"{E2E_STEM}.mlmodelc").is_dir()
 
 
+# Output width of the Dense projection the end-to-end test below declares:
+# different from the backbone's hidden size, so the compiled graph proves
+# it really applied the projection.
+_E2E_DENSE_OUT = 48
+
+
+def test_e2e_dense_embedding_model_converts_and_widens_the_embedding(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A declared Dense projection must reach the compiled graph and the metadata.
+
+    The real self-check runs here on purpose: it compares the compiled
+    model against the FP32 baseline, so it also proves both sides apply
+    the projection. Its measured ``embedding_dim`` is the width the graph
+    actually produces, not one this test derives from the declaration.
+    """
+    if not _E2E_AVAILABLE:
+        pytest.skip("end-to-end conversion needs a local machine with xcrun")
+    model_dir = _build_synthetic_model(
+        tmp_path_factory.mktemp("synthetic-dense") / "tiny-modernbert-dense",
+        dense_out=_E2E_DENSE_OUT,
+    )
+    out_dir = tmp_path_factory.mktemp("compile-dense") / "cache"
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        exit_code = pipeline.run(
+            _compile_args(str(model_dir), "--buckets", str(E2E_SEQ_LEN), "--out-dir", str(out_dir)),
+            selfcheck_fn=selfcheck.run_selfcheck,
+        )
+
+    model_root = out_dir / "compiled" / model_dir.name
+    assert exit_code == 0
+    assert (model_root / f"{E2E_STEM}.mlmodelc").is_dir()
+    metadata = json.loads((model_root / f"{E2E_STEM}.json").read_text(encoding="utf-8"))
+    assert metadata["variant"]["dense"] == [
+        {"in": 32, "out": _E2E_DENSE_OUT, "bias": True, "activation": "identity"}
+    ]
+    assert metadata["selfcheck"]["sanity"]["passed"] is True
+    info = json.loads((model_root / artifacts.MODEL_INFO_FILENAME).read_text(encoding="utf-8"))
+    assert info["embedding_dim"] == _E2E_DENSE_OUT
+    assert info["dense"] == [
+        {"in": 32, "out": _E2E_DENSE_OUT, "bias": True, "activation": "identity"}
+    ]
+
+
 # --- batch families in the record and the snippet ----------------------------
 
 # Bucket the stub-driven runs of this section compile, small enough to
@@ -1724,10 +2102,10 @@ class _FamilyBackend(_StubBackend):
         """Report no known limit, so every requested bucket is compiled."""
         return None
 
-    def sanity_spec(self, kind: str) -> Any:
+    def sanity_spec(self, kind: str) -> base.SanitySpec:
         """Return the fixtures the tokenizer verification is built from."""
-        inputs: list[Any] = [("q", "d")] if kind == "reranker" else ["hello"]
-        return SimpleNamespace(inputs=inputs)
+        inputs: tuple[Any, ...] = (("q", "d"),) if kind == "reranker" else ("hello",)
+        return base.SanitySpec(input_sets=(("en", inputs),))
 
     def trace_example(self, kind: str) -> Any:
         """Return the fixed trace example of ``kind``."""
@@ -1785,7 +2163,9 @@ def _install_family_stubs(monkeypatch: pytest.MonkeyPatch, kind: str = "embeddin
     _install_stub_conversion(monkeypatch)
 
 
-def _stub_source(tmp_path: Path, *, pooling_flag: str | None = None) -> Path:
+def _stub_source(
+    tmp_path: Path, *, pooling_flag: str | None = None, dense_out: int | None = None
+) -> Path:
     """Create the minimal model directory a run resolves its source to.
 
     Args:
@@ -1794,6 +2174,9 @@ def _stub_source(tmp_path: Path, *, pooling_flag: str | None = None) -> Path:
             ``1_Pooling/config.json`` (e.g. ``"pooling_mode_mean_tokens"``).
             ``None`` (the default) leaves the model without one, matching
             every stub-driven test that never reads it.
+        dense_out: Output width of a Dense projection to declare after the
+            pooling. Only the declaration is written: the stubs never load
+            weights, and neither does the run's own recording of it.
 
     Returns:
         The created model directory.
@@ -1805,6 +2188,8 @@ def _stub_source(tmp_path: Path, *, pooling_flag: str | None = None) -> Path:
     )
     if pooling_flag is not None:
         _write_pooling_declaration(source, pooling_flag)
+    if dense_out is not None:
+        _write_dense_declaration(source, in_features=32, out_features=dense_out)
     return source
 
 
@@ -2028,3 +2413,76 @@ def test_a_reranker_stub_run_logs_no_pooling_line(
     assert _run_stub_compile(monkeypatch, source, out_dir, kind="reranker") == 0
 
     assert "pooling" not in capsys.readouterr().err
+
+
+# --- declared dense recorded by a whole run -----------------------------------
+
+
+def test_a_stub_run_records_the_declared_dense_in_variant_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The projection a model declares must reach the variant metadata."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_mean_tokens", dense_out=1024)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    metadata_path = out_dir / "compiled" / source.name / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["variant"]["dense"] == [
+        {"in": 32, "out": 1024, "bias": True, "activation": "identity"}
+    ]
+
+
+def test_a_stub_run_records_the_declared_dense_in_model_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The projection must reach model_info.json too, next to the pooling."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_mean_tokens", dense_out=768)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    assert _stub_model_info(out_dir, source)["dense"] == [
+        {"in": 32, "out": 768, "bias": True, "activation": "identity"}
+    ]
+
+
+def test_a_stub_run_without_a_declared_dense_records_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that projects nothing must say so explicitly, in both records."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_mean_tokens")
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    metadata_path = out_dir / "compiled" / source.name / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json"
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["variant"]["dense"] is None
+    assert _stub_model_info(out_dir, source)["dense"] is None
+
+
+def test_a_stub_run_logs_the_declared_dense(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The progress log must report the projection that is being baked in."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_mean_tokens", dense_out=1024)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    stderr = capsys.readouterr().err
+    assert "dense" in stderr
+    assert "32 -> 1024 (identity)" in stderr
+
+
+def test_a_stub_run_without_a_dense_logs_no_such_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A model without a projection must not gain a line about one."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_mean_tokens")
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    assert "dense" not in capsys.readouterr().err

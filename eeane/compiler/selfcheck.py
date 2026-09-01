@@ -12,10 +12,17 @@ compiled artifact itself):
 
 1. **Accuracy sanity** (:func:`_run_sanity`): the compiled model is loaded
    on ``CPU_AND_NE`` and compared against an FP32 (``sdpa``) reference,
-   using the exact fixtures and thresholds proven by
-   ``poc/convert_embedding.py``/``poc/convert_reranker.py``. A failure
-   here (a non-finite output or a threshold miss) makes the whole report
-   ``status="failed"`` -- this is the only check the pipeline reacts to.
+   using the thresholds proven by ``poc/convert_embedding.py``/
+   ``poc/convert_reranker.py``. The backend's fixtures come as one set
+   per language and each set is scored on its own, because a set in a
+   language the model has no vocabulary for encodes to little more than
+   unknown-token rows -- whose FP16-vs-FP32 difference says nothing about
+   the model, yet can still miss the threshold. The variant therefore
+   passes as soon as *any* set does, and the report records every set's
+   numbers plus the one it was accepted (or, having failed, best
+   described) on. A failure here -- no set clearing the threshold, or a
+   batch whose rows influence each other -- makes the whole report
+   ``status="failed"``; this is the only check the pipeline reacts to.
 2. **NE placement** (:func:`_compute_plan_report`): per-op device
    placement via ``MLComputePlan``, ported from
    ``poc/benchmark_latency.py``. Below
@@ -40,6 +47,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import coremltools as ct
@@ -175,47 +183,79 @@ def _run_sanity(
 def _sanity_embedding(
     context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    """Accuracy sanity check for an embedding variant (ported from poc/convert_embedding.py)."""
-    raw_texts: list[str] = list(context.backend.sanity_spec(context.kind).inputs)
+    """Accuracy sanity check for an embedding variant (ported from poc/convert_embedding.py).
+
+    The fixtures arrive as one set per language and the variant passes as
+    soon as any set clears the threshold (see :func:`_best_sanity_set`).
+    Every set's texts are predicted and referenced in one pass -- the sets
+    are concatenated, then split again by row -- so offering more of them
+    costs one more row each rather than another FP32 model load.
+    """
+    spec = context.backend.sanity_spec(context.kind)
+    raw_texts: list[str] = list(spec.all_inputs)
     tokens = runtime.tokenize_texts(frozen_tokenizer, raw_texts, context.seq_len)
     padding = runtime.tokenize_texts(
         frozen_tokenizer, [context.backend.padding_input(context.kind)], context.seq_len
     )
     output_key, coreml_emb = _predict_rows(compiled, tokens, padding, context.batch_size, context)
+    baseline_emb = context.backend.reference_outputs(
+        context.model_dir, context.kind, raw_texts, context.seq_len
+    )
+    cosines = _cosine_rowwise(coreml_emb, baseline_emb)
+
+    rows_per_set = _set_row_slices(spec.input_sets)
+    set_reports: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
+    for language, rows in rows_per_set.items():
+        set_cosines = cosines[rows]
+        cosine_min = float(set_cosines.min())
+        finite = bool(np.isfinite(coreml_emb[rows]).all())
+        set_reports[language] = {
+            "cosine_per_text": [float(value) for value in set_cosines],
+            "cosine_min": cosine_min,
+            "cosine_mean": float(set_cosines.mean()),
+            "finite": finite,
+            "passed": finite and bool(cosine_min >= SANITY_COSINE_THRESHOLD),
+        }
+        scores[language] = _set_score(cosine_min, finite)
+
+    best = _best_sanity_set(set_reports, scores)
+    best_rows = rows_per_set[best]
 
     consistency = None
     if context.batch_size > 1:
         consistency = _check_batch_consistency_embedding(
             compiled,
             frozen_tokenizer,
-            raw_texts[0],
+            raw_texts[best_rows.start],
             context.seq_len,
             context.batch_size,
             output_key,
         )
 
-    baseline_emb = context.backend.reference_outputs(
-        context.model_dir, context.kind, raw_texts, context.seq_len
-    )
-    cosines = _cosine_rowwise(coreml_emb, baseline_emb)
-    finite = bool(np.isfinite(coreml_emb).all())
+    best_report = set_reports[best]
     sanity = {
         "output_key": output_key,
         "batch_size": context.batch_size,
         "embedding_dim": int(coreml_emb.shape[1]),
-        "cosine_per_text": [float(c) for c in cosines],
-        "cosine_min": float(cosines.min()),
-        "cosine_mean": float(cosines.mean()),
+        # The established keys carry the best set's numbers, so a reader
+        # that predates the per-set sets sees the measurement the variant
+        # was actually accepted (or rejected) on.
+        "cosine_per_text": best_report["cosine_per_text"],
+        "cosine_min": best_report["cosine_min"],
+        "cosine_mean": best_report["cosine_mean"],
         "cosine_threshold": SANITY_COSINE_THRESHOLD,
         "batch_consistency": consistency,
-        "finite": finite,
+        "finite": best_report["finite"],
+        "sets": set_reports,
+        "best_set": best,
         "passed": (
-            finite
-            and bool(cosines.min() >= SANITY_COSINE_THRESHOLD)
+            any(report["passed"] for report in set_reports.values())
             and (consistency is None or bool(consistency["passed"]))
         ),
     }
-    return sanity, _first_predict_batch(tokens, padding, context.batch_size)
+    best_tokens = _slice_tokens(tokens, best_rows)
+    return sanity, _first_predict_batch(best_tokens, padding, context.batch_size)
 
 
 def _sanity_reranker(
@@ -223,72 +263,188 @@ def _sanity_reranker(
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Accuracy sanity check for a reranker variant (ported from poc/convert_reranker.py).
 
-    The expected ordering comes from the backend's sanity specification;
-    when it declares no relevant/irrelevant pair, the ordering check is
-    skipped and the report says so (``ordering_checked``) instead of
-    silently passing an unperformed check.
+    Like the embedding check, the fixtures arrive as one set per language,
+    every set is predicted and referenced in one pass, and the variant
+    passes as soon as any set does.
+
+    The expected ordering comes from the backend's sanity specification
+    and is checked *within* each set, whose pairs are built in the same
+    roles; when the spec declares no relevant/irrelevant pair, the
+    ordering check is skipped and the report says so (``ordering_checked``)
+    instead of silently passing an unperformed check.
     """
     spec = context.backend.sanity_spec(context.kind)
-    raw_pairs: list[tuple[str, str]] = [(query, document) for query, document in spec.inputs]
+    raw_pairs: list[tuple[str, str]] = [(query, document) for query, document in spec.all_inputs]
     tokens = runtime.tokenize_pairs(frozen_tokenizer, raw_pairs, context.seq_len)
     padding = runtime.tokenize_pairs(
         frozen_tokenizer, [context.backend.padding_input(context.kind)], context.seq_len
     )
     output_key, coreml_out = _predict_rows(compiled, tokens, padding, context.batch_size, context)
     coreml_logits = coreml_out.reshape(-1)
-
-    consistency = None
-    if context.batch_size > 1:
-        consistency = _check_batch_consistency_reranker(
-            compiled,
-            frozen_tokenizer,
-            raw_pairs[0],
-            context.seq_len,
-            context.batch_size,
-            output_key,
-        )
-
     fp32_logits = context.backend.reference_outputs(
         context.model_dir, context.kind, raw_pairs, context.seq_len
     )
     coreml_scores = runtime.sigmoid(coreml_logits)
     fp32_scores = runtime.sigmoid(fp32_logits)
     abs_diff = np.abs(coreml_scores - fp32_scores)
-    finite = bool(np.isfinite(coreml_logits).all() and np.isfinite(fp32_logits).all())
     ordering_checked = spec.relevant_index is not None and spec.irrelevant_index is not None
-    ordering_coreml = _check_ordering(coreml_scores, spec)
-    ordering_fp32 = _check_ordering(fp32_scores, spec)
-    max_abs_diff = float(abs_diff.max())
+
+    rows_per_set = _set_row_slices(spec.input_sets)
+    set_reports: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
+    for language, rows in rows_per_set.items():
+        max_abs_diff = float(abs_diff[rows].max())
+        finite = bool(
+            np.isfinite(coreml_logits[rows]).all() and np.isfinite(fp32_logits[rows]).all()
+        )
+        ordering_coreml = _check_ordering(coreml_scores[rows], spec)
+        ordering_fp32 = _check_ordering(fp32_scores[rows], spec)
+        set_reports[language] = {
+            "coreml_logits": [float(value) for value in coreml_logits[rows]],
+            "fp32_logits": [float(value) for value in fp32_logits[rows]],
+            "coreml_scores": [float(value) for value in coreml_scores[rows]],
+            "fp32_scores": [float(value) for value in fp32_scores[rows]],
+            "sigmoid_abs_diff": [float(value) for value in abs_diff[rows]],
+            "sigmoid_max_abs_diff": max_abs_diff,
+            "ordering_checked": ordering_checked,
+            "ordering_ok_coreml": ordering_coreml,
+            "ordering_ok_fp32": ordering_fp32,
+            "finite": finite,
+            "passed": (
+                finite
+                and max_abs_diff <= SANITY_SIGMOID_TOLERANCE
+                and (not ordering_checked or (bool(ordering_coreml) and bool(ordering_fp32)))
+            ),
+        }
+        # Negated: the closer to the baseline, the better the set, whereas
+        # _best_sanity_set always keeps the highest score.
+        scores[language] = _set_score(-max_abs_diff, finite)
+
+    best = _best_sanity_set(set_reports, scores)
+    best_rows = rows_per_set[best]
+
+    consistency = None
+    if context.batch_size > 1:
+        consistency = _check_batch_consistency_reranker(
+            compiled,
+            frozen_tokenizer,
+            raw_pairs[best_rows.start],
+            context.seq_len,
+            context.batch_size,
+            output_key,
+        )
+
+    best_report = set_reports[best]
     sanity = {
         "output_key": output_key,
         "batch_size": context.batch_size,
-        "coreml_logits": [float(v) for v in coreml_logits],
-        "fp32_logits": [float(v) for v in fp32_logits],
-        "coreml_scores": [float(v) for v in coreml_scores],
-        "fp32_scores": [float(v) for v in fp32_scores],
-        "sigmoid_abs_diff": [float(v) for v in abs_diff],
-        "sigmoid_max_abs_diff": max_abs_diff,
+        # As for an embedding variant: the established keys describe the
+        # best set, the per-set table below describes all of them.
+        "coreml_logits": best_report["coreml_logits"],
+        "fp32_logits": best_report["fp32_logits"],
+        "coreml_scores": best_report["coreml_scores"],
+        "fp32_scores": best_report["fp32_scores"],
+        "sigmoid_abs_diff": best_report["sigmoid_abs_diff"],
+        "sigmoid_max_abs_diff": best_report["sigmoid_max_abs_diff"],
+        "ordering_checked": best_report["ordering_checked"],
+        "ordering_ok_coreml": best_report["ordering_ok_coreml"],
+        "ordering_ok_fp32": best_report["ordering_ok_fp32"],
+        "finite": best_report["finite"],
         "sigmoid_tolerance": SANITY_SIGMOID_TOLERANCE,
-        "ordering_checked": ordering_checked,
-        "ordering_ok_coreml": ordering_coreml,
-        "ordering_ok_fp32": ordering_fp32,
         "batch_consistency": consistency,
-        "finite": finite,
+        "sets": set_reports,
+        "best_set": best,
         "passed": (
-            finite
-            and max_abs_diff <= SANITY_SIGMOID_TOLERANCE
-            and (not ordering_checked or (bool(ordering_coreml) and bool(ordering_fp32)))
+            any(report["passed"] for report in set_reports.values())
             and (consistency is None or bool(consistency["passed"]))
         ),
     }
-    return sanity, _first_predict_batch(tokens, padding, context.batch_size)
+    best_tokens = _slice_tokens(tokens, best_rows)
+    return sanity, _first_predict_batch(best_tokens, padding, context.batch_size)
+
+
+def _set_row_slices(input_sets: Sequence[tuple[str, Sequence[Any]]]) -> dict[str, slice]:
+    """Map every language set to the rows it occupies in the concatenated inputs.
+
+    The sets are predicted (and referenced) as one flat sequence of rows,
+    so each of them has to be found again by position afterwards.
+
+    Args:
+        input_sets: A :class:`eeane.compiler.backends.base.SanitySpec`'s
+            ordered ``(language, inputs)`` pairs.
+
+    Returns:
+        Language -> row slice, in the order the sets were declared in.
+    """
+    slices: dict[str, slice] = {}
+    start = 0
+    for language, inputs in input_sets:
+        end = start + len(inputs)
+        slices[language] = slice(start, end)
+        start = end
+    return slices
+
+
+def _set_score(metric: float, finite: bool) -> float:
+    """Rank one language set by its headline metric, higher being better.
+
+    Args:
+        metric: The set's metric, already oriented so that a larger value
+            is a better result.
+        finite: Whether the set's raw outputs were finite.
+
+    Returns:
+        ``metric``, or negative infinity when the set produced a
+        non-finite output or a metric that is not a number: such a set
+        must never be reported as the best one, whatever the others did.
+    """
+    return metric if finite and np.isfinite(metric) else float("-inf")
+
+
+def _best_sanity_set(set_reports: dict[str, dict[str, Any]], scores: dict[str, float]) -> str:
+    """Pick the language set a sanity report is summarized by.
+
+    A model is only measurable on fixtures its vocabulary covers, so the
+    self-check evaluates one set per language and accepts the variant as
+    soon as one of them passes. This picks which of them the report's
+    established keys describe: a passing set whenever there is one (the
+    reason the variant was accepted), else the closest set (the most
+    informative account of why it was not).
+
+    Args:
+        set_reports: Per-language report, in declaration order.
+        scores: Per-language rank from :func:`_set_score`.
+
+    Returns:
+        The chosen language. Two equally good sets resolve to the one
+        declared first, so a rerun of the same variant reports the same
+        set.
+    """
+    passing = [language for language, report in set_reports.items() if report["passed"]]
+    candidates = passing or list(set_reports)
+    return max(candidates, key=lambda language: scores[language])
+
+
+def _slice_tokens(tokens: dict[str, np.ndarray], rows: slice) -> dict[str, np.ndarray]:
+    """Keep only ``rows`` of a tokenized batch.
+
+    Args:
+        tokens: Tokenized rows, each value of shape (N, S).
+        rows: Rows to keep.
+
+    Returns:
+        Dict with the same keys, each value of shape (len(rows), S).
+    """
+    return {key: value[rows] for key, value in tokens.items()}
 
 
 def _check_ordering(scores: np.ndarray, spec: Any) -> bool | None:
     """Report whether the relevant input scored above the irrelevant one.
 
     Args:
-        scores: One score per sanity input, in the spec's own order.
+        scores: One score per input of *one* language set, in that set's
+            own order. The spec's indices address every set alike, since
+            each of them puts its pairs in the same roles.
         spec: The backend's sanity specification
             (:class:`eeane.compiler.backends.base.SanitySpec`).
 

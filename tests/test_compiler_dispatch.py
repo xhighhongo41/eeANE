@@ -109,6 +109,39 @@ def test_resolve_dispatch_detects_an_xlm_roberta_reranker(tmp_path: Path) -> Non
     assert result.backend_name == "XLMRoberta"
 
 
+def test_resolve_dispatch_detects_a_roberta_embedding_model(tmp_path: Path) -> None:
+    """A bare RobertaModel must be dispatched to the XLM-RoBERTa backend.
+
+    RoBERTa and XLM-RoBERTa are structurally identical in the HF
+    implementation (they differ only in vocabulary), so the XLM-RoBERTa
+    backend covers RoBERTa checkpoints too. It is matched through its own
+    ``Roberta`` registry key, but that key resolves to the very same
+    backend class as ``XLMRoberta``.
+    """
+    model_dir = _write_config(tmp_path / "m", {"architectures": ["RobertaModel"]})
+
+    result = dispatch.resolve_dispatch(model_dir)
+
+    assert result.kind == dispatch.KIND_EMBEDDING
+    assert result.architecture == "RobertaModel"
+    assert result.backend_name == "Roberta"
+    assert result.load_backend().name == "XLMRoberta"
+
+
+def test_resolve_dispatch_detects_a_roberta_reranker(tmp_path: Path) -> None:
+    """RobertaForSequenceClassification must be dispatched as a reranker on XLM-RoBERTa."""
+    model_dir = _write_config(
+        tmp_path / "m", {"architectures": ["RobertaForSequenceClassification"]}
+    )
+
+    result = dispatch.resolve_dispatch(model_dir)
+
+    assert result.kind == dispatch.KIND_RERANKER
+    assert result.architecture == "RobertaForSequenceClassification"
+    assert result.backend_name == "Roberta"
+    assert result.load_backend().name == "XLMRoberta"
+
+
 def test_no_registry_key_is_a_prefix_of_another_one() -> None:
     """Prefix matching stays unambiguous only while no key starts with another key."""
     keys = list(dispatch.BACKEND_REGISTRY)
@@ -126,9 +159,11 @@ def test_no_registry_key_is_a_prefix_of_another_one() -> None:
         ("ModernBertModel", dispatch.KIND_EMBEDDING),
         ("BertModel", dispatch.KIND_EMBEDDING),
         ("XLMRobertaModel", dispatch.KIND_EMBEDDING),
+        ("RobertaModel", dispatch.KIND_EMBEDDING),
         ("ModernBertForSequenceClassification", dispatch.KIND_RERANKER),
         ("BertForSequenceClassification", dispatch.KIND_RERANKER),
         ("XLMRobertaForSequenceClassification", dispatch.KIND_RERANKER),
+        ("RobertaForSequenceClassification", dispatch.KIND_RERANKER),
         ("ModernBertForMaskedLM", None),
         ("BertForMaskedLM", None),
         ("XLMRobertaForMaskedLM", None),
@@ -286,6 +321,7 @@ def test_resolve_dispatch_bad_architectures_field(tmp_path: Path, config: object
         ("BertModel", "BertBackend", "Bert"),
         ("ModernBertModel", "ModernBertBackend", "ModernBert"),
         ("XLMRobertaModel", "XlmRobertaBackend", "XLMRoberta"),
+        ("RobertaModel", "XlmRobertaBackend", "XLMRoberta"),
     ],
 )
 def test_dispatch_load_backend_returns_the_registered_backend(

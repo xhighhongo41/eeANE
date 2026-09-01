@@ -70,7 +70,11 @@ from eeane.compiler.artifacts import (
     write_config_snippet,
     write_json_record,
 )
-from eeane.compiler.backends.common import read_pooling_mode
+from eeane.compiler.backends.common import (
+    dense_record,
+    read_dense_modules,
+    read_pooling_mode,
+)
 from eeane.compiler.dispatch import DispatchError, resolve_dispatch
 from eeane.compiler.tokenizer_freeze import (
     TokenizerFreezeError,
@@ -107,6 +111,12 @@ _VERIFICATION_LONG_UNIT = "これはトークナイザ凍結検証用の長い�
 # Degenerate tokenizer-verification inputs: empty, whitespace-only and
 # single-character strings (both ASCII and Japanese).
 _VERIFICATION_BOUNDARY_TEXTS: tuple[str, ...] = ("", " ", "a", "あ")
+
+# Headline metric of one sanity language set, per model kind, as recorded
+# by a self-check report. The progress line below reads whichever of them
+# the report carries, so it describes an embedding and a reranker variant
+# without knowing which one it was handed.
+_SANITY_SET_METRIC_KEYS: tuple[str, ...] = ("cosine_min", "sigmoid_max_abs_diff")
 
 
 class SelfcheckFailedError(CompileError):
@@ -167,6 +177,10 @@ class _CompileContext:
             declaration) or when the declaration could not be read; the
             backend's own ``load()`` is what raises on that for an
             embedding model, this field simply has nothing to record.
+        dense: Dense projections the embedding model declares after its
+            pooling, resolved once via :func:`_declared_dense`; ``None``
+            when it declares none, for a reranker, or when the
+            declaration could not be read.
         output_name: Core ML graph output name for ``kind``.
         batch_size: Fixed batch size B.
         model_root: ``<out-dir>/compiled/<model-name>`` directory.
@@ -182,6 +196,7 @@ class _CompileContext:
     model_id: str
     kind: str
     pooling: str | None
+    dense: tuple[dict[str, Any], ...] | None
     output_name: str
     batch_size: int
     model_root: Path
@@ -233,6 +248,11 @@ def verification_inputs(
     (empty, whitespace-only, single character, and a text far longer than
     the largest bucket) -- never repository test data.
 
+    Every language set of the sanity fixtures is taken in, not just one:
+    the self-check may accept a variant on any of them, and this gate
+    compares token sequences, which is language-agnostic -- so covering
+    all of them only widens it.
+
     Args:
         backend: Loaded compile backend instance.
         kind: Resolved model kind.
@@ -247,7 +267,7 @@ def verification_inputs(
     texts: list[str] = [*_VERIFICATION_BOUNDARY_TEXTS, long_text]
     pairs: list[tuple[str, str]] = []
 
-    sanity_inputs = list(backend.sanity_spec(kind).inputs)
+    sanity_inputs = list(backend.sanity_spec(kind).all_inputs)
     if kind == "reranker":
         sanity_pairs = [(query, document) for query, document in sanity_inputs]
         trace_pair = tuple(backend.trace_example(kind))
@@ -292,6 +312,9 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     pooling = _declared_pooling(kind, model_dir)
     if pooling is not None:
         _progress(f"      pooling         : {pooling}")
+    dense = _declared_dense(kind, model_dir)
+    if dense is not None:
+        _progress(f"      dense           : {_dense_summary(dense)}")
 
     out_root = resolve_out_root(args.out_dir)
     model_root = out_root / CACHE_SUBDIR / model_cache_name(args.source, model_dir)
@@ -322,6 +345,7 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
         model_id=model_identifier(args.source, model_dir),
         kind=kind,
         pooling=pooling,
+        dense=dense,
         output_name=output_name,
         batch_size=batch_size,
         model_root=model_root,
@@ -553,6 +577,48 @@ def _declared_pooling(kind: str, model_dir: Path) -> str | None:
         return None
 
 
+def _declared_dense(kind: str, model_dir: Path) -> tuple[dict[str, Any], ...] | None:
+    """Best-effort read of the Dense projection an embedding model declares.
+
+    Like :func:`_declared_pooling`, this is for *recording and comparing*
+    what a run compiled rather than an authoritative gate: an embedding
+    backend's own ``load()`` is what refuses a module chain it cannot
+    reproduce, with a full explanation, and that error must reach the user
+    unchanged.
+
+    Args:
+        kind: Resolved model kind.
+        model_dir: Read-only model directory.
+
+    Returns:
+        One record per declared projection stage, or ``None`` for a model
+        that declares none, for a reranker (whose score comes from its own
+        classification head, never from a sentence-transformers chain), or
+        when the declaration cannot be read.
+    """
+    if kind == "reranker":
+        return None
+    try:
+        return dense_record(read_dense_modules(model_dir))
+    except ValueError:
+        return None
+
+
+def _dense_summary(dense: Sequence[Mapping[str, Any]]) -> str:
+    """Summarize the declared projection for the progress log.
+
+    Args:
+        dense: Records of the declared stages, in application order.
+
+    Returns:
+        A line like ``"384 -> 1024 (identity)"``, with the stages of a
+        multi-stage projection separated by commas.
+    """
+    return ", ".join(
+        f"{stage.get('in')} -> {stage.get('out')} ({stage.get('activation')})" for stage in dense
+    )
+
+
 def _convert_variants(
     context: _CompileContext, plans: Sequence[VariantPlan]
 ) -> dict[int, dict[str, Any]]:
@@ -764,6 +830,7 @@ def _plan_variants(context: _CompileContext, buckets: Sequence[int]) -> list[Var
                     context.versions,
                     force=bool(context.args.force),
                     pooling=context.pooling,
+                    dense=context.dense,
                 ),
             )
         )
@@ -852,7 +919,69 @@ def _run_selfcheck(context: _CompileContext, plan: VariantPlan) -> dict[str, Any
             f"the self-check of bucket {plan.seq_len} returned {type(report).__name__}, "
             "expected a report dict"
         )
+    sets_line = _sanity_sets_line(report)
+    if sets_line is not None:
+        _progress(f"      s{plan.seq_len}: sanity : {sets_line}")
     return report
+
+
+def _sanity_sets_line(report: Mapping[str, Any]) -> str | None:
+    """Summarize a self-check report's per-language sanity sets in one line.
+
+    The accuracy sanity is evaluated once per language set and the variant
+    is accepted as soon as one of them clears the threshold, so the number
+    the self-check's own summary prints is the *best* set's. This line
+    adds what that summary cannot show: which set that was, and how close
+    the others came -- the two facts a reader needs to tell a genuinely
+    accurate variant from one that only one language happened to carry.
+
+    Args:
+        report: A self-check report, as stored under the variant
+            metadata's ``selfcheck`` key. Any shape is tolerated: the hook
+            is pluggable, and a run must not fail over its progress line.
+
+    Returns:
+        A line like ``"pass (best=en 0.99961; ja 0.98923, zh 0.99120)"``,
+        or ``None`` when the report carries no per-set measurements at all
+        (a skipped self-check, or one that failed before measuring).
+    """
+    sanity = report.get("sanity")
+    if not isinstance(sanity, dict):
+        return None
+    sets = sanity.get("sets")
+    best = sanity.get("best_set")
+    if not isinstance(sets, dict) or not isinstance(best, str) or best not in sets:
+        return None
+    best_report = sets[best]
+    if not isinstance(best_report, Mapping):
+        return None
+    metric_key = next((key for key in _SANITY_SET_METRIC_KEYS if key in best_report), None)
+    if metric_key is None:
+        return None
+
+    verdict = "pass" if sanity.get("passed") else "fail"
+    line = f"{verdict} (best={best} {_sanity_metric(best_report, metric_key)}"
+    others = [language for language in sets if language != best]
+    if others:
+        line += "; " + ", ".join(
+            f"{language} {_sanity_metric(sets[language], metric_key)}" for language in others
+        )
+    return f"{line})"
+
+
+def _sanity_metric(set_report: Any, metric_key: str) -> str:
+    """Format one sanity set's headline metric for the progress line.
+
+    Args:
+        set_report: That set's entry in the report's ``sets`` table.
+        metric_key: Key the metric is recorded under.
+
+    Returns:
+        The value to five decimals, or ``"n/a"`` when the set did not
+        record a number under ``metric_key``.
+    """
+    value = set_report.get(metric_key) if isinstance(set_report, Mapping) else None
+    return f"{value:.5f}" if isinstance(value, int | float) else "n/a"
 
 
 def _build_metadata(
@@ -877,10 +1006,10 @@ def _build_metadata(
         selfcheck: Self-check report (possibly ``status="skipped"``).
 
     Returns:
-        A JSON-serializable metadata record. Its ``variant.pooling`` is
-        ``None`` (JSON ``null``) for a reranker, or when the embedding
-        model's declaration could not be read; see
-        :attr:`_CompileContext.pooling`.
+        A JSON-serializable metadata record. Its ``variant.pooling`` and
+        ``variant.dense`` are ``None`` (JSON ``null``) for a reranker, or
+        when the embedding model's declaration could not be read; see
+        :attr:`_CompileContext.pooling` and :attr:`_CompileContext.dense`.
     """
     return {
         "format_version": METADATA_FORMAT_VERSION,
@@ -892,6 +1021,7 @@ def _build_metadata(
             "kind": context.kind,
             "output_name": context.output_name,
             "pooling": context.pooling,
+            "dense": context.dense,
         },
         "args": dict(context.recorded_args),
         "versions": dict(context.versions),
@@ -939,15 +1069,17 @@ def _build_model_info(
         A JSON-serializable summary; the input ``eeane.config``'s cache
         auto-resolution reads, hence the ``format_version``. The batched
         table is an addition a reader that does not know it simply
-        ignores, so it needs no new ``format_version``. ``pooling`` is
-        another such addition: ``None`` (JSON ``null``) for a reranker,
-        or when the embedding model's declaration could not be read.
+        ignores, so it needs no new ``format_version``. ``pooling`` and
+        ``dense`` are two more such additions: both are ``None`` (JSON
+        ``null``) for a reranker, or when the embedding model's
+        declaration could not be read.
     """
     record: dict[str, Any] = {
         "format_version": MODEL_INFO_FORMAT_VERSION,
         "id": context.model_id,
         "kind": context.kind,
         "pooling": context.pooling,
+        "dense": context.dense,
         "output_name": context.output_name,
         "buckets": sorted(artifacts),
         "tokenizer": TOKENIZER_FILENAME,

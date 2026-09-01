@@ -30,7 +30,7 @@ KINDS: tuple[str, ...] = (KIND_EMBEDDING, KIND_RERANKER)
 SUPPORTED_ARCHITECTURES = (
     "BERT embedding models (e.g. BAAI/bge-large-en-v1.5), "
     "ModernBERT (e.g. cl-nagoya/ruri-v3-310m) and "
-    "XLM-RoBERTa (e.g. intfloat/multilingual-e5-base, BAAI/bge-reranker-v2-m3)"
+    "XLM-RoBERTa / RoBERTa (e.g. intfloat/multilingual-e5-base, BAAI/bge-reranker-v2-m3)"
 )
 
 # Architecture-name prefix -> "module:attribute" of the backend class. The
@@ -41,6 +41,7 @@ BACKEND_REGISTRY: dict[str, str] = {
     "Bert": "eeane.compiler.backends.bert:BertBackend",
     "ModernBert": "eeane.compiler.backends.modernbert:ModernBertBackend",
     "XLMRoberta": "eeane.compiler.backends.xlm_roberta:XlmRobertaBackend",
+    "Roberta": "eeane.compiler.backends.xlm_roberta:XlmRobertaBackend",
 }
 
 # Architecture-name suffix that identifies a cross-encoder reranker.

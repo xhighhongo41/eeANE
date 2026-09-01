@@ -18,7 +18,11 @@ Adding a backend
 1. Create ``eeane/compiler/backends/<family>.py`` with a class implementing
    every member listed below (structural typing: no base class to inherit).
 2. Register it in :data:`eeane.compiler.dispatch.BACKEND_REGISTRY`, keyed by
-   the architecture-name prefix that ``config.json`` reports.
+   the architecture-name prefix that ``config.json`` reports. An existing
+   backend may be registered under more than one prefix when another
+   architecture is, for compilation purposes, the same encoder (e.g.
+   ``Roberta`` alongside ``XLMRoberta``): add the extra key pointing at
+   the same backend target instead of duplicating the implementation.
 3. Add unit tests covering the fixtures, the kind validation and the
    effective maximum sequence length; add local-only tests for anything
    that needs real weights.
@@ -57,7 +61,8 @@ Members to implement:
 ``trace_example(kind)``
     One fixed raw input used to build the tracing example.
 ``sanity_spec(kind)``
-    Fixed self-check inputs plus their expected-ordering metadata.
+    Fixed self-check inputs -- one set per language -- plus their
+    expected-ordering metadata.
 ``padding_input(kind)``
     Filler raw input used to pad a partial batch. It must encode to a
     non-empty attention mask, since a fully masked row can produce NaN.
@@ -79,7 +84,7 @@ The pipeline drives them in this order::
         ...                                             # trace/convert/compile
     spec = backend.sanity_spec(kind)                    # once per variant
     reference = backend.reference_outputs(
-        model_dir, kind, list(spec.inputs), seq_len
+        model_dir, kind, list(spec.all_inputs), seq_len
     )
 
 Rules every backend must follow:
@@ -139,6 +144,17 @@ class LoadedModel:
         pooling: Pooling mode of an embedding model (e.g. ``"mean"`` or
             ``"cls"``); ``None`` for a reranker, whose head is part of the
             model itself.
+        dense: ``torch.nn.Module`` projecting the pooled vector of an
+            embedding model whose sentence-transformers module chain
+            declares one; ``None`` when nothing is declared (the common
+            case) and always for a reranker. Both the traced wrapper and
+            the FP32 baseline apply this very module, so that the two
+            sides of the self-check keep computing the same function.
+        dense_config: JSON-serializable description of ``dense`` -- one
+            entry per projection stage -- recorded in the compiled
+            variant's metadata so a later run can tell whether the model's
+            declaration still matches the artifact. ``None`` whenever
+            ``dense`` is.
     """
 
     model: Any
@@ -148,48 +164,114 @@ class LoadedModel:
     kind: str
     attn: str
     pooling: str | None = None
+    dense: Any = None
+    dense_config: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True)
 class SanitySpec:
-    """Fixed sanity-check inputs plus their expected-ordering metadata.
+    """Fixed sanity-check inputs, one set per language, plus their metadata.
 
     Everything the self-check knows about a backend's sanity fixtures is
     in here: it never reads a backend module's constants directly.
 
+    The fixtures are grouped by language because a checkpoint's vocabulary
+    decides how much a set can say about it: fixtures in a language the
+    model has no vocabulary for encode to little more than unknown-token
+    rows, whose FP16-vs-FP32 difference says nothing about the model but
+    can still miss the accuracy threshold. The self-check therefore
+    evaluates every set and accepts the variant when *any* of them passes,
+    which is why the sets have to reach it separately rather than merged
+    into one list.
+
     Attributes:
-        inputs: Raw inputs -- texts for an embedding model, ``(query,
-            document)`` pairs for a reranker. Immutable on purpose: the
-            same fixtures are fed to the compiled model and to the FP32
-            reference, so a caller must not be able to change them.
-        relevant_index: Index into :attr:`inputs` of the pair expected to
+        input_sets: Ordered ``(language, inputs)`` pairs, one per language
+            the backend offers fixtures in. ``inputs`` are raw inputs --
+            texts for an embedding model, ``(query, document)`` pairs for
+            a reranker. Both levels are tuples on purpose: the same
+            fixtures are fed to the compiled model and to the FP32
+            reference, so a caller must not be able to change them. The
+            order is part of the contract -- it decides the order rows are
+            predicted in and the set a tie between two equally good sets
+            resolves to.
+        relevant_index: Index *within every set* of the pair expected to
             score *higher*, or ``None`` when the fixtures carry no
-            ordering expectation (always the case for embeddings).
-        irrelevant_index: Index into :attr:`inputs` of the pair expected
+            ordering expectation (always the case for embeddings). Every
+            set is built with its pairs in the same roles, so one index
+            applies to all of them.
+        irrelevant_index: Index *within every set* of the pair expected
             to score *lower*, or ``None``. The ordering check runs only
             when both indices are given.
     """
 
-    inputs: tuple[Any, ...]
+    input_sets: tuple[tuple[str, tuple[Any, ...]], ...]
     relevant_index: int | None = None
     irrelevant_index: int | None = None
 
     def __post_init__(self) -> None:
-        """Validate that the declared indices address existing inputs.
+        """Validate the declared sets and the indices addressing them.
 
         Raises:
-            ValueError: If an index is negative or beyond the last input;
-                such a spec would only surface as an ``IndexError`` deep
-                inside the self-check.
+            TypeError: If a set's inputs are not held in a tuple, which
+                would leave the fixtures mutable by their consumers.
+            ValueError: If no set is declared, a set is empty, two sets
+                share a language (one would silently overwrite the other
+                in the self-check's per-language report), or an index is
+                negative or beyond the last input of a set; any of those
+                would only surface deep inside the self-check.
+        """
+        if not self.input_sets:
+            raise ValueError("a sanity spec declares no sanity input set")
+        seen: set[str] = set()
+        for language, inputs in self.input_sets:
+            if language in seen:
+                raise ValueError(f"the sanity language '{language}' is declared more than once")
+            seen.add(language)
+            if not isinstance(inputs, tuple):
+                raise TypeError(
+                    f"the '{language}' sanity inputs are a {type(inputs).__name__}, "
+                    "expected a tuple"
+                )
+            if not inputs:
+                raise ValueError(f"the '{language}' sanity input set is empty")
+            self._check_indices(language, inputs)
+
+    def _check_indices(self, language: str, inputs: tuple[Any, ...]) -> None:
+        """Validate both ordering indices against one set's inputs.
+
+        Args:
+            language: Language of the set being validated, named in the
+                error so the offending set is identifiable.
+            inputs: That set's inputs.
+
+        Raises:
+            ValueError: If an index is negative or beyond the last input.
         """
         for field_name in ("relevant_index", "irrelevant_index"):
             index = getattr(self, field_name)
             if index is None:
                 continue
-            if not 0 <= index < len(self.inputs):
+            if not 0 <= index < len(inputs):
                 raise ValueError(
-                    f"{field_name}={index} is out of range for {len(self.inputs)} sanity input(s)"
+                    f"{field_name}={index} is out of range for the {len(inputs)} "
+                    f"'{language}' sanity input(s)"
                 )
+
+    @property
+    def languages(self) -> tuple[str, ...]:
+        """Return the declared languages, in :attr:`input_sets` order."""
+        return tuple(language for language, _ in self.input_sets)
+
+    @property
+    def all_inputs(self) -> tuple[Any, ...]:
+        """Return every set's inputs concatenated in :attr:`input_sets` order.
+
+        For consumers that treat the fixtures as one flat collection (the
+        tokenizer-verification gate, which compares token sequences and
+        is therefore language-agnostic) rather than evaluating them set by
+        set.
+        """
+        return tuple(item for _, inputs in self.input_sets for item in inputs)
 
 
 class CompileBackend(Protocol):

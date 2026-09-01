@@ -1,11 +1,15 @@
 """XLM-RoBERTa compile backend.
 
 Covers the encoder family whose ``config.json`` reports an architecture
-starting with ``XLMRoberta`` -- multilingual embedding models
-(``XLMRobertaModel`` plus a sentence-transformers pooling module, e.g.
-``intfloat/multilingual-e5-base``) and cross-encoder rerankers
+starting with ``XLMRoberta`` or ``Roberta`` -- multilingual embedding
+models (``XLMRobertaModel`` plus a sentence-transformers pooling module,
+e.g. ``intfloat/multilingual-e5-base``) and cross-encoder rerankers
 (``XLMRobertaForSequenceClassification`` with a single output label, e.g.
-``BAAI/bge-reranker-v2-m3``).
+``BAAI/bge-reranker-v2-m3``). RoBERTa checkpoints share this backend
+because the two architectures are the same encoder in the HF
+implementation -- both use ``padding_idx = 1`` with position ids starting
+at ``padding_idx + 1`` -- and differ only in vocabulary (BPE), which the
+conversion graph never depends on.
 
 Two properties set this family apart from the other backends:
 
@@ -19,9 +23,10 @@ Two properties set this family apart from the other backends:
 
 The pooling of an embedding model is not part of the HF configuration; it
 is declared by the sentence-transformers pooling module in the model
-directory, which this backend reads (and refuses to guess) through the
-shared reader in :mod:`eeane.compiler.backends.common`, re-exported here
-so that the names stay reachable under this module.
+directory, as are the Dense projections that may follow it. This backend
+reads both (and refuses to guess either) through the shared readers in
+:mod:`eeane.compiler.backends.common`, re-exported here so that the names
+stay reachable under this module.
 
 Importing this module pulls in ``torch``/``transformers``; it therefore
 requires the ``[compile]`` extra and must never be imported from the
@@ -46,10 +51,15 @@ from eeane.compiler.backends.common import (
     POOLING_MEAN,
     POOLING_MODE_KEYS,
     POOLING_MODE_PREFIX,
+    SANITY_IRRELEVANT_INDEX,
+    SANITY_PAIR_SETS,
+    SANITY_RELEVANT_INDEX,
+    SANITY_TEXT_SETS,
     ClsEmbeddingWrapper,
     EmbeddingWrapper,
     RerankerWrapper,
     encode_pytorch,
+    load_dense,
     read_pooling_mode,
     score_pytorch,
     tokenize_batch,
@@ -68,11 +78,12 @@ __all__ = [
     "POOLING_MODE_KEYS",
     "POOLING_MODE_PREFIX",
     "POSITION_OFFSET",
-    "SANITY_PAIRS",
+    "SANITY_PAIR_SETS",
     "SANITY_SPECS",
-    "SANITY_TEXTS",
+    "SANITY_TEXT_SETS",
     "SUPPORTED_KINDS",
     "XlmRobertaBackend",
+    "load_dense",
     "read_pooling_mode",
 ]
 
@@ -102,16 +113,6 @@ POSITION_OFFSET = 2
 # Short Japanese sentence used as the example input for torch.jit.trace.
 TRACE_EXAMPLE_TEXT = "変換に使う短い日本語のサンプル文です。"
 
-# Fixed sanity-check sentences (short / medium / long) exercising different
-# amounts of padding under the same fixed sequence length.
-SANITY_TEXTS: list[str] = [
-    "質問: 富士山の標高は何メートルですか。",
-    "文書: 富士山は静岡県と山梨県にまたがる標高3776メートルの山であり、"
-    "日本の最高峰として知られている。",
-    "話題: 大量の文書をあらかじめベクトルに変換して保存しておくと、"
-    "検索のたびに本文を読み直さずに近い意味の文書を取り出せる。",
-]
-
 # Short Japanese (query, document) pair used as the example input for
 # torch.jit.trace of a reranker.
 TRACE_EXAMPLE_PAIR: tuple[str, str] = (
@@ -119,34 +120,19 @@ TRACE_EXAMPLE_PAIR: tuple[str, str] = (
     "変換に使うサンプルの文書です。",
 )
 
-# Fixed sanity-check pairs: relevant / irrelevant / partially related. The
-# first two share their query, so only the document decides which of them
-# must score higher.
-SANITY_PAIRS: list[tuple[str, str]] = [
-    # Relevant pair
-    (
-        "富士山の標高は何メートルですか。",
-        "富士山は静岡県と山梨県にまたがる標高3776メートルの山であり、日本の最高峰として知られている。",
-    ),
-    # Irrelevant pair
-    (
-        "富士山の標高は何メートルですか。",
-        "味噌汁の出汁は昆布と鰹節を組み合わせると香りが良くなると言われている。",
-    ),
-    # Partially related pair
-    (
-        "ベクトル検索の仕組みを知りたい。",
-        "図書館では蔵書を著者名の五十音順に並べて管理している。",
-    ),
-]
-
-# Sanity fixtures per kind, as handed to the pipeline and the self-check.
-# The reranker is expected to score pair 0 above pair 1; embeddings are
-# compared row by row against their own baseline and carry no ordering
-# expectation.
+# Sanity fixtures per kind, as handed to the pipeline and the self-check:
+# the shared per-language sets, unchanged -- this family is multilingual,
+# so it has no reason to prefer fixtures of its own for any language. The
+# reranker is expected to score pair 0 of a set above pair 1; embeddings
+# are compared row by row against their own baseline and carry no
+# ordering expectation.
 SANITY_SPECS: dict[str, SanitySpec] = {
-    KIND_EMBEDDING: SanitySpec(inputs=tuple(SANITY_TEXTS)),
-    KIND_RERANKER: SanitySpec(inputs=tuple(SANITY_PAIRS), relevant_index=0, irrelevant_index=1),
+    KIND_EMBEDDING: SanitySpec(input_sets=SANITY_TEXT_SETS),
+    KIND_RERANKER: SanitySpec(
+        input_sets=SANITY_PAIR_SETS,
+        relevant_index=SANITY_RELEVANT_INDEX,
+        irrelevant_index=SANITY_IRRELEVANT_INDEX,
+    ),
 }
 
 # Filler rows used to pad the last sanity batch when the number of sanity
@@ -185,17 +171,22 @@ class XlmRobertaBackend:
             A handle holding the model in eval/FP32 mode with
             ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
             outputs), its tokenizer, its configuration and -- for an
-            embedding model -- the pooling declared by the model directory.
+            embedding model -- the pooling and the Dense projection
+            declared by the model directory.
 
         Raises:
-            ValueError: If ``kind`` is not supported by this backend, or if
-                the pooling of an embedding model cannot be determined.
+            ValueError: If ``kind`` is not supported by this backend, if
+                the pooling of an embedding model cannot be determined, or
+                if its declared module chain cannot be reproduced.
         """
         self._check_kind(kind)
-        # Detected before the weights are read: an undeclared pooling makes
-        # the model uncompilable, and finding that out first avoids loading
-        # gigabytes of FP32 parameters for nothing.
+        # Both declarations are read before the weights: an undeclared
+        # pooling or an unreproducible module chain makes the model
+        # uncompilable, and finding that out first avoids loading
+        # gigabytes of FP32 parameters for nothing. A reranker has
+        # neither: its score comes from its own classification head.
         pooling = read_pooling_mode(model_dir) if kind == KIND_EMBEDDING else None
+        dense, dense_config = load_dense(model_dir) if kind == KIND_EMBEDDING else (None, None)
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         if kind == KIND_EMBEDDING:
             # Pooling happens in the wrapper; the HF pooler head is unused
@@ -220,6 +211,8 @@ class XlmRobertaBackend:
             kind=kind,
             attn=attn,
             pooling=pooling,
+            dense=dense,
+            dense_config=dense_config,
         )
 
     def apply_patches(
@@ -255,7 +248,8 @@ class XlmRobertaBackend:
 
         Args:
             loaded: Handle returned by :meth:`load`; for an embedding
-                model its ``pooling`` selects the wrapper.
+                model its ``pooling`` selects the wrapper and its
+                ``dense`` is applied after that pooling.
 
         Returns:
             The pooling wrapper matching ``loaded.pooling`` for an
@@ -276,7 +270,7 @@ class XlmRobertaBackend:
             raise ValueError(
                 f"unsupported pooling '{loaded.pooling}' for {self.name} (supported: {supported})"
             )
-        return wrapper_class(loaded.model).eval()
+        return wrapper_class(loaded.model, dense=loaded.dense).eval()
 
     def output_name(self, kind: str) -> str:
         """Return the Core ML graph output name used for ``kind``.
@@ -418,14 +412,16 @@ class XlmRobertaBackend:
         loaded = self.load(model_dir, kind, attn="sdpa")
         try:
             if kind == KIND_EMBEDDING:
-                # The baseline must pool exactly like the traced wrapper,
-                # so it follows the pooling detected for this directory.
+                # The baseline must pool and project exactly like the
+                # traced wrapper, so it follows both declarations of this
+                # directory.
                 return encode_pytorch(
                     loaded.model,
                     loaded.tokenizer,
                     list(inputs),
                     seq_len,
                     pooling=loaded.pooling,
+                    dense=loaded.dense,
                 )
             return score_pytorch(
                 loaded.model, loaded.tokenizer, [(q, d) for q, d in inputs], seq_len

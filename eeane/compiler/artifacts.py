@@ -217,6 +217,7 @@ def needs_conversion(
     *,
     force: bool = False,
     pooling: str | None = None,
+    dense: Sequence[Mapping[str, Any]] | None = None,
 ) -> bool:
     """Tell whether a variant must be (re)converted.
 
@@ -225,13 +226,12 @@ def needs_conversion(
     current environment, and the recorded self-check did not fail (a
     failed variant must never be silently reused).
 
-    When ``pooling`` is given, the recorded ``variant.pooling`` must also
-    match it. A model's sentence-transformers pooling declaration can
-    change on the Hub between two compiles that otherwise use the exact
-    same eeane version -- nothing in :data:`SKIP_VERSION_KEYS` would
-    notice that, so without this check a cache would keep silently
-    serving an artifact baked with the old pooling under the model's new
-    declared identity.
+    The sentence-transformers declarations of a model are compared too.
+    They can change on the Hub between two compiles that otherwise use the
+    exact same eeane version -- nothing in :data:`SKIP_VERSION_KEYS` would
+    notice that, so without these checks a cache would keep silently
+    serving an artifact baked with the old declaration under the model's
+    new declared identity.
 
     Args:
         mlmodelc_path: Compiled artifact directory.
@@ -242,6 +242,13 @@ def needs_conversion(
             for a reranker, or when it could not be determined), compared
             against the recorded metadata. ``None`` skips this check
             entirely, leaving the version/self-check outcome as is.
+        dense: Dense projection this run resolved, one entry per stage.
+            Unlike ``pooling``, ``None`` is not "skip": it is the
+            statement that the model projects nothing, so an artifact
+            recorded with a projection is not reused for it. A record that
+            never knew about projections reads as ``None`` too, which is
+            what a model without one declares -- so an existing cache
+            stays reusable.
 
     Returns:
         ``True`` when the variant must be converted.
@@ -263,14 +270,32 @@ def needs_conversion(
     selfcheck = recorded.get("selfcheck")
     if isinstance(selfcheck, dict) and selfcheck.get("status") == SELFCHECK_STATUS_FAILED:
         return True
-    if pooling is not None:
-        recorded_variant = recorded.get("variant")
-        recorded_pooling = (
-            recorded_variant.get("pooling") if isinstance(recorded_variant, dict) else None
-        )
-        if recorded_pooling != pooling:
-            return True
-    return False
+    recorded_variant = recorded.get("variant")
+    if not isinstance(recorded_variant, dict):
+        recorded_variant = {}
+    if pooling is not None and recorded_variant.get("pooling") != pooling:
+        return True
+    return _dense_declaration(recorded_variant.get("dense")) != _dense_declaration(dense)
+
+
+def _dense_declaration(value: Any) -> list[Any] | None:
+    """Normalize a Dense description for comparison across a JSON round trip.
+
+    Args:
+        value: A recorded ``variant.dense`` (a JSON list, or absent) or
+            the description this run resolved (a tuple, or ``None``).
+
+    Returns:
+        ``None`` for "no projection", else the stages as a list. Anything
+        else -- a hand-edited or corrupt record -- is wrapped rather than
+        dropped, so it compares unequal to a real description instead of
+        silently reading as "no projection".
+    """
+    if value is None:
+        return None
+    if isinstance(value, list | tuple):
+        return list(value)
+    return [value]
 
 
 def discover_variants(
