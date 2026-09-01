@@ -1,11 +1,15 @@
 """XLM-RoBERTa compile backend.
 
 Covers the encoder family whose ``config.json`` reports an architecture
-starting with ``XLMRoberta`` -- multilingual embedding models
-(``XLMRobertaModel`` plus a sentence-transformers pooling module, e.g.
-``intfloat/multilingual-e5-base``) and cross-encoder rerankers
+starting with ``XLMRoberta`` or ``Roberta`` -- multilingual embedding
+models (``XLMRobertaModel`` plus a sentence-transformers pooling module,
+e.g. ``intfloat/multilingual-e5-base``) and cross-encoder rerankers
 (``XLMRobertaForSequenceClassification`` with a single output label, e.g.
-``BAAI/bge-reranker-v2-m3``).
+``BAAI/bge-reranker-v2-m3``). RoBERTa checkpoints share this backend
+because the two architectures are the same encoder in the HF
+implementation -- both use ``padding_idx = 1`` with position ids starting
+at ``padding_idx + 1`` -- and differ only in vocabulary (BPE), which the
+conversion graph never depends on.
 
 Two properties set this family apart from the other backends:
 

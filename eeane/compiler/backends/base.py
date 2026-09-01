@@ -18,7 +18,11 @@ Adding a backend
 1. Create ``eeane/compiler/backends/<family>.py`` with a class implementing
    every member listed below (structural typing: no base class to inherit).
 2. Register it in :data:`eeane.compiler.dispatch.BACKEND_REGISTRY`, keyed by
-   the architecture-name prefix that ``config.json`` reports.
+   the architecture-name prefix that ``config.json`` reports. An existing
+   backend may be registered under more than one prefix when another
+   architecture is, for compilation purposes, the same encoder (e.g.
+   ``Roberta`` alongside ``XLMRoberta``): add the extra key pointing at
+   the same backend target instead of duplicating the implementation.
 3. Add unit tests covering the fixtures, the kind validation and the
    effective maximum sequence length; add local-only tests for anything
    that needs real weights.
