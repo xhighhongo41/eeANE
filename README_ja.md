@@ -159,7 +159,10 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 rerankerは代わりに明確なエラーで拒否されます。理由は、コンパイル
 済みグラフではsegment idをゼロに固定せざるを得ず、それがこの
 アーキテクチャにおけるquery/documentペアの意味を変えてしまうため
-です)。さらなる系統の追加を計画中です。embeddingモデルでは、3つの
+です)。`RobertaModel`アーキテクチャのモデルもXLM-RoBERTaバックエン
+ドで扱われます — transformers上ではRoBERTaとXLM-RoBERTaは語彙のみ
+が異なる同一のエンコーダ実装だからです。さらなる系統の追加を計画中
+です。embeddingモデルでは、3つの
 バックエンドすべてが、モデルディレクトリのsentence-transformers宣
 言(`1_Pooling/config.json`)からmean/CLSプーリングを検出し、対応す
 るグラフをコンパイルします。対応するプーリングモードを宣言していな
@@ -171,6 +174,22 @@ rerankerは代わりに明確なエラーで拒否されます。理由は、コ
 ログには、embeddingモデルごとに検出されたプーリングが表示されます。
 実際に一通り動作を検証したモデルは
 [検証済みモデル](#検証済みモデル)を参照してください。
+
+sentence-transformers形式のモデルディレクトリは、`modules.json`で
+**Dense**モジュールの列を宣言していることがあります。`eeane
+compile`は`Transformer → Pooling → Dense(0個以上) →
+Normalize(任意・末尾)`という構成に対応しており、宣言されたDense
+線形射影(活性化はIdentityまたはTanh)を1つずつコンパイル済みグラフ
+へ焼き込み、出力次元もそれに追随させます — Denseモジュールを持つ
+モデルの埋め込み次元は、生のhidden sizeとは異なるものになります。
+この構成で表現できないモジュール列は、重みを読み込む前にエラーで
+拒否されます。意味の違う成果物を黙って作らないためです。Normalize
+モジュール自体はグラフには含めません — 代わりにサーバーが、各モデ
+ルの`normalize`設定(既定で有効。[API](#api)を参照)に応じてL2正規化
+を行います。Denseの重みも、本体の重みと同じsafetensors優先ポリシー
+に従います(`.bin`のみのDenseチェックポイントには`--allow-pickle`
+が必要。[チェックポイント形式](#チェックポイント形式)を参照)。
+
 コンパイラは
 モデルがembeddingモデルかrerankerかを自動判別し、既定のバケツは
 embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
@@ -183,7 +202,15 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 検証し、どれだけの演算がNeural Engineに配置されたかを計測し、
 ウォームレイテンシを記録します — 表示されるサマリは互換性レポート
 を兼ねるため、未検証のハードウェア(M1/M3/M4など)でeeANEを実行した
-場合は、ぜひIssueに貼り付けてください。バケツごとの実測値はキャッ
+場合は、ぜひIssueに貼り付けてください。精度のセルフチェックは、
+英語・日本語・中国語の3つの固定入力セットで評価され、いずれか1つ
+のセットが閾値を満たせば合格となります: モデルのトークナイザが
+ほとんど語彙を持たない言語の入力は、fp16とfp32の差が増幅されて
+しまい、モデル自身の実力ではなく入力そのものを反映してしまうため、
+モデルが実際に読める言語で採点することが公平な判定に必要だから
+です。コンパイルログにはセットごとの実測値と、どのセットが採用され
+たかが表示され、セットごとの数値は採用セットとともに成果物メタ
+データにも記録されます。バケツごとの実測値はキャッ
 シュ内のキャリブレーション記録(`model_info.json`)に集約され、
 セルフチェックに失敗したバケツは、キャッシュ自動解決の設定がロード
 する推奨集合から除外されます。トークナイザは成果物ディレクトリへ
@@ -220,6 +247,7 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 | ibm-granite/granite-embedding-english-r2 | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-97m-multilingual-r2 | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-311m-multilingual-r2 | embedding | 128/512/1024 |
+| nomic-ai/modernbert-embed-base | embedding | 128/512/1024 |
 | cl-nagoya/ruri-v3-reranker-310m | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-tiny-v2 | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-xsmall-v2 | reranker | 512/1024 |
@@ -229,12 +257,20 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 
 **XLM-RoBERTa**
 
+素のRoBERTaアーキテクチャに基づくモデルもこのバックエンドで扱われ
+ます(transformers上ではRoBERTaも同一のエンコーダ実装で、語彙のみ
+が異なるため)。下表のgranite-embedding r1英語系モデル
+(`config.json`で`RobertaModel`)がBERTの表ではなくこの表に載って
+いるのはそのためです。
+
 | モデル | 種別 | バケツ |
 |---|---|---|
 | BAAI/bge-m3 <sup>1</sup> | embedding | 128/512/1024 |
 | Snowflake/snowflake-arctic-embed-l-v2.0 | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-107m-multilingual | embedding | 128/512 |
 | ibm-granite/granite-embedding-278m-multilingual | embedding | 128/512 |
+| ibm-granite/granite-embedding-30m-english | embedding | 128/512 |
+| ibm-granite/granite-embedding-125m-english | embedding | 128/512 |
 | intfloat/multilingual-e5-base | embedding | 128/512 |
 | intfloat/multilingual-e5-large | embedding | 128/512 |
 | intfloat/multilingual-e5-large-instruct | embedding | 128/512 |
@@ -242,6 +278,9 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 | BAAI/bge-reranker-v2-m3 | reranker | 512/1024 |
 | BAAI/bge-reranker-base | reranker | 512 |
 | BAAI/bge-reranker-large | reranker | 512 |
+| hotchpotch/japanese-reranker-cross-encoder-xsmall-v1 | reranker | 512 |
+| hotchpotch/japanese-reranker-cross-encoder-small-v1 | reranker | 512 |
+| hotchpotch/japanese-bge-reranker-v2-m3-v1 | reranker | 512/1024 |
 
 **BERT**(embeddingモデルのみ)
 
@@ -271,6 +310,9 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 | sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | embedding | 128/512 |
 | sentence-transformers/paraphrase-MiniLM-L6-v2 | embedding | 128/512 |
 | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | embedding | 128/512 |
+| MongoDB/mdbr-leaf-mt | embedding | 128/512 |
+| MongoDB/mdbr-leaf-ir | embedding | 128/512 |
+| sentence-transformers/LaBSE | embedding | 128/512 |
 
 <sup>1</sup> `pytorch_model.bin`のみを配布しているため、コンパイルには
 `--allow-pickle`が必要です([チェックポイント形式](#チェックポイント形式)
@@ -448,8 +490,8 @@ launchd agentとして登録します — 手順とそのまま使えるplistテ
   全モデルのOpenAI互換リスト
 - `POST /v1/embeddings`(エイリアス: `POST /embeddings`) —
   OpenAI互換(`input`は文字列またはリスト、`encoding_format`は
-  `float`/`base64`)。埋め込みは既定でL2正規化されます(モデル
-  ごとの`normalize`設定)
+  `float`/`base64`、`dimensions`は省略可)。埋め込みは既定でL2正規化
+  されます(モデルごとの`normalize`設定)
 - `POST /rerank`、`POST /v1/rerank` — Infinity互換
   (`query`/`documents`/`top_n`/`return_documents`/`raw_scores`)
 
@@ -463,6 +505,14 @@ embeddingsとrerankリクエストの`model`フィールド(省略可能)は、
 各入力はそのモデルの、収まる最小の系列長バケツにルーティングされ、
 それより長い場合は最大バケツに切り詰められ、サーバー側で警告が
 出ます。
+
+embeddingsリクエストの`dimensions`フィールド(省略可能、OpenAI互換)
+を指定すると、返す埋め込みを先頭`dimensions`個の成分に切り詰めてか
+ら(正規化が有効な場合は)再正規化し、推論をやり直すことなくより
+小さいベクトルを返します。Matryoshka表現学習(MRL)で学習された
+モデルのように、任意の接頭辞長でも意味を持つ埋め込みを生成する
+モデルで有効です。モデルの埋め込み次元を超える値を指定すると400が
+返ります。
 
 [Open WebUI](https://github.com/open-webui/open-webui)からeeANEを
 使うには: 埋め込みエンジンをOpenAIに設定し、base URLを
@@ -571,9 +621,14 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   します。モデルのトークナイザがうまく表現できない入力 — たとえば
   中国語専用モデルに英語の文を与えるような場合 — では、入力自体が
   モデルの学習範囲から大きく外れているため、fp32の参照実装との
-  丸め差が目に見えて大きくなります。モデルが想定する言語の範囲内
-  では一致度はずっと高くなります(上記一覧の全モデルでコサイン
-  0.9999以上)。
+  丸め差が目に見えて大きくなります。`eeane compile`自身のセルフ
+  チェックは、英語・日本語・中国語の3つの固定セットで採点し、
+  モデルが実際に語彙を持つセットで合否判定することでこの問題を
+  回避しています(上記の「`eeane compile`について」を参照)が、
+  自分でモデルの想定言語外の入力に対してfp16とfp32の出力を比較する
+  際には、同じ注意が依然として当てはまります。モデルが想定する言語
+  の範囲内では一致度はずっと高くなります(上記一覧の全モデルで
+  コサイン0.9999以上)。
 
 ## 開発
 
@@ -660,6 +715,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 1.4.0 | コンパイルのセルフチェックが、英語・日本語・中国語の3つの固定言語セットで評価し、いずれか1セットが閾値を満たせば合格とするようになった(モデルが実際に語彙を持つ言語で判定するため)。sentence-transformersのDenseモジュール(`Transformer → Pooling → Dense → Normalize`)に対応。`RobertaModel`アーキテクチャのモデルがXLM-RoBERTaバックエンドで動作するように。OpenAI互換の`dimensions`パラメータを`/v1/embeddings`に追加。検証済みモデルを9件追加(51→60) |
 | 1.3.0 | ModernBERTバックエンドが、meanのみのコンパイルから、モデルのsentence-transformers宣言に基づくmean/CLSプーリングの自動判別に対応し、CLSプーリングを宣言するModernBERT系embeddingモデル(granite-embedding-*-r2系など)も正しくコンパイルできるようになった。判別したプーリングはコンパイルログと成果物メタデータに記録される。検証済みモデルを5件追加(gte-modernbert-base、granite-embedding-*-r2系4件) |
 | 1.2.0 | 3つのバックエンド全体で35モデルを追加検証(granite・Snowflake Arctic Embed・GTE・mxbai・MiniLM・e5・ruri-v3の小型・中国語版bge v1.5・日本語reranker)し、検証済みモデルの一覧表を新設。エンジンの変更なし |
 | 1.1.0 | BERT embeddingバックエンドを新設。BAAI/bge系モデルを6件追加検証(bge-m3・bge-reranker-base/large・bge-small/base/large-en-v1.5)。pickleベースのチェックポイント向けopt-inの`--allow-pickle`。PyPIメタデータの拡充 |

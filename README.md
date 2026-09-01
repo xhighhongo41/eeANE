@@ -156,18 +156,37 @@ Three architecture families are supported: **ModernBERT** and
 **BERT** (embedding models only — a BERT cross-encoder reranker is
 rejected instead, because the compiled graph would have to pin its
 segment ids to zero, which changes the meaning of a query/document pair
-for this architecture). More families are planned. For embedding models,
-all three backends detect the mean/CLS pooling declared by the model
-directory's sentence-transformers `1_Pooling/config.json` and compile the
-matching graph; an embedding model that does not declare a supported
-pooling mode is rejected with an error rather than compiled on a guess,
-because an artifact built with the wrong pooling still looks plausible
-while returning vectors with a different meaning. Rerankers are
-unaffected by this declaration — their pooling is part of the model's own
-classification head, not a separate sentence-transformers module. The
-compile log names the pooling it detected for each embedding model. See
-[Verified models](#verified-models) for the models that have been run end
-to end.
+for this architecture). `RobertaModel`-architecture models are routed to
+the XLM-RoBERTa backend as well — transformers implements RoBERTa and
+XLM-RoBERTa as the same encoder, differing only in vocabulary. More
+families are planned. For embedding models, all three backends detect the
+mean/CLS pooling declared by the model directory's sentence-transformers
+`1_Pooling/config.json` and compile the matching graph; an embedding
+model that does not declare a supported pooling mode is rejected with an
+error rather than compiled on a guess, because an artifact built with the
+wrong pooling still looks plausible while returning vectors with a
+different meaning. Rerankers are unaffected by this declaration — their
+pooling is part of the model's own classification head, not a separate
+sentence-transformers module. The compile log names the pooling it
+detected for each embedding model. See [Verified models](#verified-models)
+for the models that have been run end to end.
+
+A sentence-transformers model directory may also declare a **Dense**
+module chain in its `modules.json`: `eeane compile` supports the
+`Transformer -> Pooling -> Dense (zero or more) -> Normalize (optional,
+trailing)` sequence, baking each declared Dense linear projection
+(Identity or Tanh activation) into the compiled graph and following the
+output width to match — a model with a Dense module ends up with a
+different embedding width than its raw hidden size. A module chain this
+sequence cannot describe is rejected with an error before any weights are
+read, rather than silently compiling something with a different meaning.
+The Normalize module itself is not compiled into the graph — the server
+applies L2 normalization instead, according to each model's `normalize`
+setting (on by default; see [API](#api)). Dense checkpoints follow the
+same safetensors-first policy as the model's main weights (`--allow-pickle`
+for `.bin`-only Dense checkpoints; see [Checkpoint
+formats](#checkpoint-formats)).
+
 The compiler detects whether a model is
 an embedding model or a reranker and defaults to buckets 128/512/1024
 (embedding) or 512/1024 (reranker), clipped to the model's maximum
@@ -180,7 +199,16 @@ conversion a **self-check** verifies accuracy against the FP32 original,
 measures how many operations landed on the Neural Engine, and records
 warm latency — the printed summary doubles as a compatibility report:
 if you run eeANE on hardware we have not verified (M1/M3/M4...), please
-paste it into an issue. The per-bucket measurements are aggregated into
+paste it into an issue. The accuracy sanity check is evaluated on three
+fixed input sets — English, Japanese and Chinese — and a variant passes
+as soon as any one set clears the threshold: an input in a language the
+model's tokenizer has little or no vocabulary for produces an amplified
+fp16-vs-fp32 difference that reflects the input, not the model, so
+scoring against a language the model can actually read is what the
+self-check needs to judge it fairly. The compile log names each set's
+measured result and which one was accepted, and the per-set numbers are
+recorded in the artifact metadata alongside the accepted set. The
+per-bucket measurements are aggregated into
 a calibration record (`model_info.json`) in the cache; buckets whose
 self-check failed are dropped from the recommended set that
 cache-resolved configs load. The tokenizer is frozen into the artifact
@@ -218,6 +246,7 @@ work as well; these are simply the ones that have been run end to end.
 | ibm-granite/granite-embedding-english-r2 | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-97m-multilingual-r2 | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-311m-multilingual-r2 | embedding | 128/512/1024 |
+| nomic-ai/modernbert-embed-base | embedding | 128/512/1024 |
 | cl-nagoya/ruri-v3-reranker-310m | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-tiny-v2 | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-xsmall-v2 | reranker | 512/1024 |
@@ -227,12 +256,20 @@ work as well; these are simply the ones that have been run end to end.
 
 **XLM-RoBERTa**
 
+Models built on the plain RoBERTa architecture are also served by this
+backend (transformers implements RoBERTa as the same encoder, differing
+only in vocabulary), which is why the granite-embedding r1 English models
+below (`RobertaModel` in their `config.json`) sit in this table rather
+than BERT's.
+
 | Model | Type | Buckets |
 |---|---|---|
 | BAAI/bge-m3 <sup>1</sup> | embedding | 128/512/1024 |
 | Snowflake/snowflake-arctic-embed-l-v2.0 | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-107m-multilingual | embedding | 128/512 |
 | ibm-granite/granite-embedding-278m-multilingual | embedding | 128/512 |
+| ibm-granite/granite-embedding-30m-english | embedding | 128/512 |
+| ibm-granite/granite-embedding-125m-english | embedding | 128/512 |
 | intfloat/multilingual-e5-base | embedding | 128/512 |
 | intfloat/multilingual-e5-large | embedding | 128/512 |
 | intfloat/multilingual-e5-large-instruct | embedding | 128/512 |
@@ -240,6 +277,9 @@ work as well; these are simply the ones that have been run end to end.
 | BAAI/bge-reranker-v2-m3 | reranker | 512/1024 |
 | BAAI/bge-reranker-base | reranker | 512 |
 | BAAI/bge-reranker-large | reranker | 512 |
+| hotchpotch/japanese-reranker-cross-encoder-xsmall-v1 | reranker | 512 |
+| hotchpotch/japanese-reranker-cross-encoder-small-v1 | reranker | 512 |
+| hotchpotch/japanese-bge-reranker-v2-m3-v1 | reranker | 512/1024 |
 
 **BERT** (embedding models only)
 
@@ -269,6 +309,9 @@ work as well; these are simply the ones that have been run end to end.
 | sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | embedding | 128/512 |
 | sentence-transformers/paraphrase-MiniLM-L6-v2 | embedding | 128/512 |
 | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | embedding | 128/512 |
+| MongoDB/mdbr-leaf-mt | embedding | 128/512 |
+| MongoDB/mdbr-leaf-ir | embedding | 128/512 |
+| sentence-transformers/LaBSE | embedding | 128/512 |
 
 <sup>1</sup> Ships `pytorch_model.bin` only, so compiling it needs
 `--allow-pickle` (see [Checkpoint formats](#checkpoint-formats)).
@@ -439,8 +482,9 @@ idle.
 - `GET /models` (alias: `GET /v1/models`) — OpenAI-compatible listing
   of every served model
 - `POST /v1/embeddings` (alias: `POST /embeddings`) — OpenAI-compatible
-  (`input` as string or list, `encoding_format` `float`/`base64`);
-  embeddings are L2-normalized by default (per-model `normalize`)
+  (`input` as string or list, `encoding_format` `float`/`base64`,
+  optional `dimensions`); embeddings are L2-normalized by default
+  (per-model `normalize`)
 - `POST /rerank`, `POST /v1/rerank` — Infinity-compatible
   (`query`/`documents`/`top_n`/`return_documents`/`raw_scores`)
 
@@ -453,6 +497,14 @@ and at the root, so a base URL with or without the `/v1` suffix works.
 Each input is routed to the smallest fitting sequence-length bucket of
 its model and truncated to the largest bucket when longer, with a
 server-side warning.
+
+The optional `dimensions` field of an embeddings request (OpenAI-compatible)
+truncates each returned embedding to its first `dimensions` components
+before re-normalizing (when normalization is enabled), returning a
+smaller vector without re-running inference. It is meaningful for models
+trained with a Matryoshka representation learning (MRL) objective, whose
+embeddings stay meaningful at any prefix length; requesting more
+dimensions than the model's embedding width gets a 400.
 
 To use eeANE from [Open WebUI](https://github.com/open-webui/open-webui):
 set the embedding engine to OpenAI with base URL
@@ -554,9 +606,14 @@ exactly (`tools/verify_server.py` in a repository checkout).
   fp16. For input a model's tokenizer cannot represent well — feeding
   English text to a Chinese-only model, say — the rounding difference
   against an fp32 reference grows noticeably, because the input is
-  already far outside what the model was trained on. Within a model's
-  intended languages the agreement is far tighter (cosine ≥ 0.9999 on
-  every model listed above).
+  already far outside what the model was trained on. `eeane compile`'s
+  own self-check sidesteps this by scoring three fixed language sets
+  (English, Japanese, Chinese) and accepting the variant on whichever
+  set the model actually has vocabulary for (see About `eeane compile`
+  above), but the same caution still applies whenever you compare a
+  model's fp16 and fp32 output on input outside its intended languages
+  yourself. Within a model's intended languages the agreement is far
+  tighter (cosine ≥ 0.9999 on every model listed above).
 
 ## Development
 
@@ -641,6 +698,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.4.0 | Compile self-check now scores three fixed language sets (English, Japanese, Chinese) and accepts whichever clears the threshold, instead of one fixed set that could fail on a model with different vocabulary; support for sentence-transformers Dense projection modules (`Transformer -> Pooling -> Dense -> Normalize`); `RobertaModel`-architecture models now route to the XLM-RoBERTa backend; OpenAI-compatible `dimensions` parameter on `/v1/embeddings`; nine more verified models (51 -> 60) |
 | 1.3.0 | ModernBERT backend detects mean/CLS pooling from the model's sentence-transformers declaration instead of compiling mean pooling only, so CLS-pooling ModernBERT embedding models (e.g. the granite-embedding-*-r2 family) now compile correctly; the resolved pooling is recorded in the compile log and artifact metadata; five more verified models (gte-modernbert-base and four granite-embedding-*-r2 models) |
 | 1.2.0 | 35 more verified models across all three backends (granite, Snowflake Arctic Embed, GTE, mxbai, MiniLM, e5, small ruri-v3, Chinese bge v1.5, Japanese rerankers) and a Verified models table; no engine changes |
 | 1.1.0 | BERT embedding backend; six more verified BAAI/bge models (bge-m3, bge-reranker-base/large, bge-small/base/large-en-v1.5); `--allow-pickle` opt-in for pickle-based checkpoints; expanded PyPI metadata |
