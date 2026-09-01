@@ -156,11 +156,18 @@ Three architecture families are supported: **ModernBERT** and
 **BERT** (embedding models only — a BERT cross-encoder reranker is
 rejected instead, because the compiled graph would have to pin its
 segment ids to zero, which changes the meaning of a query/document pair
-for this architecture). More families are planned. For embedding models
-the mean/CLS pooling declared by the model directory is applied
-automatically on the BERT and XLM-RoBERTa backends; the ModernBERT
-backend currently compiles mean pooling only. See [Verified
-models](#verified-models) for the models that have been run end to end.
+for this architecture). More families are planned. For embedding models,
+all three backends detect the mean/CLS pooling declared by the model
+directory's sentence-transformers `1_Pooling/config.json` and compile the
+matching graph; an embedding model that does not declare a supported
+pooling mode is rejected with an error rather than compiled on a guess,
+because an artifact built with the wrong pooling still looks plausible
+while returning vectors with a different meaning. Rerankers are
+unaffected by this declaration — their pooling is part of the model's own
+classification head, not a separate sentence-transformers module. The
+compile log names the pooling it detected for each embedding model. See
+[Verified models](#verified-models) for the models that have been run end
+to end.
 The compiler detects whether a model is
 an embedding model or a reranker and defaults to buckets 128/512/1024
 (embedding) or 512/1024 (reranker), clipped to the model's maximum
@@ -206,6 +213,11 @@ work as well; these are simply the ones that have been run end to end.
 | cl-nagoya/ruri-v3-130m | embedding | 128/512/1024 |
 | cl-nagoya/ruri-v3-310m | embedding | 128/512/1024 |
 | hotchpotch/bekko-embedding-v1-a25m | embedding | 128/512/1024 |
+| Alibaba-NLP/gte-modernbert-base | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-small-english-r2 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-english-r2 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-97m-multilingual-r2 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-311m-multilingual-r2 | embedding | 128/512/1024 |
 | cl-nagoya/ruri-v3-reranker-310m | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-tiny-v2 | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-xsmall-v2 | reranker | 512/1024 |
@@ -496,6 +508,17 @@ exactly (`tools/verify_server.py` in a repository checkout).
   only, and `eeane compile` requires safetensors by default. The error
   message already names the fix: pass `--allow-pickle` (see Checkpoint
   formats above) — only for checkpoints from publishers you trust.
+- **`eeane compile` fails with `... must declare its pooling in the
+  sentence-transformers '1_Pooling/config.json' ...`**:
+  compiling an embedding model needs a `1_Pooling/config.json`
+  sentence-transformers pooling declaration; when it is missing,
+  unreadable, or names an unsupported mode (anything other than mean or
+  CLS), `eeane compile` stops with an error instead of guessing. Check
+  that the model is actually distributed in sentence-transformers form
+  — for a local model directory, check that the `1_Pooling/config.json`
+  the publisher ships alongside it is present. eeANE does not fall back
+  to assuming mean pooling: a wrongly-pooled artifact would silently
+  return vectors with a different meaning.
 
 ## Known limitations
 
@@ -527,13 +550,6 @@ exactly (`tools/verify_server.py` in a repository checkout).
   compile` above — pinning the compiled graph's segment ids to zero
   would change the meaning of a query/document pair for this
   architecture. BERT embedding models are unaffected.
-- **CLS-pooling ModernBERT embedding models are not supported yet**:
-  the ModernBERT backend compiles mean pooling only, so an embedding
-  model of that family which declares CLS pooling (for example the
-  ibm-granite `granite-embedding-*-r2` embedding models) would be
-  compiled with the wrong pooling. Support is planned. The BERT and
-  XLM-RoBERTa backends read the declared pooling and handle both, and
-  ModernBERT *rerankers* are unaffected.
 - **Accuracy on out-of-vocabulary input**: compiled models run in
   fp16. For input a model's tokenizer cannot represent well — feeding
   English text to a Chinese-only model, say — the rounding difference
@@ -625,6 +641,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.3.0 | ModernBERT backend detects mean/CLS pooling from the model's sentence-transformers declaration instead of compiling mean pooling only, so CLS-pooling ModernBERT embedding models (e.g. the granite-embedding-*-r2 family) now compile correctly; the resolved pooling is recorded in the compile log and artifact metadata; five more verified models (gte-modernbert-base and four granite-embedding-*-r2 models) |
 | 1.2.0 | 35 more verified models across all three backends (granite, Snowflake Arctic Embed, GTE, mxbai, MiniLM, e5, small ruri-v3, Chinese bge v1.5, Japanese rerankers) and a Verified models table; no engine changes |
 | 1.1.0 | BERT embedding backend; six more verified BAAI/bge models (bge-m3, bge-reranker-base/large, bge-small/base/large-en-v1.5); `--allow-pickle` opt-in for pickle-based checkpoints; expanded PyPI metadata |
 | 1.0.0 | First stable release: published on PyPI, launchd service guide, documentation overhaul |

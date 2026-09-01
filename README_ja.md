@@ -159,11 +159,18 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 rerankerは代わりに明確なエラーで拒否されます。理由は、コンパイル
 済みグラフではsegment idをゼロに固定せざるを得ず、それがこの
 アーキテクチャにおけるquery/documentペアの意味を変えてしまうため
-です)。さらなる系統の追加を計画中です。embeddingモデルでは、BERTと
-XLM-RoBERTaのバックエンドについてはモデルディレクトリが宣言する
-mean/CLSプーリングが自動的に適用されます。ModernBERTバックエンドは
-現在meanプーリングのみをコンパイルします。実際に一通り動作を検証
-したモデルは[検証済みモデル](#検証済みモデル)を参照してください。
+です)。さらなる系統の追加を計画中です。embeddingモデルでは、3つの
+バックエンドすべてが、モデルディレクトリのsentence-transformers宣
+言(`1_Pooling/config.json`)からmean/CLSプーリングを検出し、対応す
+るグラフをコンパイルします。対応するプーリングモードを宣言していな
+いembeddingモデルは、推測でコンパイルするのではなくエラーで拒否さ
+れます — 誤ったプーリングでコンパイルされた成果物は、一見もっとも
+らしいのに意味の違うベクトルを返してしまうためです。rerankerはこの
+宣言と無関係です — プーリングはモデル自身の分類ヘッドの一部であり、
+独立したsentence-transformersモジュールではありません。コンパイル
+ログには、embeddingモデルごとに検出されたプーリングが表示されます。
+実際に一通り動作を検証したモデルは
+[検証済みモデル](#検証済みモデル)を参照してください。
 コンパイラは
 モデルがembeddingモデルかrerankerかを自動判別し、既定のバケツは
 embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
@@ -208,6 +215,11 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 | cl-nagoya/ruri-v3-130m | embedding | 128/512/1024 |
 | cl-nagoya/ruri-v3-310m | embedding | 128/512/1024 |
 | hotchpotch/bekko-embedding-v1-a25m | embedding | 128/512/1024 |
+| Alibaba-NLP/gte-modernbert-base | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-small-english-r2 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-english-r2 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-97m-multilingual-r2 | embedding | 128/512/1024 |
+| ibm-granite/granite-embedding-311m-multilingual-r2 | embedding | 128/512/1024 |
 | cl-nagoya/ruri-v3-reranker-310m | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-tiny-v2 | reranker | 512/1024 |
 | hotchpotch/japanese-reranker-xsmall-v2 | reranker | 512/1024 |
@@ -511,6 +523,18 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   safetensorsを要求します。エラーメッセージが対処法(`--allow-pickle`
   を付ける。上記のチェックポイント形式を参照)をすでに示しています —
   信頼できる配布元のチェックポイントに限って使用してください。
+- **`eeane compile`が`... must declare its pooling in the
+  sentence-transformers '1_Pooling/config.json' ...`で失敗する**:
+  embeddingモデルのコンパイルには、sentence-transformersのプーリ
+  ング宣言`1_Pooling/config.json`が必要です。これが無い・読み取
+  れない・対応外のモード(mean/CLS以外)を宣言している場合、
+  `eeane compile`は推測せずエラーで停止します。そのモデルが実際
+  にsentence-transformers形式で配布されているか確認してください
+  — ローカルディレクトリを指定している場合は、配布元にある
+  `1_Pooling/config.json`が揃っているか確認してください。eeANEは
+  推測でmeanプーリングを補う挙動には戻しません。誤ったプーリング
+  でコンパイルされた成果物は、黙って意味の違うベクトルを返してし
+  まうためです。
 
 ## 既知の制限
 
@@ -543,13 +567,6 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   segment idをゼロに固定せざるを得ず、それがこのアーキテクチャに
   おけるquery/documentペアの意味を変えてしまうためです。BERT系
   embeddingモデルはこの影響を受けず、対応しています。
-- **CLSプーリングのModernBERT系embeddingモデルは未対応**:
-  ModernBERTバックエンドはmeanプーリングのみをコンパイルするため、
-  CLSプーリングを宣言する同系統のembeddingモデル(例: ibm-graniteの
-  `granite-embedding-*-r2`のembeddingモデル)は誤った
-  プーリングでコンパイルされてしまいます。対応を計画中です。
-  BERTとXLM-RoBERTaのバックエンドは宣言されたプーリングを読み取り
-  両方に対応しており、ModernBERT系の*reranker*も影響を受けません。
 - **語彙外の入力に対する精度**: コンパイル済みモデルはfp16で動作
   します。モデルのトークナイザがうまく表現できない入力 — たとえば
   中国語専用モデルに英語の文を与えるような場合 — では、入力自体が
@@ -643,6 +660,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 1.3.0 | ModernBERTバックエンドが、meanのみのコンパイルから、モデルのsentence-transformers宣言に基づくmean/CLSプーリングの自動判別に対応し、CLSプーリングを宣言するModernBERT系embeddingモデル(granite-embedding-*-r2系など)も正しくコンパイルできるようになった。判別したプーリングはコンパイルログと成果物メタデータに記録される。検証済みモデルを5件追加(gte-modernbert-base、granite-embedding-*-r2系4件) |
 | 1.2.0 | 3つのバックエンド全体で35モデルを追加検証(granite・Snowflake Arctic Embed・GTE・mxbai・MiniLM・e5・ruri-v3の小型・中国語版bge v1.5・日本語reranker)し、検証済みモデルの一覧表を新設。エンジンの変更なし |
 | 1.1.0 | BERT embeddingバックエンドを新設。BAAI/bge系モデルを6件追加検証(bge-m3・bge-reranker-base/large・bge-small/base/large-en-v1.5)。pickleベースのチェックポイント向けopt-inの`--allow-pickle`。PyPIメタデータの拡充 |
 | 1.0.0 | 最初の安定版リリース: PyPIで公開、launchdサービス化ガイド、ドキュメント全面改訂 |
