@@ -216,6 +216,7 @@ def needs_conversion(
     versions: Mapping[str, str],
     *,
     force: bool = False,
+    pooling: str | None = None,
 ) -> bool:
     """Tell whether a variant must be (re)converted.
 
@@ -224,11 +225,23 @@ def needs_conversion(
     current environment, and the recorded self-check did not fail (a
     failed variant must never be silently reused).
 
+    When ``pooling`` is given, the recorded ``variant.pooling`` must also
+    match it. A model's sentence-transformers pooling declaration can
+    change on the Hub between two compiles that otherwise use the exact
+    same eeane version -- nothing in :data:`SKIP_VERSION_KEYS` would
+    notice that, so without this check a cache would keep silently
+    serving an artifact baked with the old pooling under the model's new
+    declared identity.
+
     Args:
         mlmodelc_path: Compiled artifact directory.
         metadata_path: Variant metadata JSON path.
         versions: Version block of the current environment.
         force: ``--force``; short-circuits to ``True``.
+        pooling: Pooling mode this run resolved for the model (``None``
+            for a reranker, or when it could not be determined), compared
+            against the recorded metadata. ``None`` skips this check
+            entirely, leaving the version/self-check outcome as is.
 
     Returns:
         ``True`` when the variant must be converted.
@@ -248,7 +261,16 @@ def needs_conversion(
     if any(recorded_versions.get(key) != versions.get(key) for key in SKIP_VERSION_KEYS):
         return True
     selfcheck = recorded.get("selfcheck")
-    return isinstance(selfcheck, dict) and selfcheck.get("status") == SELFCHECK_STATUS_FAILED
+    if isinstance(selfcheck, dict) and selfcheck.get("status") == SELFCHECK_STATUS_FAILED:
+        return True
+    if pooling is not None:
+        recorded_variant = recorded.get("variant")
+        recorded_pooling = (
+            recorded_variant.get("pooling") if isinstance(recorded_variant, dict) else None
+        )
+        if recorded_pooling != pooling:
+            return True
+    return False
 
 
 def discover_variants(

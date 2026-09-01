@@ -76,6 +76,7 @@ def _write_variant(
     versions: dict[str, str],
     *,
     selfcheck_status: str = "skipped",
+    pooling: str | None = None,
 ) -> tuple[Path, Path]:
     """Create a fake compiled variant (``.mlmodelc`` + metadata) on disk.
 
@@ -83,6 +84,9 @@ def _write_variant(
         directory: Directory to create the variant in.
         versions: Version block to record in the metadata.
         selfcheck_status: Value recorded under ``selfcheck.status``.
+        pooling: Value recorded under ``variant.pooling``, or ``None`` to
+            omit the ``variant`` block entirely -- an old-format record
+            that never recorded one.
 
     Returns:
         Tuple of the ``.mlmodelc`` and metadata paths.
@@ -90,10 +94,10 @@ def _write_variant(
     mlmodelc_path = directory / f"{E2E_STEM}.mlmodelc"
     mlmodelc_path.mkdir(parents=True, exist_ok=True)
     metadata_path = directory / f"{E2E_STEM}.json"
-    metadata_path.write_text(
-        json.dumps({"versions": versions, "selfcheck": {"status": selfcheck_status}}),
-        encoding="utf-8",
-    )
+    payload: dict[str, Any] = {"versions": versions, "selfcheck": {"status": selfcheck_status}}
+    if pooling is not None:
+        payload["variant"] = {"pooling": pooling}
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
     return mlmodelc_path, metadata_path
 
 
@@ -598,6 +602,88 @@ def test_needs_conversion_when_the_recorded_selfcheck_failed(tmp_path: Path) -> 
     assert artifacts.needs_conversion(mlmodelc_path, metadata_path, versions) is True
 
 
+def test_needs_conversion_when_the_recorded_pooling_matches(tmp_path: Path) -> None:
+    """A recorded pooling equal to the one this run resolved is not a reason to reconvert."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(tmp_path, versions, pooling="mean")
+
+    assert (
+        artifacts.needs_conversion(mlmodelc_path, metadata_path, versions, pooling="mean") is False
+    )
+
+
+def test_needs_conversion_when_the_recorded_pooling_differs(tmp_path: Path) -> None:
+    """A model whose declared pooling changed must be reconverted, not silently reused.
+
+    A Hub repository can update its sentence-transformers declaration
+    between two compiles of the exact same eeane version; nothing in
+    SKIP_VERSION_KEYS would ever notice that on its own.
+    """
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(tmp_path, versions, pooling="mean")
+
+    assert artifacts.needs_conversion(mlmodelc_path, metadata_path, versions, pooling="cls") is True
+
+
+def test_needs_conversion_when_no_pooling_was_ever_recorded(tmp_path: Path) -> None:
+    """An old-format record without a recorded pooling counts as a mismatch, not a pass."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(tmp_path, versions)
+
+    assert (
+        artifacts.needs_conversion(mlmodelc_path, metadata_path, versions, pooling="mean") is True
+    )
+
+
+def test_needs_conversion_skips_the_pooling_check_when_none_is_given(tmp_path: Path) -> None:
+    """pooling=None (a reranker, or an unresolved declaration) must leave the outcome alone."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(tmp_path, versions)
+
+    assert artifacts.needs_conversion(mlmodelc_path, metadata_path, versions, pooling=None) is False
+
+
+# --- declared pooling ---------------------------------------------------------
+
+
+def _write_pooling_declaration(model_dir: Path, pooling_flag: str) -> None:
+    """Write a minimal sentence-transformers pooling declaration.
+
+    Args:
+        model_dir: Directory the ``1_Pooling/config.json`` is created under.
+        pooling_flag: Flag to set to ``True`` (e.g.
+            ``"pooling_mode_mean_tokens"``).
+    """
+    (model_dir / mb.POOLING_DIRNAME).mkdir(parents=True, exist_ok=True)
+    (model_dir / mb.POOLING_DIRNAME / "config.json").write_text(
+        json.dumps({pooling_flag: True}), encoding="utf-8"
+    )
+
+
+def test_declared_pooling_reads_an_embedding_models_declaration(tmp_path: Path) -> None:
+    """A readable sentence-transformers declaration must be reported back verbatim."""
+    _write_pooling_declaration(tmp_path, "pooling_mode_cls_token")
+
+    assert pipeline._declared_pooling("embedding", tmp_path) == "cls"
+
+
+def test_declared_pooling_is_none_when_the_declaration_cannot_be_read(tmp_path: Path) -> None:
+    """A missing declaration must resolve to None here, not raise.
+
+    The authoritative failure for a missing or malformed declaration is
+    the backend's own load(); this helper only records what it can for
+    later comparison and must never fail the run on its own.
+    """
+    assert pipeline._declared_pooling("embedding", tmp_path) is None
+
+
+def test_declared_pooling_is_none_for_a_reranker(tmp_path: Path) -> None:
+    """A reranker's pooling belongs to its own classification head, not a declaration."""
+    _write_pooling_declaration(tmp_path, "pooling_mode_mean_tokens")
+
+    assert pipeline._declared_pooling("reranker", tmp_path) is None
+
+
 # --- calibration aggregation --------------------------------------------------
 
 
@@ -777,13 +863,16 @@ def test_aggregate_calibration_embedding_dim_is_always_none_for_a_reranker(
 # --- patches recording --------------------------------------------------------
 
 
-def _stub_compile_context(tmp_path: Path) -> pipeline._CompileContext:
+def _stub_compile_context(
+    tmp_path: Path, *, kind: str = "embedding", pooling: str | None = "mean"
+) -> pipeline._CompileContext:
     """Build a minimal ``_CompileContext`` for a ``_build_metadata`` unit test."""
     return pipeline._CompileContext(
         args=argparse.Namespace(source="stub-source"),
         model_dir=tmp_path,
         model_id="stub-model",
-        kind="embedding",
+        kind=kind,
+        pooling=pooling,
         output_name="embedding",
         batch_size=1,
         model_root=tmp_path,
@@ -899,6 +988,7 @@ def test_convert_variants_records_the_backends_own_patches(
         model_dir=tmp_path,
         model_id="stub-model",
         kind="embedding",
+        pooling="mean",
         output_name="embedding",
         batch_size=1,
         model_root=tmp_path,
@@ -1695,13 +1785,26 @@ def _install_family_stubs(monkeypatch: pytest.MonkeyPatch, kind: str = "embeddin
     _install_stub_conversion(monkeypatch)
 
 
-def _stub_source(tmp_path: Path) -> Path:
-    """Create the minimal model directory a run resolves its source to."""
+def _stub_source(tmp_path: Path, *, pooling_flag: str | None = None) -> Path:
+    """Create the minimal model directory a run resolves its source to.
+
+    Args:
+        tmp_path: Directory the source is created under.
+        pooling_flag: sentence-transformers pooling flag to declare under
+            ``1_Pooling/config.json`` (e.g. ``"pooling_mode_mean_tokens"``).
+            ``None`` (the default) leaves the model without one, matching
+            every stub-driven test that never reads it.
+
+    Returns:
+        The created model directory.
+    """
     source = tmp_path / "stub-model"
     source.mkdir(parents=True, exist_ok=True)
     (source / "config.json").write_text(
         json.dumps({"architectures": ["StubModel"]}), encoding="utf-8"
     )
+    if pooling_flag is not None:
+        _write_pooling_declaration(source, pooling_flag)
     return source
 
 
@@ -1855,3 +1958,73 @@ def test_a_reranker_snippet_never_names_batched_artifacts(
     # The record still describes the cache truthfully; only the served
     # configuration leaves the batched family out.
     assert "batch_artifacts" in _stub_model_info(out_dir, source)
+
+
+# --- declared pooling recorded by a whole run ---------------------------------
+
+
+def test_a_stub_run_records_the_declared_pooling_in_variant_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An embedding model's declared pooling must reach the variant metadata."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_cls_token")
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    model_root = out_dir / "compiled" / source.name
+    metadata_path = model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["variant"]["pooling"] == "cls"
+
+
+def test_a_stub_run_records_the_declared_pooling_in_model_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An embedding model's declared pooling must reach model_info.json too."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_mean_tokens")
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    assert _stub_model_info(out_dir, source)["pooling"] == "mean"
+
+
+def test_a_reranker_stub_run_records_no_pooling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reranker's model_info.json must record pooling as null.
+
+    Its pooling belongs to the model's own classification head, not a
+    sentence-transformers declaration.
+    """
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, kind="reranker") == 0
+
+    assert _stub_model_info(out_dir, source)["pooling"] is None
+
+
+def test_a_stub_run_logs_the_declared_pooling_for_an_embedding_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The progress log must report the pooling mode an embedding model declares."""
+    source = _stub_source(tmp_path, pooling_flag="pooling_mode_cls_token")
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    assert "pooling         : cls" in capsys.readouterr().err
+
+
+def test_a_reranker_stub_run_logs_no_pooling_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A reranker never has a declared pooling to log, so no such line must appear."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, kind="reranker") == 0
+
+    assert "pooling" not in capsys.readouterr().err
