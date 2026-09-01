@@ -32,6 +32,11 @@ HF_ALLOW_PATTERNS: tuple[str, ...] = (
     "*.model",
     "special_tokens_map.json",
     "*config*.json",
+    # The sentence-transformers pooling declaration an embedding model's
+    # backend reads to pick mean vs CLS pooling. It happens to also match
+    # "*config*.json" above, but is requested explicitly so that pattern
+    # change cannot silently stop shipping a file conversion now depends on.
+    "1_Pooling/*.json",
 )
 
 # Extra patterns added to a Hub download when ``allow_pickle=True`` and no

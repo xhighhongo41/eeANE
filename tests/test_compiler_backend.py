@@ -27,6 +27,8 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
+from transformers import PreTrainedTokenizerFast
 from transformers.models.modernbert import modeling_modernbert
 
 from eeane.compiler.backends import base, bert
@@ -59,10 +61,10 @@ def _restore_transformers_patches() -> Iterator[None]:
     modeling_modernbert.ModernBertAttention.forward = original_forward
 
 
-def _tiny_model(seed: int = 0) -> torch.nn.Module:
+def _tiny_model(seed: int = 0, vocab_size: int = 128) -> torch.nn.Module:
     """Build a randomly initialised ModernBertModel small enough for a unit test."""
     config = modeling_modernbert.ModernBertConfig(
-        vocab_size=128,
+        vocab_size=vocab_size,
         hidden_size=32,
         num_attention_heads=4,
         num_hidden_layers=2,
@@ -88,6 +90,7 @@ def _tiny_inputs(seq_len: int = 16, batch_size: int = 2) -> tuple[torch.Tensor, 
 def _loaded(
     model: Any,
     kind: str = "embedding",
+    pooling: str | None = "mean",
     tokenizer: Any = None,
     model_dir: Path = Path("/nonexistent-model-dir"),
 ) -> base.LoadedModel:
@@ -99,8 +102,23 @@ def _loaded(
         model_dir=model_dir,
         kind=kind,
         attn="eager",
-        pooling="mean" if kind == "embedding" else None,
+        pooling=pooling if kind == "embedding" else None,
     )
+
+
+def _write_json(path: Path, payload: object) -> None:
+    """Write ``payload`` as JSON, creating the parent directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _model_dir(tmp_path: Path, config: dict[str, Any] | None = None, **pooling: Any) -> Path:
+    """Build a synthetic model directory with a config.json and pooling module."""
+    model_dir = tmp_path / "model"
+    _write_json(model_dir / mb.CONFIG_FILENAME, config or {"architectures": ["ModernBertModel"]})
+    if pooling:
+        _write_json(model_dir / mb.POOLING_DIRNAME / "config.json", pooling)
+    return model_dir
 
 
 # --- interface types (backends/base.py) --------------------------------------
@@ -342,13 +360,28 @@ def test_handle_taking_methods_reject_an_unsupported_kind(method: str) -> None:
         getattr(backend, method)(loaded, *arguments)
 
 
-def test_wrap_selects_the_kind_specific_wrapper() -> None:
-    """wrap must return the mean-pooling wrapper vs the raw-logits wrapper."""
+def test_wrap_selects_the_wrapper_of_the_detected_pooling() -> None:
+    """The pooling recorded on the handle must decide which wrapper is traced."""
     backend = mb.ModernBertBackend()
     model = torch.nn.Identity()
 
-    assert isinstance(backend.wrap(_loaded(model, "embedding")), mb.EmbeddingWrapper)
-    assert isinstance(backend.wrap(_loaded(model, "reranker")), mb.RerankerWrapper)
+    mean_wrapper = backend.wrap(_loaded(model, "embedding", pooling="mean"))
+    cls_wrapper = backend.wrap(_loaded(model, "embedding", pooling="cls"))
+    reranker_wrapper = backend.wrap(_loaded(model, "reranker"))
+
+    assert isinstance(mean_wrapper, mb.EmbeddingWrapper)
+    assert isinstance(cls_wrapper, mb.ClsEmbeddingWrapper)
+    assert isinstance(reranker_wrapper, mb.RerankerWrapper)
+    assert not any(wrapper.training for wrapper in (mean_wrapper, cls_wrapper, reranker_wrapper))
+
+
+@pytest.mark.parametrize("pooling", [None, "max", "lasttoken", ""])
+def test_wrap_rejects_a_pooling_no_wrapper_implements(pooling: str | None) -> None:
+    """An embedding handle with an unknown pooling must raise, not fall back to mean."""
+    backend = mb.ModernBertBackend()
+
+    with pytest.raises(ValueError, match="pooling"):
+        backend.wrap(_loaded(torch.nn.Identity(), "embedding", pooling=pooling))
 
 
 def test_apply_patches_rejects_odd_rope_head_dim() -> None:
@@ -385,6 +418,95 @@ def test_apply_patches_records_the_mask_fill_value_when_given() -> None:
         "eager_attention_rank4": True,
         "mask_fill_value": -30000.0,
     }
+
+
+# --- pooling detection -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        ({"pooling_mode_mean_tokens": True, "pooling_mode_cls_token": False}, "mean"),
+        ({"pooling_mode_mean_tokens": False, "pooling_mode_cls_token": True}, "cls"),
+        # Only the flag that is set has to be present.
+        ({"pooling_mode_mean_tokens": True}, "mean"),
+        ({"pooling_mode_cls_token": True, "word_embedding_dimension": 768}, "cls"),
+    ],
+)
+def test_read_pooling_mode_detects_the_declared_mode(
+    tmp_path: Path, declaration: dict[str, Any], expected: str
+) -> None:
+    """Exactly one enabled supported flag must select that pooling mode."""
+    model_dir = _model_dir(tmp_path, **declaration)
+
+    assert mb.read_pooling_mode(model_dir) == expected
+
+
+def test_read_pooling_mode_without_a_pooling_module_explains_what_is_missing(
+    tmp_path: Path,
+) -> None:
+    """A missing declaration must name the file and the accepted flags, not default."""
+    model_dir = _model_dir(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        mb.read_pooling_mode(model_dir)
+
+    message = str(excinfo.value)
+    assert mb.POOLING_DIRNAME in message
+    assert "pooling_mode_mean_tokens" in message
+    assert "pooling_mode_cls_token" in message
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        {"pooling_mode_mean_tokens": True, "pooling_mode_cls_token": True},
+        {"pooling_mode_mean_tokens": False, "pooling_mode_cls_token": False},
+        {},
+        {"pooling_mode_max_tokens": True},
+        {"pooling_mode_mean_tokens": True, "pooling_mode_max_tokens": True},
+        # A non-boolean flag is not a declaration this backend can trust.
+        {"pooling_mode_mean_tokens": "true"},
+        {"pooling_mode_mean_tokens": 1},
+    ],
+    ids=["both", "neither", "empty", "unsupported", "mixed", "string-flag", "int-flag"],
+)
+def test_read_pooling_mode_rejects_an_ambiguous_declaration(
+    tmp_path: Path, declaration: dict[str, Any]
+) -> None:
+    """Anything but exactly one supported flag must raise instead of guessing."""
+    model_dir = _model_dir(tmp_path, **{"word_embedding_dimension": 768, **declaration})
+
+    with pytest.raises(ValueError, match="pooling"):
+        mb.read_pooling_mode(model_dir)
+
+
+def test_read_pooling_mode_rejects_a_corrupt_declaration(tmp_path: Path) -> None:
+    """Unparsable JSON must surface as a ValueError naming the file."""
+    model_dir = _model_dir(tmp_path)
+    pooling_config = model_dir / mb.POOLING_DIRNAME / "config.json"
+    pooling_config.parent.mkdir(parents=True, exist_ok=True)
+    pooling_config.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=mb.POOLING_DIRNAME):
+        mb.read_pooling_mode(model_dir)
+
+
+def test_read_pooling_mode_rejects_a_non_object_declaration(tmp_path: Path) -> None:
+    """A JSON document that is not an object cannot declare a pooling mode."""
+    model_dir = _model_dir(tmp_path)
+    _write_json(model_dir / mb.POOLING_DIRNAME / "config.json", ["mean"])
+
+    with pytest.raises(ValueError, match="pooling"):
+        mb.read_pooling_mode(model_dir)
+
+
+def test_load_reports_an_undeclared_pooling_before_loading_weights(tmp_path: Path) -> None:
+    """An embedding model without a pooling declaration must fail fast and clearly."""
+    model_dir = _model_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="pooling"):
+        mb.ModernBertBackend().load(model_dir, "embedding")
 
 
 # --- effective maximum sequence length ---------------------------------------
@@ -540,20 +662,20 @@ def reranker_smoke() -> dict[str, Any]:
     return _run_smoke(RERANKER_MODEL_DIR, "reranker")
 
 
-def _run_smoke(model_dir: Path, kind: str) -> dict[str, Any]:
+def _run_smoke(model_dir: Path, kind: str, seq_len: int = SMOKE_SEQ_LEN) -> dict[str, Any]:
     """Compare one patched eager forward pass against the FP32 sdpa reference."""
     backend = mb.ModernBertBackend()
     inputs = list(backend.sanity_spec(kind).inputs[:1])
     loaded = backend.load(model_dir, kind, attn="eager")
     backend.apply_patches(loaded)
     wrapper = backend.wrap(loaded)
-    tokens = backend.tokenize(loaded, inputs, SMOKE_SEQ_LEN)
+    tokens = backend.tokenize(loaded, inputs, seq_len)
     with torch.no_grad():
         patched = wrapper(
             torch.from_numpy(tokens["input_ids"]).long(),
             torch.from_numpy(tokens["attention_mask"]).long(),
         )
-    reference = backend.reference_outputs(model_dir, kind, inputs, SMOKE_SEQ_LEN)
+    reference = backend.reference_outputs(model_dir, kind, inputs, seq_len)
     return {
         "tokens": tokens,
         "patched": patched.numpy().reshape(len(inputs), -1),
@@ -572,6 +694,85 @@ def _run_smoke(model_dir: Path, kind: str) -> dict[str, Any]:
             "tokenizer_encodes": bool(loaded.tokenizer("x")["input_ids"]),
         },
     }
+
+
+# --- synthetic pooling round trip (always runs) -------------------------------
+
+# Sequence length for the synthetic round-trip test: well within the tiny
+# model's small max_position_embeddings, unlike SMOKE_SEQ_LEN.
+_SYNTHETIC_SMOKE_SEQ_LEN = 16
+
+
+def _write_model_directory(directory: Path, pooling_flag: str) -> Path:
+    """Save a tiny randomly initialised embedding model as a HuggingFace directory.
+
+    Args:
+        directory: Destination directory; created if needed.
+        pooling_flag: sentence-transformers pooling flag to enable.
+
+    Returns:
+        ``directory``, holding weights, config, tokenizer files and the
+        pooling declaration.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    # The byte-level tokenizer below can emit up to ~260 distinct token ids
+    # (256 bytes + 4 special tokens), so the vocabulary must be larger than
+    # the default _tiny_model() size to keep every id addressable.
+    _tiny_model(vocab_size=300).save_pretrained(directory)
+
+    # Byte-level vocabulary with no merges: every byte is its own token, so
+    # Japanese fixtures tokenize without shipping a real vocab file.
+    vocab = {"<pad>": 0, "<unk>": 1, "<s>": 2, "</s>": 3}
+    for index, character in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet())):
+        vocab[character] = index + 4
+    tokenizer = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="<s> $A </s>",
+        pair="<s> $A </s> <s> $B </s>",
+        special_tokens=[("<s>", 2), ("</s>", 3)],
+    )
+    tokenizer.decoder = decoders.ByteLevel()
+    PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        pad_token="<pad>",
+        unk_token="<unk>",
+        bos_token="<s>",
+        eos_token="</s>",
+        model_max_length=64,
+    ).save_pretrained(directory)
+
+    _write_json(
+        directory / mb.POOLING_DIRNAME / "config.json",
+        {"word_embedding_dimension": 32, pooling_flag: True},
+    )
+    return directory
+
+
+@pytest.fixture(scope="module")
+def cls_embedding_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Synthetic ModernBERT embedding model directory declaring CLS pooling."""
+    return _write_model_directory(
+        tmp_path_factory.mktemp("modernbert-embedding-cls"), pooling_flag="pooling_mode_cls_token"
+    )
+
+
+def test_synthetic_cls_embedding_model_wrap_matches_the_fp32_reference(
+    cls_embedding_dir: Path,
+) -> None:
+    """A directory declaring CLS pooling must wire that pooling through wrap and the baseline.
+
+    Unlike the real-model smoke tests below (gated to a local machine and
+    only ever exercising ruri-v3-310m's mean pooling), this runs against a
+    tiny synthetic directory and therefore always runs. If either wrap() or
+    reference_outputs() silently fell back to mean pooling, the two sides
+    would disagree well beyond the patch-vs-reference kernel tolerance.
+    """
+    smoke = _run_smoke(cls_embedding_dir, "embedding", seq_len=_SYNTHETIC_SMOKE_SEQ_LEN)
+
+    assert smoke["handle"]["pooling"] == "cls"
+    assert np.isfinite(smoke["patched"]).all()
+    assert np.abs(smoke["patched"] - smoke["reference"]).max() < PATCH_ABS_TOLERANCE
 
 
 @pytest.mark.parametrize("smoke_fixture", ["embedding_smoke", "reranker_smoke"])
@@ -595,7 +796,13 @@ def test_tokenize_returns_fixed_shape_int32_arrays(
 def test_load_returns_a_conforming_handle(
     smoke_fixture: str, kind: str, pooling: str | None, request: pytest.FixtureRequest
 ) -> None:
-    """load must hand back an eval/FP32/tuple-output model plus its tokenizer and config."""
+    """load must hand back an eval/FP32/tuple-output model plus its tokenizer and config.
+
+    ``pooling`` for the embedding case is not a hard-coded constant: it is
+    whatever load() detected from ruri-v3-310m's own
+    ``1_Pooling/config.json`` (which declares mean pooling), so this also
+    doubles as a real-weight check that the detection is wired correctly.
+    """
     handle = request.getfixturevalue(smoke_fixture)["handle"]
 
     assert handle["kind"] == kind

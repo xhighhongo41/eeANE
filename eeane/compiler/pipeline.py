@@ -70,6 +70,7 @@ from eeane.compiler.artifacts import (
     write_config_snippet,
     write_json_record,
 )
+from eeane.compiler.backends.common import read_pooling_mode
 from eeane.compiler.dispatch import DispatchError, resolve_dispatch
 from eeane.compiler.tokenizer_freeze import (
     TokenizerFreezeError,
@@ -159,6 +160,13 @@ class _CompileContext:
         model_dir: Resolved (read-only) model directory.
         model_id: Model id used in the config snippet and model_info.json.
         kind: Resolved model kind.
+        pooling: Pooling mode (``"mean"`` or ``"cls"``) the embedding
+            model's sentence-transformers declaration selects, resolved
+            once via :func:`_declared_pooling`. ``None`` for a reranker
+            (whose pooling belongs to the classification head, not a
+            declaration) or when the declaration could not be read; the
+            backend's own ``load()`` is what raises on that for an
+            embedding model, this field simply has nothing to record.
         output_name: Core ML graph output name for ``kind``.
         batch_size: Fixed batch size B.
         model_root: ``<out-dir>/compiled/<model-name>`` directory.
@@ -173,6 +181,7 @@ class _CompileContext:
     model_dir: Path
     model_id: str
     kind: str
+    pooling: str | None
     output_name: str
     batch_size: int
     model_root: Path
@@ -280,6 +289,9 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     _progress(f"      architecture    : {dispatch.architecture} -> {dispatch.backend_name}")
     buckets = _apply_max_seq_len(backend, model_dir, buckets, explicit=args.buckets is not None)
     _progress(f"      kind / buckets  : {kind} / {', '.join(str(b) for b in buckets)}")
+    pooling = _declared_pooling(kind, model_dir)
+    if pooling is not None:
+        _progress(f"      pooling         : {pooling}")
 
     out_root = resolve_out_root(args.out_dir)
     model_root = out_root / CACHE_SUBDIR / model_cache_name(args.source, model_dir)
@@ -309,6 +321,7 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
         model_dir=model_dir,
         model_id=model_identifier(args.source, model_dir),
         kind=kind,
+        pooling=pooling,
         output_name=output_name,
         batch_size=batch_size,
         model_root=model_root,
@@ -508,6 +521,36 @@ def _apply_max_seq_len(
             f"length ({limit}); rerun with --buckets set to at most {limit}"
         )
     return kept
+
+
+def _declared_pooling(kind: str, model_dir: Path) -> str | None:
+    """Best-effort read of the pooling mode an embedding model declares.
+
+    This is for *recording and comparing* what a run compiled, not an
+    authoritative gate: an embedding backend's own ``load()`` is what
+    raises a full explanation when the declaration is missing or
+    unreadable, and that error must reach the user exactly as before.
+    This helper must never fail the run just because it could not
+    resolve the mode, so it reports ``None`` for anything it cannot
+    determine rather than raising.
+
+    Args:
+        kind: Resolved model kind.
+        model_dir: Read-only model directory.
+
+    Returns:
+        ``"mean"`` or ``"cls"`` for an embedding model whose
+        ``1_Pooling/config.json`` declares exactly one supported mode.
+        ``None`` for a reranker (its pooling belongs to the model's own
+        classification head, not a sentence-transformers declaration) or
+        when the declaration cannot be read.
+    """
+    if kind == "reranker":
+        return None
+    try:
+        return read_pooling_mode(model_dir)
+    except ValueError:
+        return None
 
 
 def _convert_variants(
@@ -720,6 +763,7 @@ def _plan_variants(context: _CompileContext, buckets: Sequence[int]) -> list[Var
                     metadata_path,
                     context.versions,
                     force=bool(context.args.force),
+                    pooling=context.pooling,
                 ),
             )
         )
@@ -833,7 +877,10 @@ def _build_metadata(
         selfcheck: Self-check report (possibly ``status="skipped"``).
 
     Returns:
-        A JSON-serializable metadata record.
+        A JSON-serializable metadata record. Its ``variant.pooling`` is
+        ``None`` (JSON ``null``) for a reranker, or when the embedding
+        model's declaration could not be read; see
+        :attr:`_CompileContext.pooling`.
     """
     return {
         "format_version": METADATA_FORMAT_VERSION,
@@ -844,6 +891,7 @@ def _build_metadata(
             "batch_size": context.batch_size,
             "kind": context.kind,
             "output_name": context.output_name,
+            "pooling": context.pooling,
         },
         "args": dict(context.recorded_args),
         "versions": dict(context.versions),
@@ -891,12 +939,15 @@ def _build_model_info(
         A JSON-serializable summary; the input ``eeane.config``'s cache
         auto-resolution reads, hence the ``format_version``. The batched
         table is an addition a reader that does not know it simply
-        ignores, so it needs no new ``format_version``.
+        ignores, so it needs no new ``format_version``. ``pooling`` is
+        another such addition: ``None`` (JSON ``null``) for a reranker,
+        or when the embedding model's declaration could not be read.
     """
     record: dict[str, Any] = {
         "format_version": MODEL_INFO_FORMAT_VERSION,
         "id": context.model_id,
         "kind": context.kind,
+        "pooling": context.pooling,
         "output_name": context.output_name,
         "buckets": sorted(artifacts),
         "tokenizer": TOKENIZER_FILENAME,
