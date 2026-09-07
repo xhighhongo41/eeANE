@@ -731,6 +731,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.4.5 | Adds `poc_qwen/`, a study of whether decoder-only (causal LM) embedding models run on the Neural Engine, and of how large a model can get before it stops being accepted there; no engine changes |
 | 1.4.0 | Compile self-check now scores three fixed language sets (English, Japanese, Chinese) and accepts whichever clears the threshold, instead of one fixed set that could fail on a model with different vocabulary; support for sentence-transformers Dense projection modules (`Transformer -> Pooling -> Dense -> Normalize`); `RobertaModel`-architecture models now route to the XLM-RoBERTa backend; OpenAI-compatible `dimensions` parameter on `/v1/embeddings`; nine more verified models (51 -> 60) |
 | 1.3.0 | ModernBERT backend detects mean/CLS pooling from the model's sentence-transformers declaration instead of compiling mean pooling only, so CLS-pooling ModernBERT embedding models (e.g. the granite-embedding-*-r2 family) now compile correctly; the resolved pooling is recorded in the compile log and artifact metadata; five more verified models (gte-modernbert-base and four granite-embedding-*-r2 models) |
 | 1.2.0 | 35 more verified models across all three backends (granite, Snowflake Arctic Embed, GTE, mxbai, MiniLM, e5, small ruri-v3, Chinese bge v1.5, Japanese rerankers) and a Verified models table; no engine changes |

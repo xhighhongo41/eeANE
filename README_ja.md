@@ -747,6 +747,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 1.4.5 | `poc_qwen/`を追加。デコーダ型(causal LM)の埋め込みモデルがNeural Engineで動作するか、また、どのくらいの大きさまで受け付けられるかを調べる調査用スクリプト群。エンジンの変更なし |
 | 1.4.0 | コンパイルのセルフチェックが、英語・日本語・中国語の3つの固定言語セットで評価し、いずれか1セットが閾値を満たせば合格とするようになった(モデルが実際に語彙を持つ言語で判定するため)。sentence-transformersのDenseモジュール(`Transformer → Pooling → Dense → Normalize`)に対応。`RobertaModel`アーキテクチャのモデルがXLM-RoBERTaバックエンドで動作するように。OpenAI互換の`dimensions`パラメータを`/v1/embeddings`に追加。検証済みモデルを9件追加(51→60) |
 | 1.3.0 | ModernBERTバックエンドが、meanのみのコンパイルから、モデルのsentence-transformers宣言に基づくmean/CLSプーリングの自動判別に対応し、CLSプーリングを宣言するModernBERT系embeddingモデル(granite-embedding-*-r2系など)も正しくコンパイルできるようになった。判別したプーリングはコンパイルログと成果物メタデータに記録される。検証済みモデルを5件追加(gte-modernbert-base、granite-embedding-*-r2系4件) |
 | 1.2.0 | 3つのバックエンド全体で35モデルを追加検証(granite・Snowflake Arctic Embed・GTE・mxbai・MiniLM・e5・ruri-v3の小型・中国語版bge v1.5・日本語reranker)し、検証済みモデルの一覧表を新設。エンジンの変更なし |
