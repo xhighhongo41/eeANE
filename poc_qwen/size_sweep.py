@@ -133,6 +133,36 @@ CONFIGS: dict[str, SizeConfig] = {
     "a_0.6b": SizeConfig(
         hidden_size=1024, num_attention_heads=16, intermediate_size=3072, num_hidden_layers=28
     ),
+    # The three configurations below bracket the point where placement was
+    # first observed to collapse: 0.6b lands almost entirely on the Neural
+    # Engine while 1.1b lands entirely on the CPU, so these fill that gap in
+    # roughly even steps of compiled weight size.
+    #
+    # Grouped-query attention requires the query head count to be an exact
+    # multiple of the key/value head count, so the head count cannot be
+    # varied freely to hit an intermediate size. These configurations keep
+    # it at the same value the smallest configuration uses and widen only
+    # the hidden and feed-forward dimensions, which is enough to sweep the
+    # size range and leaves the attention structure untouched between them.
+    "a2_0.7b": SizeConfig(
+        hidden_size=1152, num_attention_heads=16, intermediate_size=3456, num_hidden_layers=28
+    ),
+    "a3_0.8b": SizeConfig(
+        hidden_size=1280, num_attention_heads=16, intermediate_size=3840, num_hidden_layers=28
+    ),
+    "a4_1.0b": SizeConfig(
+        hidden_size=1408, num_attention_heads=16, intermediate_size=4224, num_hidden_layers=28
+    ),
+    # These two straddle a compiled weight size of 2 GiB. Placement was
+    # found to hold at 1.78 GB and to be lost entirely at 2.36 GB, and a
+    # two-gigabyte limit is a plausible shape for such a cliff, so these
+    # sit just below and just above it to test that reading.
+    "a5_1.0b": SizeConfig(
+        hidden_size=1472, num_attention_heads=16, intermediate_size=4416, num_hidden_layers=28
+    ),
+    "a6_1.1b": SizeConfig(
+        hidden_size=1536, num_attention_heads=16, intermediate_size=4608, num_hidden_layers=28
+    ),
     "b_1.1b": SizeConfig(
         hidden_size=1536, num_attention_heads=24, intermediate_size=4608, num_hidden_layers=28
     ),
