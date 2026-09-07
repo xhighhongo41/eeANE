@@ -47,6 +47,16 @@ HF_ALLOW_PATTERNS: tuple[str, ...] = (
     "modules.json",
     "*_Dense/*.json",
     "*_Dense/*.safetensors",
+    # The score declaration of a generative reranker: it names the two
+    # vocabulary entries whose logits carry the verdict, so the conversion
+    # cannot pick them without this file. Requested by name for the same
+    # reason as the two above.
+    "1_LogitScore/*.json",
+    # A chat template shipped as a separate file rather than inside
+    # tokenizer_config.json. A model whose inputs are chat turns needs it
+    # to state its own formatting, which is what a generative reranker's
+    # prompt is checked against.
+    "*.jinja",
 )
 
 # Name of the sentence-transformers module declaration and the type suffix
