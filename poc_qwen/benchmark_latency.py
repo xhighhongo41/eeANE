@@ -39,9 +39,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 from poc_qwen import common  # noqa: E402
 
-# Maps the --compute-units CLI choice to the coremltools enum.
+# Maps the --compute-units CLI choice to the coremltools enum. Both
+# single-accelerator options matter for interpreting a result: "cpu_only"
+# separates the accelerator's contribution from the graph itself, and
+# "cpu_and_gpu" gives the comparison against the accelerator a serving
+# stack would otherwise use on this hardware.
 _COMPUTE_UNITS: dict[str, ct.ComputeUnit] = {
     "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
+    "cpu_and_gpu": ct.ComputeUnit.CPU_AND_GPU,
     "cpu_only": ct.ComputeUnit.CPU_ONLY,
     "all": ct.ComputeUnit.ALL,
 }
