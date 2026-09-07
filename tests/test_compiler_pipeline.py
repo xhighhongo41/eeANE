@@ -38,7 +38,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 from transformers.models.modernbert import modeling_modernbert
 
-from eeane import __version__, cli
+from eeane import __version__, cli, runtime
 from eeane.compiler import artifacts, pipeline, selfcheck
 from eeane.compiler.backends import base
 from eeane.compiler.backends import modernbert as mb
@@ -2079,6 +2079,9 @@ def test_e2e_dense_embedding_model_converts_and_widens_the_embedding(
 # keep the (stubbed) artifacts trivial.
 _FAMILY_SEQ_LEN = 16
 
+# Artifact name a stub-driven run of that bucket produces.
+_FAMILY_STEM = f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlmodelc"
+
 
 class _FamilyBackend(_StubBackend):
     """Stub backend answering every question a whole ``run()`` asks.
@@ -2111,14 +2114,50 @@ class _FamilyBackend(_StubBackend):
         """Return the fixed trace example of ``kind``."""
         return ("q", "d") if kind == "reranker" else "example"
 
+    def pair_template(self, model_dir: Path, kind: str) -> Any:
+        """Report that this stub's pairs need no shaping."""
+        return None
 
-def _install_family_stubs(monkeypatch: pytest.MonkeyPatch, kind: str = "embedding") -> None:
+    def reranker_score_space(self) -> str:
+        """Report the space every cross-encoder reranker is measured in."""
+        return base.SCORE_SPACE_PROBABILITY
+
+
+# Template a stub backend of a generative reranker publishes.
+_STUB_PAIR_TEMPLATE = runtime.PairTemplate(
+    prefix="<<ask>>", body_format="q={query} d={document}", suffix="<<answer>>"
+)
+
+
+class _TemplateBackend(_FamilyBackend):
+    """Stub backend of a reranker whose pairs must be spelled out."""
+
+    def pair_template(self, model_dir: Path, kind: str) -> Any:
+        """Publish the fixed template for the reranker kind only."""
+        return _STUB_PAIR_TEMPLATE if kind == "reranker" else None
+
+    def reranker_score_space(self) -> str:
+        """Report that this stub's scores are faithful as raw logits."""
+        return base.SCORE_SPACE_LOGIT
+
+
+def _install_family_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str = "embedding",
+    backend_class: type = _FamilyBackend,
+) -> list[dict[str, Any]]:
     """Stub dispatch, tokenizer freezing and conversion for a whole run.
 
     Args:
         monkeypatch: Fixture the stubs are installed with.
         kind: Model kind the stub dispatch reports.
+        backend_class: Stub backend the dispatch hands back.
+
+    Returns:
+        A list the stubbed tokenizer verification records its arguments
+        in, so a test can prove what the pipeline handed it.
     """
+    verifications: list[dict[str, Any]] = []
 
     class _StubDispatch:
         """Dispatch result pointing at the family backend stub."""
@@ -2131,7 +2170,7 @@ def _install_family_stubs(monkeypatch: pytest.MonkeyPatch, kind: str = "embeddin
 
         def load_backend(self) -> Any:
             """Return the stub backend instance."""
-            return _FamilyBackend()
+            return backend_class()
 
     def _fake_freeze(model_dir: Path, tokenizer_path: Path) -> dict[str, Any]:
         tokenizer_path.write_text("{}", encoding="utf-8")
@@ -2148,19 +2187,25 @@ def _install_family_stubs(monkeypatch: pytest.MonkeyPatch, kind: str = "embeddin
         texts: list[str],
         pairs: list[tuple[str, str]],
         buckets: list[int],
+        pair_template: Any = None,
     ) -> dict[str, Any]:
+        verifications.append({"pair_template": pair_template, "buckets": list(buckets)})
         return {
             "passed": True,
             "buckets": list(buckets),
             "n_texts": len(texts),
             "n_pairs": len(pairs),
             "n_comparisons": len(texts) * len(buckets),
+            "pair_template": None
+            if pair_template is None
+            else {"prefix_tokens": 3, "suffix_tokens": 4},
         }
 
     monkeypatch.setattr(pipeline, "resolve_dispatch", lambda model_dir, asked: _StubDispatch(kind))
     monkeypatch.setattr(pipeline, "freeze_tokenizer", _fake_freeze)
     monkeypatch.setattr(pipeline, "verify_frozen_tokenizer", _fake_verify)
     _install_stub_conversion(monkeypatch)
+    return verifications
 
 
 def _stub_source(
@@ -2201,9 +2246,10 @@ def _run_stub_compile(
     batch: int = 1,
     buckets: int = _FAMILY_SEQ_LEN,
     kind: str = "embedding",
+    backend_class: type = _FamilyBackend,
 ) -> int:
     """Run the whole pipeline against the stubs and return its exit code."""
-    _install_family_stubs(monkeypatch, kind=kind)
+    _install_family_stubs(monkeypatch, kind=kind, backend_class=backend_class)
     return pipeline.run(
         _compile_args(
             str(source),
@@ -2486,3 +2532,154 @@ def test_a_stub_run_without_a_dense_logs_no_such_line(
     assert _run_stub_compile(monkeypatch, source, out_dir) == 0
 
     assert "dense" not in capsys.readouterr().err
+
+
+# --- recording how a reranker wants its pairs spelled out -----------------------
+
+
+def test_the_record_format_version_is_the_one_the_server_reads() -> None:
+    """The pair template is a new key, so a record carrying it announces itself."""
+    assert artifacts.MODEL_INFO_FORMAT_VERSION == 3
+
+
+def test_a_run_records_the_template_the_backend_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The served request path must lay a pair out exactly as the conversion did."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    exit_code = _run_stub_compile(
+        monkeypatch, source, out_dir, kind="reranker", backend_class=_TemplateBackend
+    )
+
+    assert exit_code == 0
+    info = _stub_model_info(out_dir, source)
+    assert info["pair_template"] == {
+        "prefix": _STUB_PAIR_TEMPLATE.prefix,
+        "body_format": _STUB_PAIR_TEMPLATE.body_format,
+        "suffix": _STUB_PAIR_TEMPLATE.suffix,
+    }
+
+
+def test_a_run_of_a_model_needing_no_template_records_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record of a model that shapes nothing must read exactly as it always did."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, kind="reranker") == 0
+
+    assert "pair_template" not in _stub_model_info(out_dir, source)
+
+
+def test_the_recorded_template_round_trips_through_the_config_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The record is only useful if the server's own loader accepts it.
+
+    Resolves an id-only entry against the cache the run just wrote, which
+    is the path a served reranker actually takes.
+    """
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    assert (
+        _run_stub_compile(
+            monkeypatch, source, out_dir, kind="reranker", backend_class=_TemplateBackend
+        )
+        == 0
+    )
+    model_root = out_dir / artifacts.CACHE_SUBDIR / source.name
+    config_path = tmp_path / "eeane.toml"
+    # A served configuration needs an embedding entry too; it is spelled
+    # out here so that only the reranker entry exercises cache resolution.
+    config_path.write_text(
+        "[server]\n"
+        f"cache_root = {artifacts._toml_string(str(out_dir))}\n\n"
+        "[[models]]\n"
+        'id = "stub-embedding"\n'
+        'kind = "embedding"\n'
+        f"tokenizer = {artifacts._toml_string(str(model_root / artifacts.TOKENIZER_FILENAME))}\n"
+        "[models.artifacts]\n"
+        f"{_FAMILY_SEQ_LEN} = {artifacts._toml_string(str(model_root / _FAMILY_STEM))}\n\n"
+        "[[models]]\n"
+        f"id = {artifacts._toml_string(source.name)}\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = next(model for model in loaded.config.models if model.kind == "reranker")
+    assert entry.pair_template is not None
+    assert entry.pair_template.prefix == _STUB_PAIR_TEMPLATE.prefix
+    assert entry.pair_template.body_format == _STUB_PAIR_TEMPLATE.body_format
+    assert entry.pair_template.suffix == _STUB_PAIR_TEMPLATE.suffix
+
+
+def test_the_template_reaches_the_frozen_tokenizer_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate proves the frozen tokenizer builds the templated rows too."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    verifications = _install_family_stubs(
+        monkeypatch, kind="reranker", backend_class=_TemplateBackend
+    )
+
+    exit_code = pipeline.run(
+        _compile_args(str(source), "--buckets", str(_FAMILY_SEQ_LEN), "--out-dir", str(out_dir))
+    )
+
+    assert exit_code == 0
+    assert [entry["pair_template"] for entry in verifications] == [_STUB_PAIR_TEMPLATE]
+
+
+def test_no_template_reaches_the_gate_for_a_model_without_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model shaping nothing must be verified through the plain pair encoding."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    verifications = _install_family_stubs(monkeypatch, kind="reranker")
+
+    exit_code = pipeline.run(
+        _compile_args(str(source), "--buckets", str(_FAMILY_SEQ_LEN), "--out-dir", str(out_dir))
+    )
+
+    assert exit_code == 0
+    assert [entry["pair_template"] for entry in verifications] == [None]
+
+
+def test_a_templated_run_reports_what_the_template_costs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The progress output must say this is a model of the generative kind."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert (
+        _run_stub_compile(
+            monkeypatch, source, out_dir, kind="reranker", backend_class=_TemplateBackend
+        )
+        == 0
+    )
+
+    progress = capsys.readouterr().err
+    assert "pair template" in progress
+    # How much of every bucket the fixed halves take, and that the scores
+    # are held to the raw-logit measure rather than the probability one.
+    assert "3" in progress and "4" in progress
+    assert base.SCORE_SPACE_LOGIT in progress
+
+
+def test_an_untemplated_run_reports_no_template_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A model shaping nothing must print the output it always did."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir, kind="reranker") == 0
+
+    assert "pair template" not in capsys.readouterr().err

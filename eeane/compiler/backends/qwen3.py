@@ -1,4 +1,4 @@
-"""Qwen3 compile backend for decoder-style embedding models.
+"""Qwen3 compile backend for decoder-style embedding models and rerankers.
 
 Every other backend in this package compiles an encoder: a bidirectional
 stack whose attention mask is a plain padding mask and whose sentence
@@ -26,7 +26,25 @@ The model kind cannot be told from the architecture name: a decoder-style
 embedding model and a decoder-style reranker are both published as
 ``Qwen3ForCausalLM``. :mod:`eeane.compiler.dispatch` therefore resolves
 the kind from the sentence-transformers module declaration of the model
-directory instead. This backend compiles the embedding kind.
+directory instead. This backend compiles both kinds.
+
+The reranker of this family is not a classifier either. It is the same
+causal backbone, asked through a fixed chat prompt whether a document
+meets a query, and its verdict is the logit of one vocabulary entry
+against another at the final position. Two consequences shape the
+conversion:
+
+* **The pair is spelled out, not pair-encoded.** The prompt is a fixed
+  prefix, a body carrying the instruction, the query and the document,
+  and a fixed suffix ending in the turn the answer is read at; only the
+  body may be truncated. :meth:`Qwen3Backend.pair_template` publishes
+  that layout so the server lays a request's pairs out the same way.
+* **The graph emits one number, not a vocabulary.** The relevance
+  probability of a two-way choice is ``sigmoid(true - false)``, so a
+  single ``(1, hidden)`` weight -- the difference of the two vocabulary
+  rows -- turns the pooled state straight into the logit the server
+  already applies a sigmoid to. The vocabulary-wide projection never
+  enters the graph at all.
 
 Importing this module pulls in ``torch``/``transformers``; it therefore
 requires the ``[compile]`` extra and must never be imported from the
@@ -42,21 +60,36 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
+from safetensors import safe_open
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3 import modeling_qwen3
 
-from eeane.compiler.backends.base import LoadedModel, SanitySpec
+from eeane.compiler.backends.base import (
+    SCORE_SPACE_LOGIT,
+    LoadedModel,
+    PairTemplate,
+    SanitySpec,
+)
 from eeane.compiler.backends.common import (
     POOLING_DIRNAME,
     POOLING_LASTTOKEN,
     POOLING_MODE_KEYS,
     POOLING_MODE_PREFIX,
+    SANITY_IRRELEVANT_INDEX,
+    SANITY_PAIR_SETS,
+    SANITY_RELEVANT_INDEX,
     SANITY_TEXT_SETS,
+    ST_CONFIG_FILENAME,
+    check_scoring_module_chain,
     encode_pytorch,
     last_token_pool,
     load_dense,
+    read_default_prompt,
+    read_logit_score,
     read_pooling_mode,
+    score_pytorch_generative,
     tokenize_batch,
+    tokenize_templated_pairs,
 )
 
 # Public surface of this module, including the architecture-independent
@@ -64,6 +97,7 @@ from eeane.compiler.backends.common import (
 __all__ = [
     "CONFIG_FILENAME",
     "EMBEDDING_WRAPPERS",
+    "LM_HEAD_WEIGHT_KEY",
     "MASK_FILL_VALUE",
     "MAX_POSITION_KEY",
     "MODEL_TYPE",
@@ -71,12 +105,18 @@ __all__ = [
     "POOLING_DIRNAME",
     "POOLING_MODE_KEYS",
     "POOLING_MODE_PREFIX",
+    "RERANKER_BODY_FORMAT",
+    "RERANKER_PROMPT_PREFIX",
+    "RERANKER_PROMPT_SUFFIX",
+    "SANITY_PAIR_SETS",
     "SANITY_SPECS",
     "SANITY_TEXT_SETS",
     "SUPPORTED_KINDS",
     "CausalLastTokenWrapper",
+    "GenerativeRerankerWrapper",
     "Qwen3Backend",
     "build_causal_padding_mask",
+    "build_score_weight",
     "encode_pytorch",
     "last_token_pool",
     "load_dense",
@@ -84,16 +124,28 @@ __all__ = [
     "patch_rotate_half",
     "read_pooling_mode",
     "tokenize_batch",
+    "tokenize_templated_pairs",
 ]
 
-# Model kinds understood by this backend. The decoder-style reranker of
-# this family scores a pair by reading a single vocabulary logit, which is
-# a different graph from the one built here; it is not compiled yet.
+# Model kinds understood by this backend. Both are the same causal
+# backbone: the embedding kind pools it into a sentence vector, the
+# reranker kind reads a yes/no verdict off its final position.
 KIND_EMBEDDING = "embedding"
-SUPPORTED_KINDS: tuple[str, ...] = (KIND_EMBEDDING,)
+KIND_RERANKER = "reranker"
+SUPPORTED_KINDS: tuple[str, ...] = (KIND_EMBEDDING, KIND_RERANKER)
 
-# Core ML graph output name per kind.
-OUTPUT_NAMES: dict[str, str] = {KIND_EMBEDDING: "embedding"}
+# Core ML graph output name per kind. The reranker emits one raw logit per
+# row, under the name every other reranker of this project uses, so the
+# server needs nothing new to read it.
+OUTPUT_NAMES: dict[str, str] = {KIND_EMBEDDING: "embedding", KIND_RERANKER: "logits"}
+
+# Checkpoint entry holding the output projection onto the vocabulary. Only
+# two of its rows are ever read (see :func:`build_score_weight`), and only
+# for a checkpoint that does not tie that projection to its input
+# embeddings.
+LM_HEAD_WEIGHT_KEY = "lm_head.weight"
+SAFETENSORS_SUFFIX = ".safetensors"
+TIE_WORD_EMBEDDINGS_KEY = "tie_word_embeddings"
 
 # Additive value written into the masked-out positions of the attention
 # mask. The value the framework itself uses is the float32 minimum, which
@@ -117,16 +169,65 @@ MODEL_TYPE = "qwen3"
 # Short English sentence used as the example input for torch.jit.trace.
 TRACE_EXAMPLE_TEXT = "This is a short sample sentence used for conversion."
 
+# Fixed (query, document) pair used as the reranker's tracing example.
+# Only its shape reaches the graph, so a constant pair keeps tracing
+# independent of any measurement data.
+TRACE_EXAMPLE_PAIR: tuple[str, str] = (
+    "What is the capital of France?",
+    "Paris is the capital and the most populous city of France.",
+)
+
 # Filler row used to pad the last sanity batch when the number of sanity
 # inputs is not a multiple of B. It is a real sentence rather than an
 # empty string: every row of a causal batch must keep at least one
 # attendable position, since a fully masked row can produce NaN.
 BATCH_PADDING_TEXT = "This sentence only fills an unused row of the batch."
 
+# The same for a reranker batch: a filler pair, not an empty one.
+BATCH_PADDING_PAIR: tuple[str, str] = (
+    "Which pair fills an unused row?",
+    "This pair only fills an unused row of the batch.",
+)
+
+# The chat prompt this family publishes for its rerankers, spelled out as
+# the two fixed halves surrounding the pair and the body between them.
+#
+# The control tokens are written as plain text, so both halves are encoded
+# with ``add_special_tokens=False``: letting the tokenizer contribute its
+# own would duplicate them and ask the model a question it was not trained
+# on. Rendering the model's own chat template over a system turn, a query
+# turn and a document turn reproduces these three strings exactly, which
+# is what makes spelling them out here equivalent to applying that
+# template -- and far cheaper, since the two fixed halves are then encoded
+# once per model instead of once per pair.
+#
+# ``{instruction}`` is filled in from what the model directory declares
+# (see :meth:`Qwen3Backend.pair_template`); ``{query}`` and ``{document}``
+# stay in place and become the markers of the published pair template.
+RERANKER_PROMPT_PREFIX = (
+    "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query "
+    'and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n'
+    "<|im_start|>user\n"
+)
+RERANKER_BODY_FORMAT = "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}"
+RERANKER_PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+# Marker the declared instruction is written into before the template is
+# published. It is substituted first and by plain replacement, so the two
+# remaining markers are the ones a pair template carries.
+INSTRUCTION_PLACEHOLDER = "{instruction}"
+
 # Sanity fixtures per kind, as handed to the pipeline and the self-check.
 # The shared per-language sets are used unchanged: no model of this family
 # has been measured on fixtures of its own, so there is nothing to keep.
-SANITY_SPECS: dict[str, SanitySpec] = {KIND_EMBEDDING: SanitySpec(input_sets=SANITY_TEXT_SETS)}
+SANITY_SPECS: dict[str, SanitySpec] = {
+    KIND_EMBEDDING: SanitySpec(input_sets=SANITY_TEXT_SETS),
+    KIND_RERANKER: SanitySpec(
+        input_sets=SANITY_PAIR_SETS,
+        relevant_index=SANITY_RELEVANT_INDEX,
+        irrelevant_index=SANITY_IRRELEVANT_INDEX,
+    ),
+}
 
 
 def patch_rotate_half() -> None:
@@ -278,6 +379,190 @@ class CausalLastTokenWrapper(torch.nn.Module):
         return self.dense(pooled)
 
 
+class GenerativeRerankerWrapper(torch.nn.Module):
+    """Wraps a causal backbone and emits one relevance logit per row.
+
+    The backbone is masked and pooled exactly as the embedding wrapper
+    does -- a 4-D causal-plus-padding mask built in-graph, then the last
+    real token of the row -- and the pooled state is projected by a single
+    baked-in weight into the one number the graph returns.
+
+    That one number is the difference between the two vocabulary logits
+    the model's verdict is read from. It is all the graph needs to emit,
+    because the relevance probability of a two-way choice is
+
+        softmax([false, true])[true] = 1 / (1 + exp(false - true))
+                                     = sigmoid(true - false)
+
+    which is exactly what the server already computes from a reranker's
+    raw logit. Emitting the difference therefore keeps the served result
+    identical to the model's published procedure while leaving the
+    vocabulary-wide projection -- a matrix of six figures' worth of rows --
+    out of the graph entirely.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        score_weight: torch.Tensor,
+        fill_value: float = MASK_FILL_VALUE,
+    ) -> None:
+        """Store the backbone, the baked scoring weight and the mask fill value.
+
+        Args:
+            model: Backbone returning the last hidden state first, loaded
+                in eval/FP32 mode with ``config.return_dict = False`` and
+                ``config.use_cache = False``.
+            score_weight: ``(1, hidden_size)`` weight the pooled state is
+                projected with, as built by :func:`build_score_weight`.
+            fill_value: Additive value for masked positions; see
+                :data:`MASK_FILL_VALUE`.
+
+        Raises:
+            ValueError: If ``score_weight`` is not ``(1, hidden_size)``.
+        """
+        super().__init__()
+        if score_weight.dim() != 2 or int(score_weight.shape[0]) != 1:
+            raise ValueError(
+                f"score_weight must have shape (1, hidden_size), got {tuple(score_weight.shape)}"
+            )
+        self.model = model
+        self.fill_value = fill_value
+        # Registered as a buffer, so the weight is a constant of the
+        # traced graph rather than a second input to feed at predict time.
+        self.register_buffer("score_weight", score_weight.detach().to(torch.float32).clone())
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Score a batch of templated rows.
+
+        Args:
+            input_ids: Token ids, shape (B, S).
+            attention_mask: Attention mask, shape (B, S); non-zero marks a
+                real token, and padding is on the right.
+
+        Returns:
+            Raw relevance logits of shape (B, 1).
+        """
+        mask = build_causal_padding_mask(attention_mask, self.fill_value)  # (B, 1, S, S)
+        outputs = self.model(input_ids=input_ids, attention_mask=mask)
+        hidden = outputs[0]  # (B, S, H)
+        pooled = last_token_pool(hidden, attention_mask)  # (B, H)
+        return torch.nn.functional.linear(pooled, self.score_weight)  # (B, 1)
+
+
+def build_score_weight(
+    model: torch.nn.Module, model_dir: Path, true_token_id: int, false_token_id: int
+) -> torch.Tensor:
+    """Build the one-row weight whose product is the relevance logit.
+
+    Args:
+        model: Loaded backbone; its input embedding matrix is the output
+            projection whenever the checkpoint ties the two.
+        model_dir: Read-only model directory the checkpoint lives in, read
+            only when the projection is not tied.
+        true_token_id: Vocabulary id whose logit rises with relevance.
+        false_token_id: Vocabulary id it is scored against.
+
+    Returns:
+        FP32 tensor of shape ``(1, hidden_size)``.
+
+    Raises:
+        ValueError: If the projection cannot be reached at all, or if an
+            id is outside the vocabulary it addresses.
+    """
+    ids = (true_token_id, false_token_id)
+    rows = None
+    if bool(getattr(model.config, TIE_WORD_EMBEDDINGS_KEY, False)):
+        # A tied checkpoint stores no output projection of its own: the
+        # input embedding matrix is that projection.
+        embeddings = model.get_input_embeddings()
+        weight = getattr(embeddings, "weight", None)
+        if weight is not None:
+            rows = _select_score_rows(weight, ids, "the tied input embedding matrix")
+    if rows is None:
+        rows = _read_lm_head_rows(model_dir, ids)
+    if rows is None:
+        raise ValueError(
+            f"neither a tied input embedding matrix nor a '{LM_HEAD_WEIGHT_KEY}' entry in "
+            f"'{model_dir}' provides the output projection the two scoring rows are read "
+            "from, so this checkpoint cannot be compiled as a generative reranker"
+        )
+    # One row, so the graph's matrix product yields the logit difference
+    # directly: (true row - false row) . pooled == true logit - false logit.
+    return (rows[0] - rows[1]).unsqueeze(0)
+
+
+def _select_score_rows(
+    weight: torch.Tensor, ids: tuple[int, ...], description: str
+) -> torch.Tensor:
+    """Lift the two declared rows out of an in-memory projection matrix.
+
+    Args:
+        weight: Projection matrix of shape ``(vocab, hidden)``.
+        ids: Vocabulary ids to read, in output order.
+        description: What the matrix is, named in the error.
+
+    Returns:
+        FP32 tensor of shape ``(len(ids), hidden)``.
+
+    Raises:
+        ValueError: If an id is outside the matrix.
+    """
+    vocabulary = int(weight.shape[0])
+    _check_score_ids(ids, vocabulary, description)
+    index = torch.tensor(list(ids), dtype=torch.long, device=weight.device)
+    return weight.detach().index_select(0, index).to(torch.float32)
+
+
+def _read_lm_head_rows(model_dir: Path, ids: tuple[int, ...]) -> torch.Tensor | None:
+    """Read a few rows of a stored output projection, without loading the rest.
+
+    The projection of a published checkpoint is by far its largest tensor,
+    and two of its rows is all a generative reranker needs, so the
+    safetensors slice interface is used to read those alone.
+
+    Args:
+        model_dir: Read-only model directory holding the checkpoint.
+        ids: Vocabulary ids to read, in output order.
+
+    Returns:
+        FP32 tensor of shape ``(len(ids), hidden)``, or ``None`` when no
+        shard of the directory holds an output projection.
+
+    Raises:
+        ValueError: If an id is outside the stored projection.
+    """
+    for path in sorted(model_dir.glob(f"*{SAFETENSORS_SUFFIX}")):
+        with safe_open(str(path), framework="pt") as handle:
+            if LM_HEAD_WEIGHT_KEY not in handle.keys():
+                continue
+            sliced = handle.get_slice(LM_HEAD_WEIGHT_KEY)
+            _check_score_ids(ids, int(sliced.get_shape()[0]), f"'{path}'")
+            return torch.stack([sliced[int(token_id), :] for token_id in ids]).to(torch.float32)
+    return None
+
+
+def _check_score_ids(ids: tuple[int, ...], vocabulary: int, description: str) -> None:
+    """Validate the declared ids against the projection they address.
+
+    Args:
+        ids: Vocabulary ids to read.
+        vocabulary: Number of rows the projection holds.
+        description: What the projection is, named in the error.
+
+    Raises:
+        ValueError: If an id is negative or beyond the last row. Reading
+            past the end would either fail deep inside the tensor library
+            or, worse, silently score something else.
+    """
+    for token_id in ids:
+        if not 0 <= token_id < vocabulary:
+            raise ValueError(
+                f"the declared scoring id {token_id} is outside {description}, which holds "
+                f"{vocabulary} rows"
+            )
+
+
 # Traceable wrapper per detected pooling mode. In a causal stack no
 # position but the last real token has seen the whole sequence, so the
 # encoder pooling modes describe nothing this backend could compute and
@@ -330,9 +615,11 @@ class Qwen3Backend:
         # Everything that can make a model uncompilable is decided from
         # the declarations first: loading gigabytes of FP32 parameters for
         # a model that is then refused is pure waste. The architecture is
-        # checked before the pooling because it is the more fundamental
-        # refusal of the two.
+        # checked before the rest because it is the more fundamental
+        # refusal of them all.
         self._check_model_type(model_dir)
+        if kind == KIND_RERANKER:
+            return self._load_reranker(model_dir, attn)
         pooling = read_pooling_mode(model_dir)
         dense, dense_config = load_dense(model_dir)
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
@@ -423,6 +710,17 @@ class Qwen3Backend:
                 wrapper implements.
         """
         self._check_kind(loaded.kind)
+        if loaded.kind == KIND_RERANKER:
+            if loaded.score_token_ids is None:
+                raise ValueError(
+                    f"the {self.name} reranker handle carries no scoring ids, so there is "
+                    "nothing to project the pooled state onto; it was not produced by load()"
+                )
+            true_token_id, false_token_id = loaded.score_token_ids
+            weight = build_score_weight(
+                loaded.model, loaded.model_dir, true_token_id, false_token_id
+            )
+            return GenerativeRerankerWrapper(loaded.model, weight).eval()
         wrapper_class = EMBEDDING_WRAPPERS.get(loaded.pooling or "")
         if wrapper_class is None:
             supported = ", ".join(EMBEDDING_WRAPPERS)
@@ -467,6 +765,71 @@ class Qwen3Backend:
             return None
         return value
 
+    def pair_template(self, model_dir: Path, kind: str) -> PairTemplate | None:
+        """Return how this model wants a (query, document) pair spelled out.
+
+        Args:
+            model_dir: Local HuggingFace-format model directory.
+            kind: Model kind the template is asked for.
+
+        Returns:
+            The published chat prompt with the model's own declared
+            instruction written into it, or ``None`` for the embedding
+            kind, which encodes a single text and shapes nothing.
+
+        Raises:
+            ValueError: If ``kind`` is not supported by this backend, or
+                if a reranker directory declares no default prompt.
+        """
+        self._check_kind(kind)
+        if kind != KIND_RERANKER:
+            return None
+        return self._reranker_template(model_dir)
+
+    def reranker_score_space(self) -> str:
+        """Return the space this backend's reranker scores are faithful in.
+
+        Returns:
+            :data:`~eeane.compiler.backends.base.SCORE_SPACE_LOGIT`: this
+            reranker's score is a difference of two vocabulary logits,
+            which spans a far wider range than a calibrated head's output,
+            so the raw value is what a conversion has to preserve.
+        """
+        return SCORE_SPACE_LOGIT
+
+    def _reranker_template(self, model_dir: Path) -> PairTemplate:
+        """Build the published prompt with this directory's own instruction in it.
+
+        Args:
+            model_dir: Local HuggingFace-format model directory.
+
+        Returns:
+            The pair template the reranker of ``model_dir`` is asked with.
+
+        Raises:
+            ValueError: If the directory declares no default prompt. The
+                instruction is part of the question the model was trained
+                to answer, so a substitute would ask it something else;
+                that is refused here rather than guessed at, as every
+                other undeclared property of a model is.
+        """
+        instruction = read_default_prompt(model_dir)
+        if instruction is None:
+            raise ValueError(
+                f"'{model_dir / ST_CONFIG_FILENAME}' declares no default prompt, so the "
+                f"instruction this {self.name} reranker is asked with is unknown. A "
+                "generative reranker judges a pair against that instruction, and compiling "
+                "it with a substitute would ask the model a different question than the one "
+                "it answers"
+            )
+        return PairTemplate(
+            prefix=RERANKER_PROMPT_PREFIX,
+            # Plain replacement, and before the template is built: the two
+            # markers a pair template carries are the remaining ones.
+            body_format=RERANKER_BODY_FORMAT.replace(INSTRUCTION_PLACEHOLDER, instruction),
+            suffix=RERANKER_PROMPT_SUFFIX,
+        )
+
     def trace_example(self, kind: str) -> Any:
         """Return the fixed raw example input used for ``torch.jit.trace``.
 
@@ -474,13 +837,17 @@ class Qwen3Backend:
             kind: Model kind.
 
         Returns:
-            A sentence. The caller replicates it to B rows before tracing
-            so the traced graph already carries the target batch size.
+            A sentence for an embedding model, a (query, document) pair
+            for a reranker. The caller replicates it to B rows before
+            tracing so the traced graph already carries the target batch
+            size.
 
         Raises:
             ValueError: If ``kind`` is not supported by this backend.
         """
         self._check_kind(kind)
+        if kind == KIND_RERANKER:
+            return TRACE_EXAMPLE_PAIR
         return TRACE_EXAMPLE_TEXT
 
     def sanity_spec(self, kind: str) -> SanitySpec:
@@ -504,6 +871,8 @@ class Qwen3Backend:
             ValueError: If ``kind`` is not supported by this backend.
         """
         self._check_kind(kind)
+        if kind == KIND_RERANKER:
+            return BATCH_PADDING_PAIR
         return BATCH_PADDING_TEXT
 
     def tokenize(
@@ -534,6 +903,15 @@ class Qwen3Backend:
             raise ValueError("no inputs to tokenize")
         if seq_len <= 0:
             raise ValueError(f"seq_len must be a positive integer (got {seq_len})")
+        if loaded.kind == KIND_RERANKER:
+            # The very layout the server applies at request time, so the
+            # graph is traced for the rows it will actually be fed.
+            return tokenize_templated_pairs(
+                loaded.tokenizer,
+                [(query, document) for query, document in inputs],
+                seq_len,
+                self._reranker_template(loaded.model_dir),
+            )
         return tokenize_batch(loaded.tokenizer, list(inputs), seq_len)
 
     def reference_outputs(
@@ -565,6 +943,10 @@ class Qwen3Backend:
         self._check_kind(kind)
         if not inputs:
             raise ValueError("no inputs to encode")
+        if kind == KIND_RERANKER:
+            return self._reference_scores(
+                model_dir, [(query, document) for query, document in inputs], seq_len
+            )
         loaded = self.load(model_dir, kind, attn="sdpa")
         try:
             # The baseline must pool and project exactly like the traced
@@ -579,6 +961,98 @@ class Qwen3Backend:
             )
         finally:
             del loaded
+            gc.collect()
+
+    def _load_reranker(self, model_dir: Path, attn: str) -> LoadedModel:
+        """Load the backbone of a generative reranker plus its declarations.
+
+        Args:
+            model_dir: Local HuggingFace-format model directory.
+            attn: Attention implementation to request.
+
+        Returns:
+            A handle carrying the backbone and the two declared scoring
+            ids. Neither a pooling nor a projection is recorded: this
+            model reads its verdict off the backbone's last position.
+
+        Raises:
+            ValueError: If the directory does not declare the chain, the
+                two scoring ids and the prompt this backend reproduces.
+        """
+        # Every declaration first, weights after: a directory that cannot
+        # be compiled must be refused before gigabytes of FP32 parameters
+        # are read for nothing.
+        check_scoring_module_chain(model_dir)
+        score_token_ids = read_logit_score(model_dir)
+        # Built and discarded, purely so a missing prompt declaration is
+        # refused here rather than at the first tokenization.
+        self._reranker_template(model_dir)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        # The backbone alone: the projection onto the vocabulary that this
+        # checkpoint also carries is replaced in the graph by the two rows
+        # :func:`build_score_weight` lifts out of it.
+        model = AutoModel.from_pretrained(model_dir, attn_implementation=attn, dtype=torch.float32)
+        model.config.return_dict = False
+        model.config.use_cache = False
+        return LoadedModel(
+            model=model.eval(),
+            tokenizer=tokenizer,
+            config=model.config,
+            model_dir=model_dir,
+            kind=KIND_RERANKER,
+            attn=attn,
+            score_token_ids=score_token_ids,
+        )
+
+    def _reference_scores(
+        self, model_dir: Path, pairs: list[tuple[str, str]], seq_len: int
+    ) -> np.ndarray:
+        """Compute the FP32 reference scores of a generative reranker.
+
+        Loads the whole causal language model -- output projection
+        included -- with the untouched ``sdpa`` attention path, and reads
+        the verdict the way the model's published procedure does. Running
+        the full projection is the point: the traced graph carries two
+        rows lifted out of it, so a wrong lift shows up as a disagreement
+        here rather than only against real weights.
+
+        Args:
+            model_dir: Local HuggingFace-format model directory.
+            pairs: (query, document) pairs to score.
+            seq_len: Fixed sequence length S.
+
+        Returns:
+            Scores of shape ``(len(pairs),)``, dtype float32.
+
+        Raises:
+            ValueError: If the directory does not declare what this
+                backend needs to reproduce the model.
+        """
+        # Refused in the same order :meth:`load` refuses, so a directory
+        # this backend cannot compile fails the same way whichever of the
+        # two sides of the self-check reaches it first.
+        self._check_model_type(model_dir)
+        check_scoring_module_chain(model_dir)
+        true_token_id, false_token_id = read_logit_score(model_dir)
+        template = self._reranker_template(model_dir)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, attn_implementation="sdpa", dtype=torch.float32
+        )
+        # Object outputs, unlike everywhere else in this backend: the
+        # language-model head reads its backbone's last hidden state by
+        # attribute, so a checkpoint whose configuration asks for tuples
+        # would break its own forward. Nothing is traced here, so there is
+        # no reason to ask for tuples in the first place.
+        model.config.return_dict = True
+        model.config.use_cache = False
+        model.eval()
+        try:
+            return score_pytorch_generative(
+                model, tokenizer, pairs, seq_len, template, true_token_id, false_token_id
+            )
+        finally:
+            del model, tokenizer
             gc.collect()
 
     def _check_kind(self, kind: str) -> None:

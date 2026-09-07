@@ -33,6 +33,8 @@ import torch
 from safetensors.torch import load_file
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
+from eeane.runtime import PairTemplate
+
 # Pooling modes the shared embedding helpers implement. A backend records
 # the mode it detected on its LoadedModel handle, and both the wrapper
 # selection and the FP32 baseline are driven by that value. Reading a mode
@@ -117,6 +119,59 @@ _MODULE_CHAIN_REQUIREMENT = (
     f"'{ST_MODULE_DENSE}' projections and an optional trailing "
     f"'{ST_MODULE_NORMALIZE}', in that order."
 )
+
+# Module-type suffixes of the two-module chain a generative reranker
+# declares. They are matched by suffix, not compared in full, because the
+# same two roles are published under more than one namespace (a
+# ``...models.Transformer`` and a ``...base.modules.transformer.Transformer``
+# are the same module); the chain check above keeps its exact match, since
+# the modules it accepts carry weights this package reads by path.
+ST_TRANSFORMER_SUFFIX = ".Transformer"
+ST_LOGIT_SCORE_SUFFIX = ".LogitScore"
+
+# sentence-transformers scoring module of a generative reranker: the
+# directory holding the declaration, the file inside it, and the two keys
+# naming the vocabulary entries whose logits carry the verdict.
+LOGIT_SCORE_DIRNAME = "1_LogitScore"
+LOGIT_SCORE_CONFIG_FILENAME = "config.json"
+LOGIT_SCORE_TRUE_KEY = "true_token_id"
+LOGIT_SCORE_FALSE_KEY = "false_token_id"
+
+# Appended to every scoring-declaration error. A generative reranker reads
+# two rows of its output projection and subtracts them; picking those rows
+# by guesswork would produce a graph that scores something else entirely
+# while still looking like a working model, so a declaration that cannot
+# be read is refused rather than completed.
+_LOGIT_SCORE_REQUIREMENT = (
+    "A reranker scored from two vocabulary logits must declare them in the "
+    f"sentence-transformers '{LOGIT_SCORE_DIRNAME}/{LOGIT_SCORE_CONFIG_FILENAME}' "
+    f"as two different non-negative integers '{LOGIT_SCORE_TRUE_KEY}' and "
+    f"'{LOGIT_SCORE_FALSE_KEY}'."
+)
+
+# Appended to every scoring module-chain error.
+_SCORING_CHAIN_REQUIREMENT = (
+    "This backend reproduces a sentence-transformers chain of exactly one module whose type "
+    f"ends in '{ST_TRANSFORMER_SUFFIX}', followed by exactly one whose type ends in "
+    f"'{ST_LOGIT_SCORE_SUFFIX}', in that order."
+)
+
+# Markers a pair template's body format writes the request's own texts
+# at. They match the ones :mod:`eeane.runtime` declares, since both sides
+# must render the very same body; they are substituted by plain string
+# surgery, never through ``str.format``.
+_QUERY_MARKER = "{query}"
+_DOCUMENT_MARKER = "{document}"
+
+# sentence-transformers model-level declaration: the file a model states
+# its named prompts in, the key naming the one it applies by default, the
+# table those names address, and the name to fall back on when no default
+# is named. The prompt is part of the question the model was trained to
+# answer, so it is read from the model rather than supplied here.
+ST_CONFIG_FILENAME = "config_sentence_transformers.json"
+ST_DEFAULT_PROMPT_NAME_KEY = "default_prompt_name"
+ST_PROMPTS_KEY = "prompts"
+ST_FALLBACK_PROMPT_NAME = "query"
 
 
 # --- sanity fixtures, one set per language -----------------------------------
@@ -472,11 +527,17 @@ def load_dense(model_dir: Path) -> tuple[torch.nn.Module | None, tuple[dict[str,
     return build_dense(stages), dense_record(stages)
 
 
-def _read_module_entries(modules_path: Path) -> list[tuple[str, Any]]:
+def _read_module_entries(
+    modules_path: Path, requirement: str = _MODULE_CHAIN_REQUIREMENT
+) -> list[tuple[str, Any]]:
     """Read a ``modules.json`` into ``(type, path)`` pairs, in declared order.
 
     Args:
         modules_path: The declaration file.
+        requirement: Sentence describing the chain the caller reproduces,
+            appended to every error. It differs per caller, since the
+            chain an embedding model declares is not the one a generative
+            reranker does.
 
     Returns:
         One pair per declared module. The path is returned unvalidated;
@@ -490,27 +551,22 @@ def _read_module_entries(modules_path: Path) -> list[tuple[str, Any]]:
         raw = modules_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(
-            f"cannot read the module declaration '{modules_path}': {exc}. "
-            f"{_MODULE_CHAIN_REQUIREMENT}"
+            f"cannot read the module declaration '{modules_path}': {exc}. {requirement}"
         ) from exc
     try:
         declaration = json.loads(raw)
     except ValueError as exc:
-        raise ValueError(
-            f"'{modules_path}' is not valid JSON: {exc}. {_MODULE_CHAIN_REQUIREMENT}"
-        ) from exc
+        raise ValueError(f"'{modules_path}' is not valid JSON: {exc}. {requirement}") from exc
     if not isinstance(declaration, list) or not declaration:
         raise ValueError(
-            f"'{modules_path}' does not contain a non-empty list of modules. "
-            f"{_MODULE_CHAIN_REQUIREMENT}"
+            f"'{modules_path}' does not contain a non-empty list of modules. {requirement}"
         )
     entries: list[tuple[str, Any]] = []
     for index, entry in enumerate(declaration):
         module_type = entry.get("type") if isinstance(entry, dict) else None
         if not isinstance(module_type, str):
             raise ValueError(
-                f"module {index} of '{modules_path}' does not name a module type. "
-                f"{_MODULE_CHAIN_REQUIREMENT}"
+                f"module {index} of '{modules_path}' does not name a module type. {requirement}"
             )
         entries.append((module_type, entry.get("path")))
     return entries
@@ -769,6 +825,306 @@ def _read_dense_weights(stage: DenseStage) -> dict[str, torch.Tensor]:
         f"the declared Dense module '{stage.path}' holds neither "
         f"'{DENSE_WEIGHTS_FILENAME}' nor '{DENSE_PICKLE_WEIGHTS_FILENAME}'"
     )
+
+
+def read_logit_score(model_dir: Path) -> tuple[int, int]:
+    """Read the two vocabulary ids a generative reranker scores with.
+
+    Such a reranker carries no scoring head: it asks a language model a
+    yes/no question and reads the logits of two vocabulary entries at the
+    final position. Which two those are is a property of the checkpoint,
+    declared next to it, and this is the only place it is read from.
+
+    Args:
+        model_dir: Local HuggingFace-format model directory.
+
+    Returns:
+        ``(true_token_id, false_token_id)``: the id whose logit rises with
+        relevance first, the id it is scored against second.
+
+    Raises:
+        ValueError: If the declaration is missing, unreadable, malformed,
+            or does not name two different non-negative integer ids.
+    """
+    path = model_dir / LOGIT_SCORE_DIRNAME / LOGIT_SCORE_CONFIG_FILENAME
+    declaration = _read_json_object(path, "the scoring module", _LOGIT_SCORE_REQUIREMENT)
+    true_id = _logit_score_id(path, declaration, LOGIT_SCORE_TRUE_KEY)
+    false_id = _logit_score_id(path, declaration, LOGIT_SCORE_FALSE_KEY)
+    if true_id == false_id:
+        # Subtracting a logit from itself is a constant zero: such a model
+        # would compile and serve, and rank everything equally.
+        raise ValueError(
+            f"'{path}' names the same id ({true_id}) for both answers, so the score "
+            f"would always be zero. {_LOGIT_SCORE_REQUIREMENT}"
+        )
+    return true_id, false_id
+
+
+def _read_json_object(path: Path, description: str, requirement: str) -> dict[str, Any]:
+    """Read one declaration file that must hold a JSON object.
+
+    Args:
+        path: File to read.
+        description: What the file is, named in the error.
+        requirement: Sentence describing what a valid declaration looks
+            like, appended to every error so the message is actionable
+            without opening the file.
+
+    Returns:
+        The parsed object.
+
+    Raises:
+        ValueError: If the file is missing, unreadable, not valid JSON, or
+            does not hold a JSON object.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read {description} '{path}': {exc}. {requirement}") from exc
+    try:
+        declaration = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"'{path}' is not valid JSON: {exc}. {requirement}") from exc
+    if not isinstance(declaration, dict):
+        raise ValueError(f"'{path}' does not contain a JSON object. {requirement}")
+    return declaration
+
+
+def _logit_score_id(path: Path, declaration: dict[str, Any], key: str) -> int:
+    """Read one vocabulary id from a scoring declaration.
+
+    Args:
+        path: The declaration file, named in the error.
+        declaration: Its parsed contents.
+        key: Field to read.
+
+    Returns:
+        The declared id.
+
+    Raises:
+        ValueError: If the field is missing or is not a non-negative
+            integer. ``bool`` is rejected explicitly: it is a subclass of
+            ``int``, but a JSON ``true`` is not a vocabulary index.
+    """
+    value = declaration.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"'{path}' does not declare '{key}' as a non-negative integer "
+            f"(got {value!r}). {_LOGIT_SCORE_REQUIREMENT}"
+        )
+    return int(value)
+
+
+def check_scoring_module_chain(model_dir: Path) -> None:
+    """Validate that ``model_dir`` declares the chain a generative reranker is.
+
+    Args:
+        model_dir: Local HuggingFace-format model directory.
+
+    Raises:
+        ValueError: If the declaration is missing, unreadable, malformed,
+            or declares anything but one Transformer module followed by
+            one scoring module.
+    """
+    modules_path = model_dir / ST_MODULES_FILENAME
+    entries = _read_module_entries(modules_path, _SCORING_CHAIN_REQUIREMENT)
+    module_types = [module_type for module_type, _ in entries]
+    expected = (ST_TRANSFORMER_SUFFIX, ST_LOGIT_SCORE_SUFFIX)
+    if len(module_types) != len(expected) or not all(
+        declared.endswith(suffix) for declared, suffix in zip(module_types, expected, strict=True)
+    ):
+        declared = " -> ".join(module_types) if module_types else "none"
+        raise ValueError(
+            f"'{modules_path}' declares a module chain this backend cannot reproduce "
+            f"(declared: {declared}). {_SCORING_CHAIN_REQUIREMENT}"
+        )
+
+
+def read_default_prompt(model_dir: Path) -> str | None:
+    """Read the prompt a sentence-transformers directory applies by default.
+
+    Args:
+        model_dir: Local HuggingFace-format model directory.
+
+    Returns:
+        The prompt string the directory's default prompt name addresses,
+        or the one named :data:`ST_FALLBACK_PROMPT_NAME` when it names no
+        default; ``None`` when the file is absent, unreadable, malformed
+        or declares no such prompt. Nothing here decides whether a model
+        may be compiled without one -- that is the backend's call.
+    """
+    try:
+        raw = (model_dir / ST_CONFIG_FILENAME).read_text(encoding="utf-8")
+        declaration = json.loads(raw)
+    except (OSError, ValueError):
+        # Most model directories carry no such file at all, and a broken
+        # one answers the question no better than a missing one; the
+        # caller decides what a missing prompt means.
+        return None
+    if not isinstance(declaration, dict):
+        return None
+    prompts = declaration.get(ST_PROMPTS_KEY)
+    if not isinstance(prompts, dict):
+        return None
+    name = declaration.get(ST_DEFAULT_PROMPT_NAME_KEY)
+    if name is None:
+        # Not stating a default is the ordinary case: the conventional
+        # name is then the one to look up. A default that is stated but
+        # is not a name, on the other hand, is a broken declaration, and
+        # falling back for it would be guessing at what the model asks.
+        name = ST_FALLBACK_PROMPT_NAME
+    if not isinstance(name, str):
+        return None
+    prompt = prompts.get(name)
+    return prompt if isinstance(prompt, str) else None
+
+
+def tokenize_templated_pairs(
+    tokenizer: PreTrainedTokenizerBase,
+    pairs: list[tuple[str, str]],
+    seq_len: int,
+    template: PairTemplate,
+) -> dict[str, np.ndarray]:
+    """Lay (query, document) pairs out into a template, as the runtime does.
+
+    The compile-time counterpart of
+    :func:`eeane.runtime.tokenize_pairs`'s template path: both must build
+    byte-identical rows, or the model would be converted for a different
+    input than it is served with.
+
+    Args:
+        tokenizer: Tokenizer of the model directory being compiled.
+        pairs: (query, document) pairs, in order.
+        seq_len: Fixed sequence length S every row is built to.
+        template: Template the pairs are laid out with.
+
+    Returns:
+        Dict with ``input_ids`` and ``attention_mask``, each of shape
+        ``(len(pairs), seq_len)`` and dtype ``np.int32``.
+
+    Raises:
+        ValueError: If ``seq_len`` is not positive, if the template's own
+            tokens leave no room for the pair's text, or if the tokenizer
+            defines no padding id to fill the rows with.
+    """
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be a positive integer (got {seq_len})")
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        raise ValueError(
+            "the tokenizer defines no pad token, so the fixed-length rows of a templated "
+            "pair encoding have nothing to be filled with"
+        )
+    # The template's fixed halves already spell their control tokens out
+    # as text, so the tokenizer must not add its own on top of them.
+    prefix_ids = list(tokenizer.encode(template.prefix, add_special_tokens=False))
+    suffix_ids = list(tokenizer.encode(template.suffix, add_special_tokens=False))
+    fixed = len(prefix_ids) + len(suffix_ids)
+    budget = seq_len - fixed
+    if budget < 1:
+        raise ValueError(
+            f"the pair template takes {fixed} of the bucket's {seq_len} tokens, leaving no "
+            "room for the query and the document; compile this model with a longer bucket"
+        )
+
+    input_ids = np.full((len(pairs), seq_len), int(pad_id), dtype=np.int32)
+    attention_mask = np.zeros((len(pairs), seq_len), dtype=np.int32)
+    for row, (query, document) in enumerate(pairs):
+        body = _render_pair_body(template.body_format, query, document)
+        # Encoded as one single string rather than as a query and a
+        # document encoded apart and joined: with a sub-word vocabulary
+        # the tokens covering the seam between them differ from the ones
+        # either side produces alone.
+        body_ids = list(tokenizer.encode(body, add_special_tokens=False))
+        # Only the body is cut, and from its right end: the prefix and the
+        # suffix are what make the input the question the model answers.
+        ids = [*prefix_ids, *body_ids[:budget], *suffix_ids]
+        # Written from position 0, so whatever is left over at the end of
+        # the row is the padding: right-padded, as last-token pooling
+        # assumes.
+        input_ids[row, : len(ids)] = ids
+        attention_mask[row, : len(ids)] = 1
+    return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def _render_pair_body(body_format: str, query: str, document: str) -> str:
+    """Write one (query, document) pair into a template's body.
+
+    Args:
+        body_format: Body format of the template being applied.
+        query: Query text to write at the ``{query}`` marker.
+        document: Document text to write at the ``{document}`` marker.
+
+    Returns:
+        The body with both texts written into it.
+    """
+    # Substituted in one left-to-right pass, and never through
+    # ``str.format``: formatting would choke on (or reinterpret) any other
+    # brace the texts carry, while two successive replacements would look
+    # inside the text just written in, so a document reading like a marker
+    # would be substituted into.
+    query_at = body_format.find(_QUERY_MARKER)
+    document_at = body_format.find(_DOCUMENT_MARKER)
+    if query_at <= document_at:
+        first, first_text = _QUERY_MARKER, query
+        second, second_text = _DOCUMENT_MARKER, document
+    else:
+        first, first_text = _DOCUMENT_MARKER, document
+        second, second_text = _QUERY_MARKER, query
+    head, _, rest = body_format.partition(first)
+    middle, _, tail = rest.partition(second)
+    return head + first_text + middle + second_text + tail
+
+
+def score_pytorch_generative(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    pairs: list[tuple[str, str]],
+    seq_len: int,
+    template: PairTemplate,
+    true_token_id: int,
+    false_token_id: int,
+) -> np.ndarray:
+    """Compute FP32 baseline scores of a generative reranker, row by row.
+
+    The model is asked the templated question and answers with a full
+    vocabulary of logits; the score is the difference between the two
+    declared entries at the row's last real position. Going through the
+    checkpoint's own output projection is the point of this baseline: the
+    traced graph carries two rows cut out of that projection, so a wrong
+    cut shows up here as a disagreement.
+
+    Args:
+        model: Causal language model loaded by a backend's reference path,
+            in eval/FP32 mode.
+        tokenizer: Tokenizer for the same model directory.
+        pairs: (query, document) pairs, in order.
+        seq_len: Fixed sequence length used for tokenization.
+        template: Template the pairs are laid out with; the very one the
+            traced graph is converted for.
+        true_token_id: Vocabulary id whose logit rises with relevance.
+        false_token_id: Vocabulary id it is scored against.
+
+    Returns:
+        Scores of shape ``(len(pairs),)``, dtype float32: one
+        ``true - false`` logit difference per pair.
+    """
+    batch = tokenize_templated_pairs(tokenizer, pairs, seq_len, template)
+    scores = np.empty(len(pairs), dtype=np.float32)
+    with torch.no_grad():
+        for i in range(len(pairs)):
+            # nn.Embedding lookup requires int64 indices; the tokenization
+            # returns int32 for Core ML compatibility, so cast here.
+            input_ids = torch.from_numpy(batch["input_ids"][i : i + 1]).long()
+            attention_mask = torch.from_numpy(batch["attention_mask"][i : i + 1]).long()
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs[0]  # (1, S, V)
+            # The rows are right-padded, so the model answers at the last
+            # position its mask marks as real.
+            last = int(attention_mask.sum().item()) - 1
+            row = logits[0, max(last, 0)]
+            scores[i] = float(row[true_token_id].item() - row[false_token_id].item())
+    return scores
 
 
 def mean_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

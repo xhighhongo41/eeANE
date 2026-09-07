@@ -10,7 +10,11 @@ protocol and is implemented once per architecture family in this package.
 
 This module deliberately stays free of ``torch``/``transformers``: it only
 declares types, so it can be imported from code paths that must not pull
-in the heavy compile-time dependencies.
+in the heavy compile-time dependencies. The one thing it does import is
+:mod:`eeane.runtime`, which depends on nothing heavier than numpy and
+``tokenizers``: a pair template is validated by the same rules at compile
+time and at request time, and that is only true while both sides use the
+one declaration of it.
 
 Adding a backend
 ----------------
@@ -58,6 +62,20 @@ Members to implement:
     architecture imposes no limit. Position-embedding offsets (if the
     architecture reserves leading positions) must already be subtracted:
     the pipeline compares bucket lengths against this number directly.
+``pair_template(model_dir, kind)``
+    How the model wants a ``(query, document)`` pair spelled out, built
+    from what the model directory declares and, like ``max_seq_len``,
+    without loading any weights; ``None`` for a model that needs no
+    shaping at all (every embedding model, and a reranker scored through
+    a head of its own). The template travels into the compiled model's
+    record, so the server lays a request's pairs out exactly as the
+    conversion did.
+``reranker_score_space()``
+    The space a reranker's scores of this architecture are faithful in,
+    and therefore the one the self-check must compare them in:
+    :data:`SCORE_SPACE_PROBABILITY` or :data:`SCORE_SPACE_LOGIT`. This
+    states a property of the architecture only; how much difference is
+    tolerated is the self-check's own policy.
 ``trace_example(kind)``
     One fixed raw input used to build the tracing example.
 ``sanity_spec(kind)``
@@ -119,8 +137,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from eeane.runtime import PairTemplate
+
 if TYPE_CHECKING:
     import numpy as np
+
+# Spaces a reranker's score can be faithful in, as declared by
+# :meth:`CompileBackend.reranker_score_space`.
+#
+# A model whose head is trained to emit one calibrated relevance value is
+# compared after the sigmoid: that probability is the number the server
+# hands out, so it is the number that has to survive the conversion.
+# A model whose score is a difference of two raw logits spans a far wider
+# range, and the sigmoid squashes that range unevenly (its slope peaks in
+# the middle and vanishes at either end), so the same conversion error
+# would count for much more on one pair than on another; such a model is
+# therefore compared before the sigmoid, where every pair is measured on
+# one and the same scale.
+SCORE_SPACE_PROBABILITY = "probability"
+SCORE_SPACE_LOGIT = "logit"
+SCORE_SPACES: tuple[str, ...] = (SCORE_SPACE_PROBABILITY, SCORE_SPACE_LOGIT)
+
+# Re-exported so that a backend and the layers reading a template can name
+# the type through this interface module rather than reaching past it.
+__all__ = [
+    "SCORE_SPACES",
+    "SCORE_SPACE_LOGIT",
+    "SCORE_SPACE_PROBABILITY",
+    "CompileBackend",
+    "LoadedModel",
+    "PairTemplate",
+    "SanitySpec",
+]
 
 
 @dataclass(frozen=True)
@@ -155,6 +203,11 @@ class LoadedModel:
             variant's metadata so a later run can tell whether the model's
             declaration still matches the artifact. ``None`` whenever
             ``dense`` is.
+        score_token_ids: ``(true_id, false_id)`` vocabulary ids of a
+            reranker whose relevance signal is the difference between two
+            vocabulary logits, as declared by the model directory.
+            ``None`` for every other model, which is every embedding model
+            and every reranker carrying a scoring head of its own.
     """
 
     model: Any
@@ -166,6 +219,7 @@ class LoadedModel:
     pooling: str | None = None
     dense: Any = None
     dense_config: tuple[dict[str, Any], ...] | None = None
+    score_token_ids: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -357,6 +411,41 @@ class CompileBackend(Protocol):
         Returns:
             The largest sequence length the model can process, or ``None``
             when it cannot be determined or the architecture has no limit.
+        """
+        ...
+
+    def pair_template(self, model_dir: Path, kind: str) -> PairTemplate | None:
+        """Return how ``model_dir`` wants a (query, document) pair spelled out.
+
+        Built from what the model directory declares, without loading any
+        weights, so the pipeline can record the template (and hand it to
+        the tokenizer gate) before anything is converted.
+
+        Args:
+            model_dir: Read-only HuggingFace-format model directory.
+            kind: Model kind the template is asked for.
+
+        Returns:
+            The template, or ``None`` when this kind of model needs no
+            shaping at all and its pairs go through the tokenizer's own
+            pair encoding.
+
+        Raises:
+            ValueError: If ``kind`` is not supported by the backend, or if
+                the model needs a template but its directory does not
+                declare what to build one from -- guessing would ask the
+                model a different question than it was trained on.
+        """
+        ...
+
+    def reranker_score_space(self) -> str:
+        """Return the space this backend's reranker scores are faithful in.
+
+        Returns:
+            One of :data:`SCORE_SPACES`. It selects what the self-check
+            compares -- the sigmoid of the graph's output or the raw
+            output itself -- and says nothing about how much difference is
+            tolerated, which is the self-check's own policy.
         """
         ...
 

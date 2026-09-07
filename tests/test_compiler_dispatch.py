@@ -516,7 +516,7 @@ def test_dispatch_load_backend_returns_the_decoder_backend(tmp_path: Path) -> No
 
     assert type(backend).__name__ == "Qwen3Backend"
     assert backend.name == "Qwen3"
-    assert backend.supported_kinds == (dispatch.KIND_EMBEDDING,)
+    assert backend.supported_kinds == (dispatch.KIND_EMBEDDING, dispatch.KIND_RERANKER)
 
 
 def test_dispatch_module_does_not_import_torch() -> None:

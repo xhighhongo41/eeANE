@@ -81,6 +81,7 @@ from eeane.compiler.tokenizer_freeze import (
     freeze_tokenizer,
     verify_frozen_tokenizer,
 )
+from eeane.runtime import PairTemplate
 
 # Reasons recorded when no self-check result is produced.
 SELFCHECK_REASON_OPTION = "--skip-selfcheck was given"
@@ -101,6 +102,11 @@ BATCHED_BATCH_SIZE = 2
 # size (a string, JSON object keys being strings) so a record can describe
 # more than one of them later on.
 BATCH_ARTIFACTS_RECORD_KEY = "batch_artifacts"
+
+# Key a reranker's pair template is recorded under, and the three strings
+# it is made of. A record carrying none is served through the tokenizer's
+# own pair encoding, as every record written before templates existed.
+PAIR_TEMPLATE_RECORD_KEY = "pair_template"
 
 # Building block of the long tokenizer-verification input. The gate inputs
 # must be self-contained (a user's machine has no repository test data),
@@ -181,6 +187,11 @@ class _CompileContext:
             pooling, resolved once via :func:`_declared_dense`; ``None``
             when it declares none, for a reranker, or when the
             declaration could not be read.
+        pair_template: How the backend says this model wants a
+            ``(query, document)`` pair spelled out, or ``None`` for a
+            model that shapes nothing (every embedding model, and every
+            reranker scored through a head of its own). Resolved once,
+            then handed to the tokenizer gate and recorded.
         output_name: Core ML graph output name for ``kind``.
         batch_size: Fixed batch size B.
         model_root: ``<out-dir>/compiled/<model-name>`` directory.
@@ -205,6 +216,7 @@ class _CompileContext:
     recorded_args: dict[str, Any]
     backend: Any
     selfcheck_fn: SelfcheckFn | None
+    pair_template: PairTemplate | None = None
 
 
 def run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None = None) -> int:
@@ -354,12 +366,15 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
         recorded_args=_recorded_args(args, kind, buckets, out_root, batch_size),
         backend=backend,
         selfcheck_fn=selfcheck_fn,
+        pair_template=backend.pair_template(model_dir, kind),
     )
 
     # The tokenizer is frozen and verified on every run: it costs seconds
     # and it is what guarantees the served artifacts and the tokenizer
     # agree.
     freeze_info, freeze_report = _freeze_and_verify(context, cache_buckets)
+    if context.pair_template is not None:
+        _progress(_pair_template_summary(context, freeze_report))
 
     plans = _plan_variants(context, buckets)
     run_reports = _convert_variants(context, plans)
@@ -871,10 +886,46 @@ def _freeze_and_verify(
         f"({len(texts)} text(s), {len(pairs)} pair(s) x {len(buckets)} bucket(s))"
     )
     report = verify_frozen_tokenizer(
-        context.model_dir, context.tokenizer_path, texts, pairs, list(buckets)
+        context.model_dir,
+        context.tokenizer_path,
+        texts,
+        pairs,
+        list(buckets),
+        pair_template=context.pair_template,
     )
     _progress("      tokenizer verification passed")
     return freeze_info, report
+
+
+def _pair_template_summary(context: _CompileContext, freeze_report: Mapping[str, Any]) -> str:
+    """Describe a model whose pairs have to be spelled out, in one line.
+
+    Such a model is scored differently from a cross-encoder in two ways a
+    reader of the progress output should not have to infer: a fixed part
+    of every bucket is taken up by the template rather than by the pair,
+    and the self-check holds the scores to the measure of the space the
+    backend declares rather than to the probability one.
+
+    Args:
+        context: Per-invocation state, for the template and the backend.
+        freeze_report: Report of the tokenizer gate, which counted what
+            the template's two fixed halves encode to.
+
+    Returns:
+        The progress line to print.
+    """
+    counted = freeze_report.get(PAIR_TEMPLATE_RECORD_KEY)
+    if isinstance(counted, Mapping):
+        cost = (
+            f"{counted.get('prefix_tokens')} prefix + {counted.get('suffix_tokens')} "
+            "suffix token(s) of every bucket"
+        )
+    else:
+        cost = "an unmeasured part of every bucket"
+    return (
+        f"      pair template   : the pair is spelled out into a fixed prompt taking {cost}; "
+        f"scores are compared in the {context.backend.reranker_score_space()} space"
+    )
 
 
 def _run_selfcheck(context: _CompileContext, plan: VariantPlan) -> dict[str, Any]:
@@ -1063,7 +1114,9 @@ def _build_model_info(
             :data:`BATCHED_BATCH_SIZE` variant in the cache. Recorded
             under :data:`BATCH_ARTIFACTS_RECORD_KEY` when there is any,
             and left out of the record entirely otherwise, so a cache
-            without them reads exactly as it did before.
+            without them reads exactly as it did before. The pair template
+            (:data:`PAIR_TEMPLATE_RECORD_KEY`) is recorded the same way,
+            from ``context``.
 
     Returns:
         A JSON-serializable summary; the input ``eeane.config``'s cache
@@ -1105,6 +1158,14 @@ def _build_model_info(
             str(BATCHED_BATCH_SIZE): {
                 str(seq_len): path.name for seq_len, path in sorted(batch_artifacts.items())
             }
+        }
+    if context.pair_template is not None:
+        # Written only for a model that shapes its pairs, so the record of
+        # every other model reads exactly as it did before.
+        record[PAIR_TEMPLATE_RECORD_KEY] = {
+            "prefix": context.pair_template.prefix,
+            "body_format": context.pair_template.body_format,
+            "suffix": context.pair_template.suffix,
         }
     return record
 
