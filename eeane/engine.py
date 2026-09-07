@@ -123,7 +123,8 @@ def _load_entry(entry: ModelEntry) -> _ServedModel:
 
     Raises:
         ValueError: If the frozen tokenizer file carries no padding
-            section (i.e. it is not an ``eeane compile`` output).
+            section (i.e. it is not an ``eeane compile`` output), or if
+            the entry declares an unusable pair template.
     """
     kind = str(entry.kind)
     compiled = dict(entry.artifacts or {})
@@ -134,10 +135,11 @@ def _load_entry(entry: ModelEntry) -> _ServedModel:
     if tokenizer_path is None:
         # Unreachable: every entry is checked before any of them is loaded.
         raise ValueError(f"model '{entry.id}': no tokenizer file configured")
+    tokenizer = runtime.load_frozen_tokenizer(tokenizer_path)
     return _ServedModel(
         id=entry.id,
         kind=kind,
-        tokenizer=runtime.load_frozen_tokenizer(tokenizer_path),
+        tokenizer=tokenizer,
         tokenizer_lock=threading.Lock(),
         compiled={seq_len: _load_compiled(path) for seq_len, path in sorted(compiled.items())},
         compiled_batch={seq_len: _load_compiled(path) for seq_len, path in sorted(batched.items())},
@@ -148,6 +150,43 @@ def _load_entry(entry: ModelEntry) -> _ServedModel:
         normalize=entry.normalize,
         # A reranker has no embedding width, whatever the entry states.
         embedding_dim=entry.embedding_dim if kind == "embedding" else None,
+        # A pair template shapes rerank inputs only; a model of another
+        # kind is served untemplated whatever the entry states.
+        pair_template=_prepare_pair_template(entry, tokenizer) if kind == "reranker" else None,
+    )
+
+
+def _prepare_pair_template(
+    entry: ModelEntry, tokenizer: runtime.FrozenTokenizer
+) -> runtime.PreparedPairTemplate | None:
+    """Encode the fixed parts of the pair template one entry declares.
+
+    Done once per load rather than once per scored pair, since the
+    template's own parts do not depend on the request.
+
+    Args:
+        entry: Entry being loaded.
+        tokenizer: Frozen tokenizer that entry is served with.
+
+    Returns:
+        The template with its prefix and suffix already encoded, or
+        ``None`` when the entry declares none, i.e. when the model is
+        scored through the tokenizer's own pair encoding.
+
+    Raises:
+        ValueError: If the declared body format does not mark the query
+            and the document exactly once each.
+    """
+    declared = entry.pair_template
+    if declared is None:
+        return None
+    return runtime.prepare_pair_template(
+        tokenizer,
+        runtime.PairTemplate(
+            prefix=declared.prefix,
+            body_format=declared.body_format,
+            suffix=declared.suffix,
+        ),
     )
 
 
@@ -903,6 +942,10 @@ class CoreMLEngine:
     def _tokenize_pair(self, served: _ServedModel, query: str, document: str) -> _TokenizedInput:
         """Route and tokenize one rerank pair under its tokenizer lock.
 
+        The pair is laid out with the model's own pair template when it
+        has one, so counting and encoding are given the same template:
+        the bucket is selected from the length the template produces.
+
         Args:
             served: Loaded reranker serving the request.
             query: Query text of every pair of the request.
@@ -911,10 +954,15 @@ class CoreMLEngine:
         Returns:
             The model inputs for that pair and the routing they imply.
         """
+        template = served.pair_template
         with served.tokenizer_lock:
-            n_tokens = runtime.count_pair_tokens(served.tokenizer, query, document)
+            n_tokens = runtime.count_pair_tokens(
+                served.tokenizer, query, document, template=template
+            )
             bucket, truncated = runtime.select_bucket(n_tokens, served.buckets)
-            inputs = runtime.tokenize_pairs(served.tokenizer, [(query, document)], bucket)
+            inputs = runtime.tokenize_pairs(
+                served.tokenizer, [(query, document)], bucket, template=template
+            )
         return _TokenizedInput(inputs=inputs, bucket=bucket, n_tokens=n_tokens, truncated=truncated)
 
     def _check_deadline(self, deadline: float | None) -> None:

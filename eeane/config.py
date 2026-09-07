@@ -44,13 +44,14 @@ from eeane.cache import (
     model_cache_dir,
     resolve_cache_root,
 )
+from eeane.runtime import PairTemplate
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Highest ``model_info.json`` schema version this release knows how to
 # read. A newer record may assign different meanings to the keys below,
 # so it is rejected instead of guessed at.
-MAX_MODEL_INFO_FORMAT_VERSION = 2
+MAX_MODEL_INFO_FORMAT_VERSION = 3
 
 # Optional table of batched artifacts in a cache record, keyed by batch
 # size (as a string, since JSON object keys are strings) so one record
@@ -58,6 +59,13 @@ MAX_MODEL_INFO_FORMAT_VERSION = 2
 # use. A record that carries none simply serves one input per prediction.
 BATCH_ARTIFACTS_RECORD_KEY = "batch_artifacts"
 BATCH_ARTIFACT_BATCH_SIZE = 2
+
+# Optional table in a cache record describing how a reranker wants a
+# (query, document) pair spelled out, and the three strings it is made
+# of. A record that carries none is served through the tokenizer's own
+# pair encoding, as every record written before it was.
+PAIR_TEMPLATE_RECORD_KEY = "pair_template"
+PAIR_TEMPLATE_RECORD_FIELDS = ("prefix", "body_format", "suffix")
 
 
 class ConfigError(Exception):
@@ -146,6 +154,52 @@ class ServerConfig(BaseModel):
     graceful_shutdown_timeout: int | None = Field(default=None, ge=1)
 
 
+class PairTemplateSpec(BaseModel):
+    """How a reranker entry wants a (query, document) pair spelled out.
+
+    Some rerankers are not scored through the tokenizer's own pair
+    encoding: they expect the query and the document laid out inside a
+    fixed wrapper and tokenized as one single string. This is the
+    declaration of that wrapper; applying it is
+    :class:`eeane.runtime.PairTemplate`'s job. A compiled reranker that
+    needs one records it, so a ``[[models]]`` entry resolved from the
+    compiled-model cache gains it without stating anything, and an entry
+    may also spell it out as a ``[models.pair_template]`` table.
+
+    Attributes:
+        prefix: Fixed text placed before the body. May be empty.
+        body_format: Body of the input, marked with ``{query}`` and
+            ``{document}`` exactly once each.
+        suffix: Fixed text placed after the body. May be empty. It is
+            never truncated away, however long the pair is.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prefix: str
+    body_format: str
+    suffix: str
+
+    @model_validator(mode="after")
+    def _check_applicable(self) -> PairTemplateSpec:
+        """Reject a declaration the runtime could not apply.
+
+        The rule lives with the type that applies the template, so this
+        only builds one and lets it judge. Checking here means a typo in
+        a hand-written table is reported by ``eeane check-config``,
+        rather than when the model is first asked to score something.
+
+        Returns:
+            The validated declaration.
+
+        Raises:
+            ValueError: If the body format does not mark the query and
+                the document exactly once each.
+        """
+        PairTemplate(prefix=self.prefix, body_format=self.body_format, suffix=self.suffix)
+        return self
+
+
 def _coerce_bucket_path_map(value: Any, *, entry_id: str, field: str) -> dict[int, Path] | None:
     """Coerce a TOML bucket-length-to-path table's string keys to positive ints.
 
@@ -227,6 +281,13 @@ class ModelEntry(BaseModel):
         normalize: Whether to L2-normalize embedding output. Only valid
             for ``kind="embedding"``; explicitly setting this on a
             ``kind="reranker"`` entry is a configuration error.
+        pair_template: How this reranker wants a (query, document) pair
+            spelled out (see :class:`PairTemplateSpec`), or ``None`` for
+            a reranker scored through the tokenizer's own pair encoding.
+            Only valid for ``kind="reranker"``; setting it on a
+            ``kind="embedding"`` entry is a configuration error, since
+            an embedding request carries no pair to shape. Filled in
+            from the compiled-model cache when the record carries one.
         output_name: Name of the Core ML output tensor to read. If
             omitted (and not recorded in the cache), derived from ``kind``
             (``"embedding"`` -> ``"embedding"``, ``"reranker"`` ->
@@ -262,6 +323,7 @@ class ModelEntry(BaseModel):
     artifacts: dict[int, Path] | None = None
     batch_artifacts: dict[int, Path] | None = None
     normalize: bool = True
+    pair_template: PairTemplateSpec | None = None
     output_name: str | None = None
     embedding_dim: int | None = Field(default=None, gt=0)
     excluded_buckets: tuple[int, ...] = ()
@@ -328,8 +390,9 @@ class ModelEntry(BaseModel):
             ValueError: If ``kind``/``tokenizer``/``artifacts`` are still
                 unset (neither configured nor resolved from the cache); if
                 ``normalize`` was explicitly set on a ``kind="reranker"``
-                entry; if ``batch_artifacts`` was set on a
-                ``kind="reranker"`` entry; or if ``batch_artifacts``
+                entry; if ``pair_template`` was set on a
+                ``kind="embedding"`` entry; if ``batch_artifacts`` was set
+                on a ``kind="reranker"`` entry; or if ``batch_artifacts``
                 contains a bucket that is not one of ``artifacts``'
                 buckets.
 
@@ -350,6 +413,11 @@ class ModelEntry(BaseModel):
         if self.kind == "reranker" and "normalize" in self.model_fields_set:
             raise ValueError(
                 f"model '{self.id}': 'normalize' may only be set on kind='embedding' entries"
+            )
+        if self.pair_template is not None and self.kind == "embedding":
+            raise ValueError(
+                f"model '{self.id}': 'pair_template' may only be set on kind='reranker' "
+                "entries (an embedding request carries no pair to shape)"
             )
         if self.batch_artifacts is not None:
             if self.kind == "reranker":
@@ -929,7 +997,9 @@ def _fill_entry_from_cache(entry: dict[str, Any], model_id: str, cache_root: Pat
         An entry whose artifacts come from the cache also gains the
         batched artifacts the record names for the buckets it loads, so a
         model compiled for both is served with both without the config
-        file having to spell anything out.
+        file having to spell anything out. A reranker whose record
+        describes a pair template gains that too, unless the entry states
+        one of its own.
     """
     model_dir = model_cache_dir(cache_root, model_id)
     try:
@@ -1011,6 +1081,58 @@ def _fill_entry_from_cache(entry: dict[str, Any], model_id: str, cache_root: Pat
             ):
                 raise ConfigError(f"{record} records an unusable 'embedding_dim'")
             entry["embedding_dim"] = embedding_dim
+
+    if entry.get("pair_template") is None:
+        pair_template = _cached_pair_template(info, model_dir, kind)
+        if pair_template is not None:
+            entry["pair_template"] = pair_template
+
+
+def _cached_pair_template(
+    info: Mapping[str, Any], model_dir: Path, kind: str
+) -> dict[str, str] | None:
+    """Read the pair template a cache record describes, if it describes one.
+
+    Args:
+        info: Parsed ``model_info.json`` contents.
+        model_dir: Directory the record lives in, for error messages.
+        kind: Model kind the record states.
+
+    Returns:
+        The template's three strings, or ``None`` when the record carries
+        no template at all. Recorded only from format_version 3 on, so an
+        older record simply leaves the entry without one -- which is how
+        every reranker was served before templates existed.
+
+    Raises:
+        ConfigError: If the record describes a template for a model kind
+            that has no pair to shape, or one that is not a table of the
+            three strings a template is made of. A half-written template
+            is treated as a corrupt record rather than completed with
+            guesses, since the missing part would silently change what
+            the model is asked.
+    """
+    record = f"'{model_dir / MODEL_INFO_FILENAME}'"
+    recorded = info.get(PAIR_TEMPLATE_RECORD_KEY)
+    if recorded is None:
+        return None
+    if kind != "reranker":
+        raise ConfigError(
+            f"{record} describes a '{PAIR_TEMPLATE_RECORD_KEY}' for a '{kind}' model, which "
+            "has no (query, document) pair to shape"
+        )
+    if not isinstance(recorded, dict):
+        raise ConfigError(f"{record} has an unusable '{PAIR_TEMPLATE_RECORD_KEY}' table")
+
+    template: dict[str, str] = {}
+    for name in PAIR_TEMPLATE_RECORD_FIELDS:
+        value = recorded.get(name)
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"{record} has a '{PAIR_TEMPLATE_RECORD_KEY}' without a usable '{name}' string"
+            )
+        template[name] = value
+    return template
 
 
 def _cached_artifacts(
