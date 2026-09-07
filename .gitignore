@@ -220,6 +220,7 @@ __marimo__/
 # eeANE: local models and PoC outputs
 models/
 poc/results/
+poc_qwen/results/
 testdata/corpus/raw/
 
 
