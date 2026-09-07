@@ -36,8 +36,11 @@ _LOCAL_PATTERNS_FILE = _REPO_ROOT / ".guard-local-patterns.txt"
 # text file this policy applies to. ``poc/`` is deliberately excluded: it
 # is a frozen historical record of the original PoC scripts, not material
 # eeANE distributes as its current implementation or documentation.
+# ``poc_qwen/`` is included: unlike ``poc/`` it is written as part of the
+# current codebase and is expected to keep evolving alongside it.
 _TARGET_GLOBS: tuple[str, ...] = (
     "eeane/**/*.py",
+    "poc_qwen/**/*.py",
     "tools/**/*.py",
     "tools/**/*.sh",
     "tests/**/*.py",

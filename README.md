@@ -676,6 +676,39 @@ uv run python poc/benchmark_throughput.py --model embedding --chunk-tokens 128 -
 uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 32  # GPU baseline
 ```
 
+### Trying the decoder-model study
+
+Every architecture `eeane compile` supports is an encoder. The
+`poc_qwen/` scripts ask a separate question: can a decoder-only (causal
+language model) embedding model, which pools the final token rather than
+averaging over all of them, be converted and run on the Neural Engine
+too? They also measure how large a model can get before the Neural
+Engine stops accepting it at all. This is a study, not part of the
+supported conversion path — nothing in it changes how `eeane compile`
+behaves:
+
+```sh
+# Convert; the model is downloaded from the Hub on first use
+uv run python poc_qwen/convert_embedding.py --seq-len 128
+
+# Check the result against the FP32 and sentence-transformers references
+uv run python poc_qwen/verify_accuracy.py \
+    --mlmodelc models/compiled/qwen3-embedding-0.6b/s128_b1_fp16_macos13.mlmodelc --seq-len 128
+
+# Latency plus which compute unit each operation landed on
+uv run python poc_qwen/benchmark_latency.py \
+    --mlmodelc models/compiled/qwen3-embedding-0.6b/s128_b1_fp16_macos13.mlmodelc \
+    --seq-len 128 --compute-plan
+
+# Where Neural Engine placement breaks down, using synthetic models of
+# increasing size (no large checkpoints are downloaded)
+uv run python poc_qwen/size_sweep.py
+
+# The generative reranker variant, which scores a pair from the yes/no
+# logits at the final position instead of a classification head
+uv run python poc_qwen/convert_reranker.py --seq-len 256
+```
+
 ## Acknowledgments and related projects
 
 eeANE was inspired by
@@ -698,6 +731,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.4.5 | Adds `poc_qwen/`, a study of whether decoder-only (causal LM) embedding models run on the Neural Engine, and of how large a model can get before it stops being accepted there; no engine changes |
 | 1.4.0 | Compile self-check now scores three fixed language sets (English, Japanese, Chinese) and accepts whichever clears the threshold, instead of one fixed set that could fail on a model with different vocabulary; support for sentence-transformers Dense projection modules (`Transformer -> Pooling -> Dense -> Normalize`); `RobertaModel`-architecture models now route to the XLM-RoBERTa backend; OpenAI-compatible `dimensions` parameter on `/v1/embeddings`; nine more verified models (51 -> 60) |
 | 1.3.0 | ModernBERT backend detects mean/CLS pooling from the model's sentence-transformers declaration instead of compiling mean pooling only, so CLS-pooling ModernBERT embedding models (e.g. the granite-embedding-*-r2 family) now compile correctly; the resolved pooling is recorded in the compile log and artifact metadata; five more verified models (gte-modernbert-base and four granite-embedding-*-r2 models) |
 | 1.2.0 | 35 more verified models across all three backends (granite, Snowflake Arctic Embed, GTE, mxbai, MiniLM, e5, small ruri-v3, Chinese bge v1.5, Japanese rerankers) and a Verified models table; no engine changes |
