@@ -631,6 +631,22 @@ def test_read_pooling_mode_detects_the_declared_mode(
     assert mb.read_pooling_mode(model_dir) == expected
 
 
+def test_read_pooling_mode_reads_a_mode_no_encoder_backend_implements(tmp_path: Path) -> None:
+    """The shared reader knows every declared mode; a backend still only serves its own.
+
+    Last-token pooling is what a decoder-style model declares. The reader
+    is architecture-independent, so it resolves that declaration too --
+    but none of the encoder backends offers a wrapper for it, and each of
+    them therefore refuses such a handle rather than pooling it some other
+    way.
+    """
+    model_dir = _model_dir(tmp_path, pooling_mode_lasttoken=True)
+
+    assert common.read_pooling_mode(model_dir) == common.POOLING_LASTTOKEN
+    for module in (bert, mb, xlmr):
+        assert common.POOLING_LASTTOKEN not in module.EMBEDDING_WRAPPERS
+
+
 def test_read_pooling_mode_without_a_pooling_module_explains_what_is_missing(
     tmp_path: Path,
 ) -> None:

@@ -35,10 +35,15 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 # Pooling modes the shared embedding helpers implement. A backend records
 # the mode it detected on its LoadedModel handle, and both the wrapper
-# selection and the FP32 baseline are driven by that value.
+# selection and the FP32 baseline are driven by that value. Reading a mode
+# and being able to compile it are two different things: this module knows
+# every mode listed here, while a backend only serves the ones it offers a
+# wrapper for (a causal stack cannot be pooled like an encoder, and vice
+# versa), and refuses the others.
 POOLING_MEAN = "mean"
 POOLING_CLS = "cls"
-POOLING_MODES: tuple[str, ...] = (POOLING_MEAN, POOLING_CLS)
+POOLING_LASTTOKEN = "lasttoken"
+POOLING_MODES: tuple[str, ...] = (POOLING_MEAN, POOLING_CLS, POOLING_LASTTOKEN)
 
 # sentence-transformers pooling module: directory holding the pooling
 # declaration of an embedding model, the file inside it, and the flags it
@@ -51,6 +56,7 @@ POOLING_MODE_PREFIX = "pooling_mode_"
 POOLING_MODE_KEYS: dict[str, str] = {
     "pooling_mode_mean_tokens": POOLING_MEAN,
     "pooling_mode_cls_token": POOLING_CLS,
+    "pooling_mode_lasttoken": POOLING_LASTTOKEN,
 }
 
 # Appended to every pooling-detection error: an embedding model whose
@@ -283,7 +289,8 @@ def read_pooling_mode(model_dir: Path) -> str:
             carry a sentence-transformers pooling module.
 
     Returns:
-        ``"mean"`` or ``"cls"``.
+        One of :data:`POOLING_MODES`. Whether the backend compiling the
+        model implements that mode is decided by the backend, not here.
 
     Raises:
         ValueError: If the pooling declaration is missing, unreadable,
@@ -786,6 +793,39 @@ def mean_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tenso
     return summed / count
 
 
+def last_token_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Pool the last unpadded position of every row.
+
+    The pooling of a causal model: only the final real token has attended
+    to the whole sequence, so it is the position that carries the sentence.
+    Padding is assumed to be on the right (what the shared
+    :func:`tokenize_batch` produces), so that position is
+    ``attention_mask.sum(dim=1) - 1``. A row with no real token at all
+    would give ``-1``; the index is clamped to ``0`` so such a row reads
+    the first position instead of wrapping around to the last one.
+
+    Single source of truth shared by the in-graph wrapper of the
+    decoder-style backends and the PyTorch baseline
+    (:func:`encode_pytorch`); changing the formula for one consumer
+    without the other would make the self-check compare two different
+    functions.
+
+    Written without turning any shape or index into a Python number: doing
+    so records an ``aten::Int`` node in the traced graph, which the Core ML
+    converter cannot fold into a static gather.
+
+    Args:
+        hidden: Last hidden state, shape (B, S, H).
+        attention_mask: Attention mask, shape (B, S), right-padded.
+
+    Returns:
+        Pooled embeddings, shape (B, H).
+    """
+    lengths = (attention_mask.sum(dim=1).to(torch.long) - 1).clamp(min=0)  # (B,)
+    rows = torch.arange(hidden.shape[0], device=hidden.device)  # (B,)
+    return hidden[rows, lengths]
+
+
 def sigmoid_np(x: np.ndarray) -> np.ndarray:
     """Compute a numerically stable sigmoid.
 
@@ -886,7 +926,8 @@ def encode_pytorch(
         texts: Input sentences.
         seq_len: Fixed sequence length used for tokenization.
         pooling: Pooling mode to apply, one of :data:`POOLING_MODES`. It
-            must match the pooling the traced wrapper performs.
+            must match the pooling the traced wrapper performs; the caller
+            is a backend that already refused any mode it cannot wrap.
         dense: Projection applied to the pooled vector, as built by
             :func:`build_dense`. It must be the very projection the traced
             wrapper applies, or the two sides of the self-check would
@@ -901,8 +942,9 @@ def encode_pytorch(
         ValueError: If ``pooling`` is not a supported pooling mode.
     """
     if pooling not in POOLING_MODES:
-        supported = ", ".join(POOLING_MODES)
-        raise ValueError(f"unsupported pooling '{pooling}' (supported: {supported})")
+        # Refused before the first forward pass: an unknown mode is a
+        # caller error, not something to discover halfway through a batch.
+        raise _unsupported_pooling(pooling)
     batch = tokenize_batch(tokenizer, texts, seq_len)
     rows: list[np.ndarray] = []
     with torch.no_grad():
@@ -913,10 +955,7 @@ def encode_pytorch(
             attention_mask = torch.from_numpy(batch["attention_mask"][i : i + 1]).long()
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             hidden = outputs[0]  # (1, S, H)
-            if pooling == POOLING_MEAN:
-                pooled = mean_pool(hidden, attention_mask)  # (1, H)
-            else:
-                pooled = hidden[:, 0]  # CLS token, (1, H)
+            pooled = _pool(hidden, attention_mask, pooling)  # (1, H)
             if dense is not None:
                 pooled = dense(pooled)  # (1, W)
             rows.append(pooled.numpy().astype(np.float32).reshape(-1))
@@ -925,6 +964,47 @@ def encode_pytorch(
         # the backbone's own width is all this can report.
         return np.empty((0, model.config.hidden_size), dtype=np.float32)
     return np.stack(rows)
+
+
+def _pool(hidden: torch.Tensor, attention_mask: torch.Tensor, pooling: str) -> torch.Tensor:
+    """Apply one pooling mode to one batch of hidden states.
+
+    Every supported mode is named explicitly, so a mode added to
+    :data:`POOLING_MODES` without a branch here is refused rather than
+    silently pooled like one of the others.
+
+    Args:
+        hidden: Last hidden state, shape (B, S, H).
+        attention_mask: Attention mask, shape (B, S).
+        pooling: Mode to apply, one of :data:`POOLING_MODES`.
+
+    Returns:
+        Pooled embeddings, shape (B, H).
+
+    Raises:
+        ValueError: If ``pooling`` is not a supported pooling mode.
+    """
+    if pooling == POOLING_MEAN:
+        return mean_pool(hidden, attention_mask)
+    if pooling == POOLING_CLS:
+        # The first position of an encoder row, which is never padding.
+        return hidden[:, 0]
+    if pooling == POOLING_LASTTOKEN:
+        return last_token_pool(hidden, attention_mask)
+    raise _unsupported_pooling(pooling)
+
+
+def _unsupported_pooling(pooling: Any) -> ValueError:
+    """Build the error raised for a pooling mode this module cannot apply.
+
+    Args:
+        pooling: The rejected mode, quoted back so the reason is actionable.
+
+    Returns:
+        The :class:`ValueError` to raise.
+    """
+    supported = ", ".join(POOLING_MODES)
+    return ValueError(f"unsupported pooling '{pooling}' (supported: {supported})")
 
 
 def score_pytorch(
