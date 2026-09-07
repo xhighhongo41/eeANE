@@ -41,7 +41,20 @@ from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 # Accepted values for the ``mode`` argument of :func:`patch_repeat_kv`.
-REPEAT_KV_MODES: tuple[str, ...] = ("repeat_interleave", "repeat_reshape")
+#
+# Only one strategy satisfies every constraint the replacement is under at
+# the same time: it must stay rank-4, it must not turn a traced shape into
+# a Python integer, and it must preserve the upstream head order
+# ``kv_index * n_rep + rep_index``. Repeating along the sequence axis and
+# reshaping back also avoids rank 5, but the reshape needs the batch and
+# head extents, and reading those off a traced tensor emits exactly the
+# shape-to-scalar node that the rotary patch above exists to remove --
+# which then fails conversion. Concatenating whole copies stays rank-4 and
+# shape-free, but yields the head order ``rep_index * kv_heads +
+# kv_index``, which no longer lines up with the query heads. Interleaving
+# is what is left, so the mode argument exists to name the strategy in the
+# recorded metadata rather than to offer a real choice today.
+REPEAT_KV_MODES: tuple[str, ...] = ("repeat_interleave",)
 
 # Accepted values for the ``mode`` argument of :func:`patch_rmsnorm`.
 RMSNORM_MODES: tuple[str, ...] = ("upstream", "scaled")
@@ -77,31 +90,8 @@ def _repeat_kv_interleave(hidden_states: torch.Tensor, n_rep: int) -> torch.Tens
     return hidden_states.repeat_interleave(n_rep, dim=1)
 
 
-def _repeat_kv_reshape(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Expand key/value heads by repeating along the sequence axis.
-
-    ``repeat`` along dim 2 lays the copies out as ``[rep, seq]``, so the
-    following reshape moves ``rep`` next to the head axis and yields the
-    upstream head order ``kv_index * n_rep + rep_index``.
-
-    Args:
-        hidden_states: Tensor of shape ``(B, kv_heads, S, head_dim)``.
-        n_rep: Number of query heads sharing one key/value head.
-
-    Returns:
-        Tensor of shape ``(B, kv_heads * n_rep, S, head_dim)``; the input
-        itself when ``n_rep == 1``.
-    """
-    if n_rep == 1:
-        return hidden_states
-    batch, kv_heads, slen, head_dim = hidden_states.shape
-    repeated = hidden_states.repeat(1, 1, n_rep, 1)
-    return repeated.reshape(batch, kv_heads * n_rep, slen, head_dim)
-
-
 _REPEAT_KV_IMPLEMENTATIONS: dict[str, Callable[[torch.Tensor, int], torch.Tensor]] = {
     "repeat_interleave": _repeat_kv_interleave,
-    "repeat_reshape": _repeat_kv_reshape,
 }
 
 
@@ -155,14 +145,13 @@ def patch_repeat_kv(mode: str = "repeat_interleave") -> dict[str, object]:
     """Replace the grouped-query key/value expansion with a rank-4 form.
 
     Rebinds ``transformers.models.qwen3.modeling_qwen3.repeat_kv`` with
-    an implementation that never materializes a rank-5 tensor. Both modes
-    produce the upstream head order and, for ``n_rep == 1``, return the
-    input unchanged exactly as upstream does.
+    an implementation that never materializes a rank-5 tensor, produces
+    the upstream head order, and returns the input unchanged when
+    ``n_rep == 1`` exactly as upstream does.
 
     Args:
-        mode: ``"repeat_interleave"`` (default) or ``"repeat_reshape"``.
-            Both are numerically identical; they differ in which
-            operators the converter has to lower.
+        mode: Expansion strategy; see :data:`REPEAT_KV_MODES` for why
+            interleaving is currently the only one that converts.
 
     Returns:
         Record of the applied patch, including the chosen mode.

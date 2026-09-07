@@ -16,7 +16,13 @@ from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Model, Qwen3RMSNorm
 
-from poc_qwen.patches import apply_patches, patch_repeat_kv, patch_rmsnorm, patch_rotate_half
+from poc_qwen.patches import (
+    REPEAT_KV_MODES,
+    apply_patches,
+    patch_repeat_kv,
+    patch_rmsnorm,
+    patch_rotate_half,
+)
 
 
 @pytest.fixture
@@ -94,9 +100,9 @@ def test_patch_rotate_half_matches_upstream(upstream: SimpleNamespace) -> None:
     assert torch.equal(modeling_qwen3.rotate_half(x), expected)
 
 
-@pytest.mark.parametrize("mode", ["repeat_interleave", "repeat_reshape"])
+@pytest.mark.parametrize("mode", list(REPEAT_KV_MODES))
 def test_patch_repeat_kv_matches_upstream(upstream: SimpleNamespace, mode: str) -> None:
-    """Both replacement modes must reproduce the upstream head order bit for bit."""
+    """Every replacement mode must reproduce the upstream head order bit for bit."""
     torch.manual_seed(1)
     hidden_states = torch.randn(2, 2, 3, 4)
     n_rep = 2
@@ -112,7 +118,7 @@ def test_patch_repeat_kv_matches_upstream(upstream: SimpleNamespace, mode: str) 
     assert torch.equal(patched, expected)
 
 
-@pytest.mark.parametrize("mode", ["repeat_interleave", "repeat_reshape"])
+@pytest.mark.parametrize("mode", list(REPEAT_KV_MODES))
 def test_patch_repeat_kv_returns_input_when_n_rep_is_one(
     upstream: SimpleNamespace, mode: str
 ) -> None:
@@ -217,12 +223,12 @@ def test_apply_patches_records_every_patch(upstream: SimpleNamespace) -> None:
     """The combined record must describe all three patches."""
     model = _tiny_model()
 
-    record = apply_patches(model, repeat_kv_mode="repeat_reshape", rmsnorm_mode="scaled")
+    record = apply_patches(model, repeat_kv_mode="repeat_interleave", rmsnorm_mode="scaled")
 
     assert set(record) == {"rotate_half", "repeat_kv", "rmsnorm"}
     assert record["rotate_half"]["applied"] is True
     assert record["repeat_kv"]["applied"] is True
-    assert record["repeat_kv"]["mode"] == "repeat_reshape"
+    assert record["repeat_kv"]["mode"] == "repeat_interleave"
     assert record["rmsnorm"]["applied"] is True
     assert record["rmsnorm"]["patched_modules"] > 0
     assert modeling_qwen3.rotate_half is not upstream.rotate_half
