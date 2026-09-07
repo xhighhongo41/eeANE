@@ -693,6 +693,38 @@ uv run python poc/benchmark_throughput.py --model embedding --chunk-tokens 128 -
 uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 32  # GPUベースライン
 ```
 
+### デコーダ型モデルの調査を試す
+
+`eeane compile`が対応しているアーキテクチャはいずれもエンコーダ型
+です。`poc_qwen/`配下のスクリプトは別の問いを扱います。全トークンを
+平均するのではなく最終トークンを取り出すデコーダ型(causal language
+model)の埋め込みモデルも、変換してNeural Engineで動かせるのか?
+また、Neural Engineが受け付けなくなるのはどのくらいの大きさからか?
+これは調査であってサポートされた変換手段ではなく、`eeane compile`の
+挙動を変えるものは含まれていません:
+
+```sh
+# 変換(モデルは初回実行時にHubから取得されます)
+uv run python poc_qwen/convert_embedding.py --seq-len 128
+
+# FP32基準およびsentence-transformersとの精度比較
+uv run python poc_qwen/verify_accuracy.py \
+    --mlmodelc models/compiled/qwen3-embedding-0.6b/s128_b1_fp16_macos13.mlmodelc --seq-len 128
+
+# レイテンシと、各演算がどの計算ユニットに配置されたか
+uv run python poc_qwen/benchmark_latency.py \
+    --mlmodelc models/compiled/qwen3-embedding-0.6b/s128_b1_fp16_macos13.mlmodelc \
+    --seq-len 128 --compute-plan
+
+# Neural Engineへの配置が崩れる大きさを、サイズを変えた合成モデルで
+# 調べます(大きなモデルのダウンロードは発生しません)
+uv run python poc_qwen/size_sweep.py
+
+# 分類ヘッドの代わりに最終位置のyes/noロジットでスコアを出す、
+# 生成型のrerankerモデル
+uv run python poc_qwen/convert_reranker.py --seq-len 256
+```
+
 ## 謝辞と関連プロジェクト
 
 eeANEは[Infinity](https://github.com/michaelfeil/infinity)に触発

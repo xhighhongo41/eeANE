@@ -676,6 +676,39 @@ uv run python poc/benchmark_throughput.py --model embedding --chunk-tokens 128 -
 uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 32  # GPU baseline
 ```
 
+### Trying the decoder-model study
+
+Every architecture `eeane compile` supports is an encoder. The
+`poc_qwen/` scripts ask a separate question: can a decoder-only (causal
+language model) embedding model, which pools the final token rather than
+averaging over all of them, be converted and run on the Neural Engine
+too? They also measure how large a model can get before the Neural
+Engine stops accepting it at all. This is a study, not part of the
+supported conversion path — nothing in it changes how `eeane compile`
+behaves:
+
+```sh
+# Convert; the model is downloaded from the Hub on first use
+uv run python poc_qwen/convert_embedding.py --seq-len 128
+
+# Check the result against the FP32 and sentence-transformers references
+uv run python poc_qwen/verify_accuracy.py \
+    --mlmodelc models/compiled/qwen3-embedding-0.6b/s128_b1_fp16_macos13.mlmodelc --seq-len 128
+
+# Latency plus which compute unit each operation landed on
+uv run python poc_qwen/benchmark_latency.py \
+    --mlmodelc models/compiled/qwen3-embedding-0.6b/s128_b1_fp16_macos13.mlmodelc \
+    --seq-len 128 --compute-plan
+
+# Where Neural Engine placement breaks down, using synthetic models of
+# increasing size (no large checkpoints are downloaded)
+uv run python poc_qwen/size_sweep.py
+
+# The generative reranker variant, which scores a pair from the yes/no
+# logits at the final position instead of a classification head
+uv run python poc_qwen/convert_reranker.py --seq-len 256
+```
+
 ## Acknowledgments and related projects
 
 eeANE was inspired by
