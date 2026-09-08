@@ -17,6 +17,7 @@ keywords = [
     "modernbert",
     "bert",
     "xlm-roberta",
+    "qwen3",
     "inference-server",
     "openai-compatible",
 ]
