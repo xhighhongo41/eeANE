@@ -44,7 +44,12 @@ from transformers import (
 )
 from transformers.models.modernbert import modeling_modernbert
 
-from eeane.compiler.backends.base import LoadedModel, SanitySpec
+from eeane.compiler.backends.base import (
+    SCORE_SPACE_PROBABILITY,
+    LoadedModel,
+    PairTemplate,
+    SanitySpec,
+)
 from eeane.compiler.backends.common import (
     POOLING_CLS,
     POOLING_DIRNAME,
@@ -530,6 +535,37 @@ class ModernBertBackend:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             return None
         return value
+
+    def pair_template(self, model_dir: Path, kind: str) -> PairTemplate | None:
+        """Return how this model wants a (query, document) pair spelled out.
+
+        Args:
+            model_dir: Local HuggingFace-format model directory.
+            kind: Model kind the template is asked for.
+
+        Returns:
+            Always ``None``: this architecture encodes a pair through the
+            tokenizer's own pair encoding, so there is nothing to shape.
+
+        Raises:
+            ValueError: If ``kind`` is not supported by this backend.
+        """
+        self._check_kind(kind)
+        # This architecture hands both sequences to the tokenizer, whose
+        # own post_processor produces the model's pair template; there is
+        # nothing left for a caller to spell out.
+        return None
+
+    def reranker_score_space(self) -> str:
+        """Return the space this backend's reranker scores are faithful in.
+
+        Returns:
+            :data:`~eeane.compiler.backends.base.SCORE_SPACE_PROBABILITY`:
+            the classification head emits one calibrated relevance value
+            per pair, and the probability its sigmoid produces is the
+            number the server hands out.
+        """
+        return SCORE_SPACE_PROBABILITY
 
     def trace_example(self, kind: str) -> Any:
         """Return the fixed raw example input used for ``torch.jit.trace``.

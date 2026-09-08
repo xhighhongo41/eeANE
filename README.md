@@ -31,9 +31,12 @@ and most of your unified memory free for other work.
 - **Multi-model serving** with per-request routing, admission control
   (429/503 + `Retry-After`), identical-request coalescing, and graceful
   shutdown.
-- **Three architecture families supported today**: ModernBERT and
-  XLM-RoBERTa (both embedding and cross-encoder reranker models), and
-  BERT (embedding models only). More are planned.
+- **Four architecture families supported today**: ModernBERT and
+  XLM-RoBERTa (both embedding and cross-encoder reranker models), BERT
+  (embedding models only), and Qwen3 (decoder-only: embedding models
+  that pool the sequence's last token, and generative rerankers that
+  score from a yes/no logit pair instead of a classification head).
+  More are planned.
 
 ## Requirements
 
@@ -151,25 +154,33 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 ### About `eeane compile`
 
 `eeane compile` picks the model backend from the model's `config.json`.
-Three architecture families are supported: **ModernBERT** and
-**XLM-RoBERTa** (both embedding and cross-encoder reranker models), and
+Four architecture families are supported: **ModernBERT** and
+**XLM-RoBERTa** (both embedding and cross-encoder reranker models),
 **BERT** (embedding models only — a BERT cross-encoder reranker is
 rejected instead, because the compiled graph would have to pin its
 segment ids to zero, which changes the meaning of a query/document pair
-for this architecture). `RobertaModel`-architecture models are routed to
-the XLM-RoBERTa backend as well — transformers implements RoBERTa and
-XLM-RoBERTa as the same encoder, differing only in vocabulary. More
-families are planned. For embedding models, all three backends detect the
-mean/CLS pooling declared by the model directory's sentence-transformers
-`1_Pooling/config.json` and compile the matching graph; an embedding
-model that does not declare a supported pooling mode is rejected with an
-error rather than compiled on a guess, because an artifact built with the
-wrong pooling still looks plausible while returning vectors with a
-different meaning. Rerankers are unaffected by this declaration — their
-pooling is part of the model's own classification head, not a separate
-sentence-transformers module. The compile log names the pooling it
-detected for each embedding model. See [Verified models](#verified-models)
-for the models that have been run end to end.
+for this architecture), and **Qwen3** (decoder-only: embedding models
+that pool the sequence's last token, and generative rerankers that score
+a query/document pair from two vocabulary logits instead of a
+classification head — see below). `RobertaModel`-architecture models are
+routed to the XLM-RoBERTa backend as well — transformers implements
+RoBERTa and XLM-RoBERTa as the same encoder, differing only in
+vocabulary. More families are planned. For embedding models, every
+backend detects the pooling declared by the model directory's
+sentence-transformers `1_Pooling/config.json` and compiles the matching
+graph — mean or CLS pooling for the three encoder backends, and
+last-token pooling for Qwen3 only, since last-token pooling assumes a
+causal (left-to-right) architecture that the encoder backends do not
+have; an embedding model that does not declare a supported pooling mode
+is rejected with an error rather than compiled on a guess, because an
+artifact built with the wrong pooling still looks plausible while
+returning vectors with a different meaning. Rerankers are unaffected by
+this declaration — their scoring is part of the model's own
+classification head (or, for Qwen3's generative reranker, its own
+instruction template — see below), not a separate sentence-transformers
+module. The compile log names the pooling it detected for each embedding
+model. See [Verified models](#verified-models) for the models that have
+been run end to end.
 
 A sentence-transformers model directory may also declare a **Dense**
 module chain in its `modules.json`: `eeane compile` supports the
@@ -187,8 +198,18 @@ same safetensors-first policy as the model's main weights (`--allow-pickle`
 for `.bin`-only Dense checkpoints; see [Checkpoint
 formats](#checkpoint-formats)).
 
-The compiler detects whether a model is
-an embedding model or a reranker and defaults to buckets 128/512/1024
+The compiler detects whether a model is an embedding model or a
+reranker from its `config.json` architecture name, for the three
+encoder backends: a name ending in `ForSequenceClassification` is a
+reranker, `...Model` an embedding model. Qwen3 embedding and generative
+reranker checkpoints are both published under the same architecture
+name, `Qwen3ForCausalLM`, so a `ForCausalLM`-suffixed name is resolved
+differently instead: `eeane compile` reads the model directory's
+sentence-transformers module declaration (`modules.json`) — a pooling
+module means embedding, a scoring module means reranker. A directory
+declaring neither is rejected with an error that names `--kind` as the
+fix; detection for every other architecture is unchanged. Either way,
+the compiler then defaults to buckets 128/512/1024
 (embedding) or 512/1024 (reranker), clipped to the model's maximum
 sequence length — a model capped at 512 tokens compiles as 128/512
 (embedding) or just 512 (reranker), and the compile log names each
@@ -217,6 +238,25 @@ so the server needs neither the original model files nor the
 transformers library at run time (see
 [docs/dependency-policy.md](docs/dependency-policy.md)).
 
+Qwen3's generative reranker variant carries no classification head:
+`eeane compile` embeds the query and document in a fixed chat-style
+instruction template, and the compiled graph outputs a single value —
+the "yes" vocabulary logit minus the "no" vocabulary logit at the
+sequence's final position — instead of a classification score. How to
+assemble that template (its preamble, per-pair body, and closing suffix)
+is resolved once at compile time from the model's own declaration and
+recorded in the compiled artifact; the server reads it back and applies
+it to every request. When a query/document pair is too long for the
+compiled bucket, only the body is truncated — the preamble and suffix
+are always kept intact, since the suffix is where the template asks the
+model to write its answer. That single output value is exactly the
+argument of the two-way identity `softmax([no, yes])[yes] =
+sigmoid(yes - no)`, so it plugs into `/rerank`'s existing sigmoid scoring
+with no change in meaning; `raw_scores=true` returns that raw logit
+difference, just as it returns a raw logit for the other reranker
+architectures. The API itself does not change at all — callers do not
+need to know whether a served reranker is generative.
+
 ### Verified models
 
 Every model below was compiled from its stock Hugging Face
@@ -229,7 +269,7 @@ maximum sequence length. Models are grouped by the backend their
 predict it (`paraphrase-multilingual-mpnet-base-v2` is an
 XLM-RoBERTa model, and `multilingual-e5-small` is a BERT one).
 
-Any other model built on one of these three architectures is likely to
+Any other model built on one of these four architectures is likely to
 work as well; these are simply the ones that have been run end to end.
 
 **ModernBERT**
@@ -315,6 +355,17 @@ than BERT's.
 
 <sup>1</sup> Ships `pytorch_model.bin` only, so compiling it needs
 `--allow-pickle` (see [Checkpoint formats](#checkpoint-formats)).
+
+**Qwen3 (decoder-only)**
+
+A generative reranker's score carries the same meaning as any other
+reranker's (see About `eeane compile` above) — `/rerank` treats it no
+differently once compiled.
+
+| Model | Type | Buckets |
+|---|---|---|
+| Qwen/Qwen3-Embedding-0.6B | embedding | 128/512/1024 |
+| Qwen/Qwen3-Reranker-0.6B | reranker | 512/1024 |
 
 ### Checkpoint formats
 
@@ -506,6 +557,25 @@ trained with a Matryoshka representation learning (MRL) objective, whose
 embeddings stay meaningful at any prefix length; requesting more
 dimensions than the model's embedding width gets a 400.
 
+eeANE never modifies request text — `input` and `query` reach the
+tokenizer exactly as sent. Some embedding models expect an instruction
+string prepended to the search query only (never to documents); when a
+served model is trained this way, adding that string is the caller's
+responsibility. Qwen3-Embedding-0.6B, for example, publishes this
+format:
+
+```
+Instruct: Given a web search query, retrieve relevant passages that answer the query
+Query:{the actual query text}
+```
+
+From [Open WebUI](https://github.com/open-webui/open-webui) (v0.6.0 or
+later), set the `RAG_EMBEDDING_QUERY_PREFIX` environment variable to the
+instruction string so it is added to queries only, and leave
+`RAG_EMBEDDING_CONTENT_PREFIX` (documents) empty. This has been checked
+against letting `sentence-transformers` build the same embedding through
+the model's own prompt feature instead: the two agree at cosine 0.9999.
+
 To use eeANE from [Open WebUI](https://github.com/open-webui/open-webui):
 set the embedding engine to OpenAI with base URL
 `http://127.0.0.1:7997/v1`, and the reranking engine to External with URL
@@ -571,6 +641,14 @@ exactly (`tools/verify_server.py` in a repository checkout).
   the publisher ships alongside it is present. eeANE does not fall back
   to assuming mean pooling: a wrongly-pooled artifact would silently
   return vectors with a different meaning.
+- **`eeane compile` fails with `cannot tell whether ... is an embedding
+  model or a reranker ...`**: this only happens for a
+  `ForCausalLM`-architecture model directory (Qwen3, for example) that
+  declares neither a sentence-transformers pooling module nor a scoring
+  module in its `modules.json` — the only signal `eeane compile` has for
+  telling that architecture's embedding and generative-reranker
+  checkpoints apart. Pass `--kind embedding` or `--kind reranker`
+  explicitly to compile it anyway.
 
 ## Known limitations
 
@@ -614,6 +692,20 @@ exactly (`tools/verify_server.py` in a repository checkout).
   model's fp16 and fp32 output on input outside its intended languages
   yourself. Within a model's intended languages the agreement is far
   tighter (cosine ≥ 0.9999 on every model listed above).
+- **Memory scales with buckets loaded, not duplicated per bucket**:
+  compiled weights are memory-mapped, so serving several buckets of the
+  same model does not multiply its resident memory by the bucket count.
+  Measured on a 0.6B-class embedding model: loading all three buckets
+  added about 150 MB of physical footprint to the server process (313 MB
+  unloaded -> 456 MB with 128/512/1024 all loaded); an eight-model
+  configuration held workers at 592 MB (peak 730 MB).
+- **Neural Engine model-size ceiling**: the 4B and 8B models in the
+  Qwen3 family are not supported. Once a compiled model's size passes
+  roughly 2 GiB, the Neural Engine stops accepting any of its operations
+  and everything falls back to the CPU instead — conversion, loading and
+  inference all still succeed, so the only visible symptom is much
+  slower inference. In parameter count this ceiling sits at about 1.07B;
+  the 0.6B models above are comfortably under it.
 
 ## Development
 
@@ -678,14 +770,14 @@ uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 
 
 ### Trying the decoder-model study
 
-Every architecture `eeane compile` supports is an encoder. The
-`poc_qwen/` scripts ask a separate question: can a decoder-only (causal
-language model) embedding model, which pools the final token rather than
-averaging over all of them, be converted and run on the Neural Engine
-too? They also measure how large a model can get before the Neural
-Engine stops accepting it at all. This is a study, not part of the
-supported conversion path — nothing in it changes how `eeane compile`
-behaves:
+Decoder-only (causal language model) architectures are now handled by
+the regular `eeane compile` — see Qwen3 in About `eeane compile` and
+Verified models above. The `poc_qwen/` scripts remain in the repository
+as the research record behind that support, and are still runnable. One
+part of that record has no equivalent in the main product: probing, with
+synthetic models of increasing size (no large checkpoints downloaded),
+how large a model can get before the Neural Engine stops accepting it at
+all — see Known limitations above for what that probe found:
 
 ```sh
 # Convert; the model is downloaded from the Hub on first use
@@ -731,6 +823,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.5.0 | Qwen3 (decoder-only) becomes eeANE's fourth supported architecture family, compiled and served through the regular `eeane compile`/`eeane serve` path: last-token pooling for embedding models, and a generative reranker scored from a yes/no logit pair instead of a classification head; model-kind detection for `ForCausalLM` architectures now reads the model's sentence-transformers module declaration instead of the architecture name alone; two verified models (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B) |
 | 1.4.5 | Adds `poc_qwen/`, a study of whether decoder-only (causal LM) embedding models run on the Neural Engine, and of how large a model can get before it stops being accepted there; no engine changes |
 | 1.4.0 | Compile self-check now scores three fixed language sets (English, Japanese, Chinese) and accepts whichever clears the threshold, instead of one fixed set that could fail on a model with different vocabulary; support for sentence-transformers Dense projection modules (`Transformer -> Pooling -> Dense -> Normalize`); `RobertaModel`-architecture models now route to the XLM-RoBERTa backend; OpenAI-compatible `dimensions` parameter on `/v1/embeddings`; nine more verified models (51 -> 60) |
 | 1.3.0 | ModernBERT backend detects mean/CLS pooling from the model's sentence-transformers declaration instead of compiling mean pooling only, so CLS-pooling ModernBERT embedding models (e.g. the granite-embedding-*-r2 family) now compile correctly; the resolved pooling is recorded in the compile log and artifact metadata; five more verified models (gte-modernbert-base and four granite-embedding-*-r2 models) |

@@ -438,6 +438,8 @@ def test_the_protocol_declares_the_documented_members() -> None:
         "wrap",
         "output_name",
         "max_seq_len",
+        "pair_template",
+        "reranker_score_space",
         "trace_example",
         "sanity_spec",
         "padding_input",
@@ -454,6 +456,34 @@ def test_every_backend_matches_the_declared_signature(backend_class: type, metho
 
     assert implemented is not None, f"{backend_class.__name__} does not implement {method}()"
     assert _parameters(implemented) == _parameters(getattr(base.CompileBackend, method))
+
+
+@pytest.mark.parametrize("backend_class", _BACKEND_CLASSES, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("kind", ["embedding", "reranker"])
+def test_every_encoder_backend_shapes_no_pair(
+    backend_class: type, kind: str, tmp_path: Path
+) -> None:
+    """These architectures encode a pair through the tokenizer, so there is nothing to shape."""
+    backend = backend_class()
+    if kind not in backend.supported_kinds:
+        pytest.skip(f"{backend.name} does not compile {kind} models")
+
+    assert backend.pair_template(tmp_path, kind) is None
+
+
+@pytest.mark.parametrize("backend_class", _BACKEND_CLASSES, ids=lambda cls: cls.__name__)
+def test_every_encoder_backend_rejects_an_unsupported_kind_for_a_pair_template(
+    backend_class: type, tmp_path: Path
+) -> None:
+    """A kind the backend cannot compile must be refused rather than answered with None."""
+    with pytest.raises(ValueError, match="kind"):
+        backend_class().pair_template(tmp_path, "classifier")
+
+
+@pytest.mark.parametrize("backend_class", _BACKEND_CLASSES, ids=lambda cls: cls.__name__)
+def test_every_encoder_backend_scores_in_the_probability_space(backend_class: type) -> None:
+    """A cross-encoder head emits the calibrated value the server hands out."""
+    assert backend_class().reranker_score_space() == base.SCORE_SPACE_PROBABILITY
 
 
 def test_modernbert_backend_declares_the_interface_attributes() -> None:
@@ -629,6 +659,22 @@ def test_read_pooling_mode_detects_the_declared_mode(
     model_dir = _model_dir(tmp_path, **declaration)
 
     assert mb.read_pooling_mode(model_dir) == expected
+
+
+def test_read_pooling_mode_reads_a_mode_no_encoder_backend_implements(tmp_path: Path) -> None:
+    """The shared reader knows every declared mode; a backend still only serves its own.
+
+    Last-token pooling is what a decoder-style model declares. The reader
+    is architecture-independent, so it resolves that declaration too --
+    but none of the encoder backends offers a wrapper for it, and each of
+    them therefore refuses such a handle rather than pooling it some other
+    way.
+    """
+    model_dir = _model_dir(tmp_path, pooling_mode_lasttoken=True)
+
+    assert common.read_pooling_mode(model_dir) == common.POOLING_LASTTOKEN
+    for module in (bert, mb, xlmr):
+        assert common.POOLING_LASTTOKEN not in module.EMBEDDING_WRAPPERS
 
 
 def test_read_pooling_mode_without_a_pooling_module_explains_what_is_missing(

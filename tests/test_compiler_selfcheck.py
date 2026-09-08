@@ -87,6 +87,8 @@ class _FakeBackend:
         reference: np.ndarray,
         *,
         ordering: bool = True,
+        score_space: str = base.SCORE_SPACE_PROBABILITY,
+        pair_template: runtime.PairTemplate | None = None,
     ) -> None:
         """Store the fixed fixtures this fake backend serves.
 
@@ -102,12 +104,19 @@ class _FakeBackend:
                 relevant/irrelevant indices (index 0 / index 1) its
                 ordering check needs. An embedding spec never declares
                 them, as in a real backend.
+            score_space: Space this fake backend declares its reranker
+                scores are faithful in.
+            pair_template: Template this fake backend declares its pairs
+                are spelled out with, or ``None`` for a model that shapes
+                nothing.
         """
         self._kind = kind
         self._sanity_sets = sanity_sets
         self._padding = padding
         self._reference = reference
         self._ordering = ordering
+        self._score_space = score_space
+        self._pair_template = pair_template
         # Recorded so a test can prove the FP32 baseline is computed once
         # for every set together, not once per set (each call reloads the
         # model in a real backend).
@@ -128,6 +137,15 @@ class _FakeBackend:
         assert kind == self._kind
         return self._padding
 
+    def pair_template(self, model_dir: Path, kind: str) -> runtime.PairTemplate | None:
+        """Return the declared pair template, asserting the expected kind."""
+        assert kind == self._kind
+        return self._pair_template
+
+    def reranker_score_space(self) -> str:
+        """Return the declared score space."""
+        return self._score_space
+
     def reference_outputs(
         self, model_dir: Path, kind: str, inputs: list[Any], seq_len: int
     ) -> np.ndarray:
@@ -146,6 +164,8 @@ def _make_context(
     seq_len: int = 16,
     batch_size: int = 1,
     ordering: bool = True,
+    score_space: str = base.SCORE_SPACE_PROBABILITY,
+    pair_template: runtime.PairTemplate | None = None,
 ) -> tuple[pipeline.SelfcheckContext, runtime.FrozenTokenizer]:
     """Build a :class:`~eeane.compiler.pipeline.SelfcheckContext` for a unit test.
 
@@ -160,6 +180,10 @@ def _make_context(
         batch_size: Fixed batch size B.
         ordering: Whether the fake reranker spec declares the expected
             relevant/irrelevant pair indices.
+        score_space: Space the fake backend declares its reranker scores
+            are faithful in.
+        pair_template: Template the fake backend declares its pairs are
+            spelled out with.
 
     Returns:
         Tuple of the context and the frozen tokenizer it points to (handed
@@ -170,7 +194,15 @@ def _make_context(
     frozen = runtime.load_frozen_tokenizer(tokenizer_path)
     mlmodelc_path = tmp_path / "variant.mlmodelc"
     mlmodelc_path.mkdir()
-    backend = _FakeBackend(kind, sanity_sets, padding_input, reference, ordering=ordering)
+    backend = _FakeBackend(
+        kind,
+        sanity_sets,
+        padding_input,
+        reference,
+        ordering=ordering,
+        score_space=score_space,
+        pair_template=pair_template,
+    )
     context = pipeline.SelfcheckContext(
         backend=backend,
         model_dir=tmp_path,
@@ -1032,6 +1064,7 @@ def test_run_selfcheck_reranker_checks_batch_consistency_on_the_best_sets_first_
         seq_len: int,
         batch_size: int,
         output_key: str,
+        template: Any = None,
     ) -> dict[str, Any]:
         pairs.append(pair)
         return {"passed": True}
@@ -1083,3 +1116,272 @@ def test_e2e_real_selfcheck_records_every_section(
     assert report["latency"]["n"] == selfcheck.LATENCY_TIMED_PREDICTS
     assert report["machine"]["platform"]
     json.dumps(report)  # the metadata file itself already proves this, but be explicit
+
+
+# --- run_selfcheck: a reranker scored in the logit space -------------------------
+
+# Template a generative reranker declares. Short enough to leave a body
+# inside the bucket the unit tests use.
+_LOGIT_TEMPLATE = runtime.PairTemplate(
+    prefix="<<ask>>", body_format="q={query} d={document}", suffix="<<answer>>"
+)
+
+_LOGIT_PAIRS: dict[str, list[Any]] = {
+    "en": [("q-en", "d-en-relevant"), ("q-en", "d-en-irrelevant")],
+}
+_LOGIT_ALL_PAIRS: list[Any] = list(_LOGIT_PAIRS["en"])
+
+
+def _run_logit_reranker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fp32_logits: list[float],
+    coreml_logits: list[float],
+    *,
+    batch_size: int = 1,
+    pair_template: runtime.PairTemplate | None = None,
+    seq_len: int = 64,
+) -> tuple[dict[str, Any], pipeline.SelfcheckContext, runtime.FrozenTokenizer]:
+    """Run the self-check over one pair set of a backend scoring in the logit space.
+
+    Args:
+        monkeypatch: Test's monkeypatch fixture.
+        tmp_path: Test-scoped scratch directory.
+        fp32_logits: FP32 baseline logit per pair of :data:`_LOGIT_ALL_PAIRS`.
+        coreml_logits: Compiled-model logit per pair, in the same order.
+        batch_size: Fixed batch size B of the variant.
+        pair_template: Template the fake backend declares.
+        seq_len: Fixed sequence length S.
+
+    Returns:
+        Tuple of the report, the context and the frozen tokenizer.
+    """
+    reference = np.array(fp32_logits, dtype=np.float32)
+    context, frozen = _make_context(
+        tmp_path,
+        "reranker",
+        _LOGIT_PAIRS,
+        ("pad-q", "pad-d"),
+        reference,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        score_space=base.SCORE_SPACE_LOGIT,
+        pair_template=pair_template,
+    )
+    prepared = (
+        None if pair_template is None else runtime.prepare_pair_template(frozen, pair_template)
+    )
+    rows = runtime.tokenize_pairs(frozen, _LOGIT_ALL_PAIRS, seq_len, prepared)["input_ids"]
+    outputs = np.array(coreml_logits, dtype=np.float32).reshape(-1, 1)
+    _install_row_predict(
+        monkeypatch,
+        "logits",
+        {_row_key(rows[index]): outputs[index] for index in range(len(_LOGIT_ALL_PAIRS))},
+    )
+    _install_compute_plan(monkeypatch, _build_fake_plan(ne_count=99, cpu_count=1))
+    return selfcheck.run_selfcheck(context), context, frozen
+
+
+def test_the_logit_tolerance_is_the_one_the_selfcheck_declares() -> None:
+    """The two spaces are measured against two thresholds, not one shared number."""
+    assert selfcheck.SANITY_LOGIT_TOLERANCE == 0.3
+    assert selfcheck.SANITY_LOGIT_TOLERANCE != selfcheck.SANITY_SIGMOID_TOLERANCE
+
+
+def test_run_selfcheck_accepts_a_logit_space_variant_within_the_tolerance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A raw difference inside the logit tolerance must pass."""
+    report, _, _ = _run_logit_reranker(monkeypatch, tmp_path, [6.0, -6.0], [6.2, -6.1])
+    sanity = report["sanity"]
+
+    assert report["status"] == selfcheck.STATUS_PASSED
+    assert sanity["passed"] is True
+    assert sanity["score_space"] == base.SCORE_SPACE_LOGIT
+    assert sanity["score_tolerance"] == selfcheck.SANITY_LOGIT_TOLERANCE
+    assert sanity["score_max_abs_diff"] == pytest.approx(0.2, abs=1e-5)
+    json.dumps(report)
+
+
+def test_run_selfcheck_fails_a_logit_space_variant_beyond_the_tolerance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A raw difference past the logit tolerance must fail, ordering notwithstanding."""
+    report, _, _ = _run_logit_reranker(monkeypatch, tmp_path, [6.0, -6.0], [6.5, -6.0])
+    sanity = report["sanity"]
+
+    assert report["status"] == selfcheck.STATUS_FAILED
+    assert sanity["passed"] is False
+    assert sanity["ordering_ok_coreml"] is True
+    assert sanity["score_max_abs_diff"] == pytest.approx(0.5, abs=1e-5)
+
+
+def test_a_logit_space_variant_is_not_measured_after_the_sigmoid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Far out on the sigmoid's flat tail, a large logit error all but disappears.
+
+    The compiled model is a full logit away from the baseline, which the
+    probability tolerance would wave through because both values sit at
+    the very top of the sigmoid. The logit space is what still sees it.
+    """
+    report, _, _ = _run_logit_reranker(monkeypatch, tmp_path, [12.0, -6.0], [13.0, -6.0])
+    sanity = report["sanity"]
+
+    assert float(
+        np.abs(runtime.sigmoid(np.array([12.0])) - runtime.sigmoid(np.array([13.0])))[0]
+    ) < (selfcheck.SANITY_SIGMOID_TOLERANCE)
+    assert sanity["passed"] is False
+    assert sanity["score_max_abs_diff"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_a_logit_space_report_carries_only_the_generic_score_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sigmoid keys would describe a comparison that was never made."""
+    report, _, _ = _run_logit_reranker(monkeypatch, tmp_path, [6.0, -6.0], [6.0, -6.0])
+    sanity = report["sanity"]
+
+    for key in ("score_space", "score_abs_diff", "score_max_abs_diff", "score_tolerance"):
+        assert key in sanity, key
+        assert key in sanity["sets"]["en"], key
+    for key in (
+        "coreml_scores",
+        "fp32_scores",
+        "sigmoid_abs_diff",
+        "sigmoid_max_abs_diff",
+        "sigmoid_tolerance",
+    ):
+        assert key not in sanity, key
+        assert key not in sanity["sets"]["en"], key
+    # The raw logits are recorded in both spaces: they are the measurement.
+    assert sanity["coreml_logits"] == [pytest.approx(6.0), pytest.approx(-6.0)]
+    assert sanity["fp32_logits"] == [pytest.approx(6.0), pytest.approx(-6.0)]
+
+
+def test_run_selfcheck_checks_the_ordering_in_the_logit_space_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sigmoid is monotonic, so the ordering expectation holds in either space."""
+    report, _, _ = _run_logit_reranker(monkeypatch, tmp_path, [-1.0, 1.0], [-1.0, 1.0])
+
+    assert report["sanity"]["ordering_checked"] is True
+    assert report["sanity"]["ordering_ok_coreml"] is False
+    assert report["sanity"]["ordering_ok_fp32"] is False
+    assert report["sanity"]["passed"] is False
+
+
+def test_a_probability_space_report_carries_both_the_generic_and_the_established_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The generic keys are an addition; nothing a reader relied on may disappear."""
+    report, _ = _run_two_set_reranker(
+        monkeypatch, tmp_path, [-2.0, 2.0, 2.0, -2.0], [-2.0, 2.0, 2.0, -2.0]
+    )
+    sanity = report["sanity"]
+
+    assert sanity["score_space"] == base.SCORE_SPACE_PROBABILITY
+    assert sanity["score_tolerance"] == selfcheck.SANITY_SIGMOID_TOLERANCE
+    assert sanity["score_abs_diff"] == sanity["sigmoid_abs_diff"]
+    assert sanity["score_max_abs_diff"] == sanity["sigmoid_max_abs_diff"]
+    for language, set_report in sanity["sets"].items():
+        assert set_report["score_space"] == base.SCORE_SPACE_PROBABILITY, language
+        assert set_report["score_abs_diff"] == set_report["sigmoid_abs_diff"], language
+
+
+# --- run_selfcheck: a reranker whose pairs are spelled out -----------------------
+
+
+def test_run_selfcheck_measures_a_templated_reranker_on_its_templated_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A model needing its pairs spelled out must be measured on those very rows.
+
+    The fake compiled model only answers for the templated rows, so a
+    self-check tokenizing the pairs any other way finds no output at all.
+    """
+    report, _, _ = _run_logit_reranker(
+        monkeypatch, tmp_path, [6.0, -6.0], [6.0, -6.0], pair_template=_LOGIT_TEMPLATE
+    )
+
+    assert report["status"] == selfcheck.STATUS_PASSED
+    assert report["sanity"]["passed"] is True
+
+
+def test_the_templated_rows_differ_from_the_plain_pair_encoding(tmp_path: Path) -> None:
+    """Guard for the test above: without the template the rows would be different ones."""
+    tokenizer_path = tmp_path / "tokenizer.json"
+    _build_toy_tokenizer(tokenizer_path)
+    frozen = runtime.load_frozen_tokenizer(tokenizer_path)
+    prepared = runtime.prepare_pair_template(frozen, _LOGIT_TEMPLATE)
+
+    plain = runtime.tokenize_pairs(frozen, _LOGIT_ALL_PAIRS, 64)
+    templated = runtime.tokenize_pairs(frozen, _LOGIT_ALL_PAIRS, 64, prepared)
+
+    assert not np.array_equal(plain["input_ids"], templated["input_ids"])
+
+
+def test_run_selfcheck_hands_the_template_to_the_batch_consistency_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The batch check must replicate the same row the accuracy check measured."""
+    seen: list[Any] = []
+
+    def _fake_consistency(
+        compiled: Any,
+        frozen_tokenizer: Any,
+        pair: tuple[str, str],
+        seq_len: int,
+        batch_size: int,
+        output_key: str,
+        template: Any = None,
+    ) -> dict[str, Any]:
+        seen.append(template)
+        return {"passed": True}
+
+    monkeypatch.setattr(selfcheck, "_check_batch_consistency_reranker", _fake_consistency)
+
+    _run_logit_reranker(
+        monkeypatch,
+        tmp_path,
+        [6.0, -6.0],
+        [6.0, -6.0],
+        batch_size=2,
+        pair_template=_LOGIT_TEMPLATE,
+    )
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], runtime.PreparedPairTemplate)
+    assert seen[0].body_format == _LOGIT_TEMPLATE.body_format
+
+
+def test_the_batch_consistency_check_replicates_the_templated_row(tmp_path: Path) -> None:
+    """Handed a template, the batch check must encode its pair through it."""
+    tokenizer_path = tmp_path / "tokenizer.json"
+    _build_toy_tokenizer(tokenizer_path)
+    frozen = runtime.load_frozen_tokenizer(tokenizer_path)
+    prepared = runtime.prepare_pair_template(frozen, _LOGIT_TEMPLATE)
+    seen: list[np.ndarray] = []
+
+    class _Recorder:
+        """Compiled-model stand-in recording the rows it is asked to predict."""
+
+        def predict(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+            seen.append(batch["input_ids"])
+            return {"logits": np.zeros((batch["input_ids"].shape[0], 1), dtype=np.float32)}
+
+    selfcheck._check_batch_consistency_reranker(
+        _Recorder(), frozen, ("q", "d"), 64, 2, "logits", template=prepared
+    )
+
+    expected = runtime.tokenize_pairs(frozen, [("q", "d")] * 2, 64, prepared)["input_ids"]
+    np.testing.assert_array_equal(seen[0], expected)
+
+
+def test_an_untemplated_reranker_is_still_measured_on_the_plain_pair_encoding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A backend declaring no template must keep encoding pairs exactly as before."""
+    report, _, _ = _run_logit_reranker(monkeypatch, tmp_path, [6.0, -6.0], [6.0, -6.0])
+
+    assert report["sanity"]["passed"] is True

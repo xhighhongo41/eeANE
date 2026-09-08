@@ -69,6 +69,15 @@ id = "cl-nagoya/ruri-v3-reranker-310m"
 # [[models]]
 # id = "BAAI/bge-m3"  # bin-only checkpoint: compile with `eeane compile BAAI/bge-m3 --allow-pickle`
 
+# Qwen3 (decoder-only). Some embedding models expect a query instruction
+# prefix; eeANE never adds one itself -- the client must prepend it (see
+# API in the README).
+# [[models]]
+# id = "Qwen/Qwen3-Embedding-0.6B"
+
+# [[models]]
+# id = "Qwen/Qwen3-Reranker-0.6B"  # generative reranker; scored the same as any other
+
 # The explicit form pins every field independently of the cache -- for
 # artifacts moved elsewhere, or to serve a hand-picked bucket set.
 # Requests are routed to the smallest bucket that fits; longer inputs

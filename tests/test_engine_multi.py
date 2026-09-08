@@ -19,6 +19,7 @@ from conftest import StubEngine
 from tokenizers import Tokenizer, models, pre_tokenizers
 
 from eeane import engine as engine_module
+from eeane import runtime
 from eeane.config import EeaneConfig, ModelEntry, ServerConfig
 from eeane.engine import CoreMLEngine, InferenceEngine
 
@@ -121,6 +122,7 @@ def _make_entry(
     *,
     buckets: Sequence[int] = (8, 16),
     embedding_dim: int | None = None,
+    pair_template: dict[str, str] | None = None,
     create: bool = True,
 ) -> ModelEntry:
     """Build a model entry and, by default, the files it points at.
@@ -132,6 +134,9 @@ def _make_entry(
         buckets: Sequence lengths to create artifacts for. They are kept
             small so a short text can exceed the largest one.
         embedding_dim: Embedding width stated by the entry, when known.
+        pair_template: How a reranker entry wants its pairs spelled out,
+            or ``None`` for one scored through the tokenizer's own pair
+            encoding.
         create: When ``False``, no file is written, so the engine's
             pre-flight check reports the entry as missing.
 
@@ -154,6 +159,8 @@ def _make_entry(
         "artifacts": artifacts,
         "embedding_dim": embedding_dim,
     }
+    if pair_template is not None:
+        fields["pair_template"] = pair_template
     return ModelEntry(**fields)
 
 
@@ -478,6 +485,101 @@ def test_rerank_with_no_documents_returns_an_empty_batch(
 
     assert batch.logits.shape == (0,)
     assert stub_loader.model_for(deployment[2], 8).seq_lens == []
+
+
+# --- pair templates ------------------------------------------------------
+
+
+# Template a reranker entry can be given: one token before the body, one
+# after it, and a body marking both texts. Every word is in the toy
+# vocabulary, so the resulting input can be counted token by token.
+_PAIR_TEMPLATE = {"prefix": "a", "body_format": "{query} b {document}", "suffix": "c"}
+
+
+def _templated_deployment(root: Path) -> list[ModelEntry]:
+    """Build an embedding model plus one templated and one plain reranker.
+
+    Args:
+        root: Directory holding one sub-directory per model.
+
+    Returns:
+        The three entries, in configuration order.
+    """
+    return [
+        _make_entry(root, "emb-a"),
+        _make_entry(root, "rr-t", kind="reranker", pair_template=_PAIR_TEMPLATE),
+        _make_entry(root, "rr-p", kind="reranker"),
+    ]
+
+
+def test_a_reranker_pair_template_is_prepared_at_load_time(
+    tmp_path: Path, stub_loader: StubLoader
+) -> None:
+    """The loaded model must carry the template with its fixed parts already encoded."""
+    engine = CoreMLEngine(_templated_deployment(tmp_path))
+
+    served = engine._models["rr-t"].served
+
+    assert served is not None
+    assert served.pair_template == runtime.PreparedPairTemplate(
+        body_format="{query} b {document}", prefix_ids=(1,), suffix_ids=(3,)
+    )
+
+
+def test_a_reranker_without_a_pair_template_carries_none(
+    tmp_path: Path, stub_loader: StubLoader
+) -> None:
+    """A reranker that declares no template must be loaded without one."""
+    engine = CoreMLEngine(_templated_deployment(tmp_path))
+
+    served = engine._models["rr-p"].served
+
+    assert served is not None
+    assert served.pair_template is None
+
+
+def test_a_templated_reranker_scores_the_templated_input(
+    tmp_path: Path, stub_loader: StubLoader
+) -> None:
+    """The pair fed to the model must be the template's, not the tokenizer's pair encoding."""
+    engine = CoreMLEngine(_templated_deployment(tmp_path))
+
+    batch = engine.rerank("a", ["c"], "rr-t")
+
+    # "a" + "a b c" + "c": five tokens, where the bare pair would be two.
+    assert batch.orig_tokens == [5]
+    assert batch.used_tokens == [5]
+    assert batch.logits.tolist() == [5.0]
+    assert batch.truncated_indices == []
+
+
+def test_an_untemplated_reranker_keeps_the_bare_pair_encoding(
+    tmp_path: Path, stub_loader: StubLoader
+) -> None:
+    """A reranker without a template must go on being scored exactly as before."""
+    engine = CoreMLEngine(_templated_deployment(tmp_path))
+
+    batch = engine.rerank("a", ["c"], "rr-p")
+
+    assert batch.orig_tokens == [2]
+    assert batch.used_tokens == [2]
+    assert batch.logits.tolist() == [2.0]
+
+
+def test_a_templated_pair_too_long_for_any_bucket_fills_the_largest_one(
+    tmp_path: Path, stub_loader: StubLoader
+) -> None:
+    """An over-long pair must be routed as too long and fill the bucket to the last position."""
+    engine = CoreMLEngine(_templated_deployment(tmp_path))
+    document = " ".join(["c"] * 20)
+
+    batch = engine.rerank("a", [document], "rr-t")
+
+    # 1 prefix + 22 body + 1 suffix, none of which fits the largest
+    # bucket (16), which the truncated input then fills completely.
+    assert batch.orig_tokens == [24]
+    assert batch.used_tokens == [16]
+    assert batch.truncated_indices == [0]
 
 
 # --- empty-request width -------------------------------------------------

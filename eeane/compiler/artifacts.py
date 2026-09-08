@@ -23,10 +23,13 @@ from eeane.compiler import sources
 
 # Schema versions of the JSON files written next to the artifacts. Bumped
 # whenever a consumer (the cache auto-resolution in eeane.config) would
-# need to tell old and new layouts apart. model_info.json is at 2 since it
-# now also records embedding_dim, recommended_buckets and calibration.
+# need to tell old and new layouts apart. model_info.json is at 3 since it
+# can now also record how a reranker wants a (query, document) pair
+# spelled out, which a reader that does not know about it would serve
+# without -- asking the model a different question than it was compiled
+# for.
 METADATA_FORMAT_VERSION = 1
-MODEL_INFO_FORMAT_VERSION = 2
+MODEL_INFO_FORMAT_VERSION = 3
 
 # Default sequence-length buckets per model kind; they reproduce the
 # v0.4/v0.5 deployed configuration.

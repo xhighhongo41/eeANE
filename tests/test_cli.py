@@ -52,6 +52,37 @@ excluded_buckets = [1024]
 256 = "compiled/emb-only/s256.mlmodelc"
 """
 
+_RERANKER_TOML = """
+[[models]]
+id = "emb-only"
+kind = "embedding"
+tokenizer = "models/emb-only/tokenizer.json"
+
+[models.artifacts]
+256 = "compiled/emb-only/s256.mlmodelc"
+
+[[models]]
+id = "rr-templated"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+
+[models.artifacts]
+256 = "compiled/rr/s256.mlmodelc"
+
+[models.pair_template]
+prefix = "<start>"
+body_format = "{query} {document}"
+suffix = "<end>"
+
+[[models]]
+id = "rr-plain"
+kind = "reranker"
+tokenizer = "models/rr2/tokenizer.json"
+
+[models.artifacts]
+256 = "compiled/rr2/s256.mlmodelc"
+"""
+
 _GRACEFUL_SHUTDOWN_TOML = """
 [server]
 graceful_shutdown_timeout = 30
@@ -473,6 +504,35 @@ def test_check_config_omits_the_optional_details_when_unset(
     assert "cache_root:" not in captured.out
     assert "embedding_dim:" not in captured.out
     assert "excluded_buckets:" not in captured.out
+
+
+def test_check_config_reports_whether_a_reranker_has_a_pair_template(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Every reranker must be reported as having a pair template or not having one."""
+    config_path = _write(tmp_path / "eeane.toml", _RERANKER_TOML)
+
+    exit_code = cli.main(["check-config", "--config", str(config_path)])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "pair_template: yes" in captured.out
+    assert "pair_template: no" in captured.out
+    # The template's own text is a compile-time detail, not a report.
+    assert "<start>" not in captured.out
+
+
+def test_check_config_reports_no_pair_template_for_an_embedding_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """An embedding entry has no pair to shape, so the line must not appear for it."""
+    config_path = _write(tmp_path / "eeane.toml", _KEYLESS_TOML)
+
+    exit_code = cli.main(["check-config", "--config", str(config_path)])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "pair_template:" not in captured.out
 
 
 def test_check_config_without_explicit_path_uses_cwd_eeane_toml(

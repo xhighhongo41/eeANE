@@ -22,6 +22,7 @@ runtime module.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,14 @@ import numpy as np
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from eeane import runtime
+from eeane.runtime import PairTemplate
+
+# Markers a pair template's body format writes a request's own texts at.
+# Spelled out here rather than imported from the layers under test: this
+# module is the gate that proves the two sides agree, so it states the
+# convention itself instead of borrowing either side's copy of it.
+_QUERY_MARKER = "{query}"
+_DOCUMENT_MARKER = "{document}"
 
 
 class TokenizerFreezeError(RuntimeError):
@@ -119,6 +128,7 @@ def verify_frozen_tokenizer(
     texts: list[str],
     pairs: list[tuple[str, str]],
     buckets: list[int],
+    pair_template: PairTemplate | None = None,
 ) -> dict[str, Any]:
     """Check that a frozen tokenizer matches ``AutoTokenizer`` exactly.
 
@@ -129,6 +139,15 @@ def verify_frozen_tokenizer(
     ``tokenizer(..., padding="max_length", truncation=True,
     max_length=bucket, return_tensors="np")``. The unpadded/untruncated
     token counts (which drive bucket selection) are compared as well.
+
+    With a ``pair_template``, the pairs take the template path on both
+    sides instead: the frozen side through the server's own function, the
+    reference side through an encoding assembled here from
+    ``AutoTokenizer`` alone. That second assembly is written out in full
+    rather than delegated to the compile-side helper on purpose -- the
+    worth of this gate is that the budget arithmetic and the truncation
+    rule are written twice and then held against each other, which
+    sharing one implementation between the two sides would undo.
 
     Everything runs serially on purpose: fast tokenizers keep mutable
     Rust-side padding/truncation state.
@@ -142,15 +161,20 @@ def verify_frozen_tokenizer(
             embedding models.
         buckets: Sequence-length buckets to verify. Must be non-empty and
             strictly positive.
+        pair_template: Template the model wants its pairs spelled out
+            with, or ``None`` when its pairs go through the tokenizer's
+            own pair encoding.
 
     Returns:
         A report dict with ``passed=True``, the verified ``buckets``, the
-        number of ``texts``/``pairs`` compared and the number of
-        comparisons performed.
+        number of ``texts``/``pairs`` compared, the number of comparisons
+        performed, and how many tokens a template's fixed parts reserve
+        (``None`` when no template was given).
 
     Raises:
         ValueError: If ``buckets`` is empty or holds a non-positive
-            length.
+            length, or if a template's own tokens leave no room for the
+            pair inside one of the buckets.
         TokenizerFreezeError: If any comparison differs. The message names
             the bucket, the array, the sample index and the first
             differing positions.
@@ -163,6 +187,12 @@ def verify_frozen_tokenizer(
 
     frozen = runtime.load_frozen_tokenizer(frozen_path)
     reference = AutoTokenizer.from_pretrained(model_dir)
+    prepared = (
+        None if pair_template is None else runtime.prepare_pair_template(frozen, pair_template)
+    )
+    affixes: tuple[list[int], list[int]] = (
+        ([], []) if pair_template is None else _reference_affixes(reference, pair_template)
+    )
 
     mismatches: list[dict[str, Any]] = []
     comparisons = 0
@@ -177,8 +207,8 @@ def verify_frozen_tokenizer(
             comparisons += 2
         if pairs:
             mismatches += _compare_batch(
-                runtime.tokenize_pairs(frozen, pairs, bucket),
-                _reference_pairs(reference, pairs, bucket),
+                runtime.tokenize_pairs(frozen, pairs, bucket, prepared),
+                _reference_pair_batch(reference, pairs, bucket, pair_template, affixes),
                 bucket=bucket,
                 kind="pairs",
             )
@@ -192,8 +222,8 @@ def verify_frozen_tokenizer(
         kind="texts",
     )
     mismatches += _compare_counts(
-        [runtime.count_pair_tokens(frozen, query, document) for query, document in pairs],
-        _reference_pair_counts(reference, pairs),
+        [runtime.count_pair_tokens(frozen, query, document, prepared) for query, document in pairs],
+        _reference_pair_count_list(reference, pairs, pair_template, affixes),
         kind="pairs",
     )
     if texts:
@@ -209,6 +239,9 @@ def verify_frozen_tokenizer(
         "n_texts": len(texts),
         "n_pairs": len(pairs),
         "n_comparisons": comparisons,
+        "pair_template": None
+        if pair_template is None
+        else {"prefix_tokens": len(affixes[0]), "suffix_tokens": len(affixes[1])},
         "mismatches": mismatches,
     }
     if mismatches:
@@ -276,6 +309,184 @@ def _reference_pairs(
         "input_ids": encoded["input_ids"].astype(np.int32),
         "attention_mask": encoded["attention_mask"].astype(np.int32),
     }
+
+
+def _reference_pair_batch(
+    reference: PreTrainedTokenizerBase,
+    pairs: list[tuple[str, str]],
+    bucket: int,
+    template: PairTemplate | None,
+    affixes: tuple[Sequence[int], Sequence[int]],
+) -> dict[str, np.ndarray]:
+    """Build the baseline encoding of the pairs, templated or not.
+
+    Args:
+        reference: Tokenizer built by ``AutoTokenizer.from_pretrained``.
+        pairs: ``(query, document)`` inputs.
+        bucket: Fixed sequence length.
+        template: Template the pairs are laid out with, or ``None`` for
+            the tokenizer's own pair encoding.
+        affixes: The template's already-encoded fixed halves; ignored
+            without a template.
+
+    Returns:
+        Dict with int32 ``input_ids``/``attention_mask`` of shape
+        ``(len(pairs), bucket)``.
+    """
+    if template is None:
+        return _reference_pairs(reference, pairs, bucket)
+    return _reference_templated_pairs(reference, pairs, bucket, template, affixes)
+
+
+def _reference_pair_count_list(
+    reference: PreTrainedTokenizerBase,
+    pairs: list[tuple[str, str]],
+    template: PairTemplate | None,
+    affixes: tuple[Sequence[int], Sequence[int]],
+) -> list[int]:
+    """Count the tokens each pair needs, by the definition its model uses.
+
+    Args:
+        reference: Tokenizer built by ``AutoTokenizer.from_pretrained``.
+        pairs: ``(query, document)`` inputs.
+        template: Template the pairs are laid out with, or ``None`` for
+            the tokenizer's own pair encoding.
+        affixes: The template's already-encoded fixed halves; ignored
+            without a template.
+
+    Returns:
+        One untruncated count per input, in order.
+    """
+    if template is None:
+        return _reference_pair_counts(reference, pairs)
+    return _reference_templated_pair_counts(reference, pairs, template, affixes)
+
+
+def _reference_affixes(
+    reference: PreTrainedTokenizerBase, template: PairTemplate
+) -> tuple[list[int], list[int]]:
+    """Encode a template's two fixed halves with ``AutoTokenizer``.
+
+    Args:
+        reference: Tokenizer built by ``AutoTokenizer.from_pretrained``.
+        template: Template the pairs are laid out with.
+
+    Returns:
+        ``(prefix_ids, suffix_ids)``. Special tokens are off: both halves
+        already spell the model's control tokens out as text, so letting
+        the tokenizer add its own would encode a different prompt.
+    """
+    return (
+        list(reference.encode(template.prefix, add_special_tokens=False)),
+        list(reference.encode(template.suffix, add_special_tokens=False)),
+    )
+
+
+def _reference_body(template: PairTemplate, query: str, document: str) -> str:
+    """Write one pair into a template's body, as the baseline of the comparison.
+
+    Args:
+        template: Template being applied.
+        query: Query text.
+        document: Document text.
+
+    Returns:
+        The rendered body.
+    """
+    # One left-to-right pass, never ``str.format``: a text of its own
+    # carrying braces (or a marker) must be written in verbatim rather
+    # than reinterpreted or substituted into.
+    query_at = template.body_format.find(_QUERY_MARKER)
+    document_at = template.body_format.find(_DOCUMENT_MARKER)
+    if query_at <= document_at:
+        markers = ((_QUERY_MARKER, query), (_DOCUMENT_MARKER, document))
+    else:
+        markers = ((_DOCUMENT_MARKER, document), (_QUERY_MARKER, query))
+    head, _, rest = template.body_format.partition(markers[0][0])
+    middle, _, tail = rest.partition(markers[1][0])
+    return head + markers[0][1] + middle + markers[1][1] + tail
+
+
+def _reference_templated_pairs(
+    reference: PreTrainedTokenizerBase,
+    pairs: list[tuple[str, str]],
+    bucket: int,
+    template: PairTemplate,
+    affixes: tuple[Sequence[int], Sequence[int]],
+) -> dict[str, np.ndarray]:
+    """Assemble the templated encoding independently, as the comparison baseline.
+
+    Deliberately written out here rather than delegated: this is the
+    second, independent statement of the rule the frozen side is being
+    held to (keep both fixed halves whole, cut only the body, from its
+    right end, then pad on the right).
+
+    Args:
+        reference: Tokenizer built by ``AutoTokenizer.from_pretrained``.
+        pairs: ``(query, document)`` inputs.
+        bucket: Fixed sequence length.
+        template: Template the pairs are laid out with.
+        affixes: The template's already-encoded fixed halves.
+
+    Returns:
+        Dict with int32 ``input_ids``/``attention_mask`` of shape
+        ``(len(pairs), bucket)``.
+
+    Raises:
+        ValueError: If the template leaves no room for the pair's text, or
+            if the tokenizer defines no pad token.
+    """
+    prefix_ids, suffix_ids = affixes
+    budget = bucket - len(prefix_ids) - len(suffix_ids)
+    if budget < 1:
+        raise ValueError(
+            f"the pair template needs {len(prefix_ids)} prefix and {len(suffix_ids)} suffix "
+            f"tokens, which leaves no room for the pair inside bucket {bucket}"
+        )
+    pad_id = reference.pad_token_id
+    if pad_id is None:
+        raise ValueError(
+            f"the tokenizer of the verified model defines no pad token, so a {bucket}-token "
+            "row cannot be filled"
+        )
+    input_ids = np.full((len(pairs), bucket), int(pad_id), dtype=np.int32)
+    attention_mask = np.zeros((len(pairs), bucket), dtype=np.int32)
+    for row, (query, document) in enumerate(pairs):
+        body = _reference_body(template, query, document)
+        body_ids = list(reference.encode(body, add_special_tokens=False))[:budget]
+        ids = [*prefix_ids, *body_ids, *suffix_ids]
+        input_ids[row, : len(ids)] = ids
+        attention_mask[row, : len(ids)] = 1
+    return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def _reference_templated_pair_counts(
+    reference: PreTrainedTokenizerBase,
+    pairs: list[tuple[str, str]],
+    template: PairTemplate,
+    affixes: tuple[Sequence[int], Sequence[int]],
+) -> list[int]:
+    """Count the tokens a templated pair needs, untruncated (baseline).
+
+    Args:
+        reference: Tokenizer built by ``AutoTokenizer.from_pretrained``.
+        pairs: ``(query, document)`` inputs.
+        template: Template the pairs are laid out with.
+        affixes: The template's already-encoded fixed halves.
+
+    Returns:
+        One count per input, in order: the whole templated input, which is
+        what a bucket is selected from.
+    """
+    prefix_ids, suffix_ids = affixes
+    fixed = len(prefix_ids) + len(suffix_ids)
+    return [
+        fixed
+        + len(
+            reference.encode(_reference_body(template, query, document), add_special_tokens=False)
+        )
+        for query, document in pairs
+    ]
 
 
 def _reference_text_counts(reference: PreTrainedTokenizerBase, texts: list[str]) -> list[int]:

@@ -39,6 +39,7 @@ def _write_cached_model(
     buckets: Sequence[int] = (128, 512),
     recommended_buckets: Sequence[int] | None = None,
     embedding_dim: int | None = 768,
+    pair_template: Any = None,
     overrides: dict[str, Any] | None = None,
 ) -> Path:
     """Create a compiled-model cache entry the way ``eeane compile`` does.
@@ -54,6 +55,9 @@ def _write_cached_model(
         recommended_buckets: ``recommended_buckets`` value (v2+); defaults
             to every compiled bucket.
         embedding_dim: ``embedding_dim`` value (v2+, embeddings only).
+        pair_template: ``pair_template`` value (v3+, rerankers only), or
+            ``None`` to leave the key out of the record entirely, as
+            every release before it did.
         overrides: Keys merged into the record last, to inject malformed
             or unknown values.
 
@@ -82,6 +86,8 @@ def _write_cached_model(
         # Recorded by the compiler for provenance; the config layer must
         # ignore its contents entirely.
         info["calibration"] = {"measured_at": "2026-01-01T00:00:00Z", "samples": 32}
+    if pair_template is not None:
+        info["pair_template"] = pair_template
     if overrides:
         info.update(overrides)
 
@@ -617,6 +623,259 @@ normalize = true
     config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
 
     with pytest.raises(ConfigError, match="normalize"):
+        load_config(explicit_path=config_path, env={})
+
+
+# --- pair templates ------------------------------------------------------
+
+
+# A reranker's pair template, as a config file states it and as a cache
+# record carries it. The wrapper's wording is arbitrary here: the config
+# layer only ever moves the three strings around.
+_PAIR_TEMPLATE = {
+    "prefix": "<start>",
+    "body_format": "query: {query}\ndocument: {document}",
+    "suffix": "<end>",
+}
+
+_PAIR_TEMPLATE_TOML = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[[models]]
+id = "rr"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+
+[models.artifacts]
+512 = "compiled/rr/s512.mlmodelc"
+
+[models.pair_template]
+prefix = "<start>"
+body_format = "query: {query}\\ndocument: {document}"
+suffix = "<end>"
+"""
+
+
+def test_reranker_pair_template_is_read_from_the_config_file(tmp_path: Path) -> None:
+    """A [models.pair_template] table must reach the entry as its three strings."""
+    config_path = _write_toml(tmp_path / "eeane.toml", _PAIR_TEMPLATE_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    template = loaded.config.models[1].pair_template
+    assert template is not None
+    assert template.prefix == "<start>"
+    assert template.body_format == "query: {query}\ndocument: {document}"
+    assert template.suffix == "<end>"
+
+
+def test_an_entry_without_a_pair_template_has_none(tmp_path: Path) -> None:
+    """A reranker scored through the tokenizer's own pair encoding must state nothing."""
+    config_path = _write_toml(tmp_path / "eeane.toml", _FULL_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.reranker_model is not None
+    assert loaded.config.reranker_model.pair_template is None
+
+
+@pytest.mark.parametrize(
+    "body_format",
+    ["query: {query}", "document: {document}", "{query} {query} {document}", "neither marker"],
+)
+def test_a_body_format_that_marks_the_texts_wrong_is_rejected_up_front(
+    tmp_path: Path, body_format: str
+) -> None:
+    """A template the runtime could not apply must fail the config check, not a request.
+
+    Every other configuration mistake is reported before the server
+    serves anything, and a body format that drops or repeats one of the
+    two texts is no different: caught here it names the file, caught at
+    load time it would surface on whichever request first touched the
+    model.
+    """
+    toml_content = f"""
+[[models]]
+id = "rr"
+kind = "reranker"
+tokenizer = "models/rr/tokenizer.json"
+
+[models.artifacts]
+512 = "compiled/rr/s512.mlmodelc"
+
+[models.pair_template]
+prefix = ""
+body_format = "{body_format}"
+suffix = ""
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="body format"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_embedding_with_a_pair_template_raises_config_error(tmp_path: Path) -> None:
+    """An embedding request carries no pair, so the entry must not shape one."""
+    toml_content = """
+[[models]]
+id = "emb"
+kind = "embedding"
+tokenizer = "models/emb/tokenizer.json"
+
+[models.artifacts]
+128 = "compiled/emb/s128.mlmodelc"
+
+[models.pair_template]
+prefix = ""
+body_format = "{query} {document}"
+suffix = ""
+"""
+    config_path = _write_toml(tmp_path / "eeane.toml", toml_content)
+
+    with pytest.raises(ConfigError, match="pair_template"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_pair_template_is_filled_in_from_the_cache_record(tmp_path: Path) -> None:
+    """An id-only reranker must gain the template its compiled model was recorded with."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    _write_cached_model(
+        tmp_path / "cache",
+        "rr",
+        format_version=3,
+        kind="reranker",
+        buckets=(512,),
+        pair_template=_PAIR_TEMPLATE,
+    )
+    config_path = _write_toml(
+        tmp_path / "eeane.toml", _CACHE_ROOT_TOML + '\n[[models]]\nid = "rr"\n'
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    template = loaded.config.reranker_model.pair_template
+    assert template is not None
+    assert template.prefix == "<start>"
+    assert template.body_format == "query: {query}\ndocument: {document}"
+    assert template.suffix == "<end>"
+
+
+def test_a_record_without_a_pair_template_leaves_the_entry_without_one(tmp_path: Path) -> None:
+    """A record written before pair templates existed must go on resolving unchanged."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    _write_cached_model(tmp_path / "cache", "rr", kind="reranker", buckets=(512,))
+    config_path = _write_toml(
+        tmp_path / "eeane.toml", _CACHE_ROOT_TOML + '\n[[models]]\nid = "rr"\n'
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    entry = loaded.config.reranker_model
+    assert entry.pair_template is None
+    assert entry.buckets == (512,)
+
+
+def test_a_configured_pair_template_wins_over_the_recorded_one(tmp_path: Path) -> None:
+    """What the config file states must survive resolution, like every other field."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    _write_cached_model(
+        tmp_path / "cache",
+        "rr",
+        format_version=3,
+        kind="reranker",
+        buckets=(512,),
+        pair_template=_PAIR_TEMPLATE,
+    )
+    config_path = _write_toml(
+        tmp_path / "eeane.toml",
+        _CACHE_ROOT_TOML
+        + '\n[[models]]\nid = "rr"\n\n[models.pair_template]\n'
+        + 'prefix = "own"\nbody_format = "{query}/{document}"\nsuffix = "end"\n',
+    )
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    template = loaded.config.reranker_model.pair_template
+    assert template is not None
+    assert template.prefix == "own"
+    assert template.body_format == "{query}/{document}"
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        {"prefix": "<start>", "suffix": "<end>"},
+        {"prefix": "<start>", "body_format": "{query} {document}"},
+        {"body_format": "{query} {document}", "suffix": "<end>"},
+        {"prefix": 1, "body_format": "{query} {document}", "suffix": "<end>"},
+        {"prefix": "<start>", "body_format": None, "suffix": "<end>"},
+        "not a table",
+        [],
+    ],
+)
+def test_a_record_with_an_unusable_pair_template_is_rejected(
+    tmp_path: Path, recorded: object
+) -> None:
+    """A record missing one of the three strings is corrupt, not a template to guess at."""
+    _write_cached_model(tmp_path / "cache", "org/emb")
+    _write_cached_model(
+        tmp_path / "cache",
+        "rr",
+        format_version=3,
+        kind="reranker",
+        buckets=(512,),
+        pair_template=recorded,
+    )
+    config_path = _write_toml(
+        tmp_path / "eeane.toml", _CACHE_ROOT_TOML + '\n[[models]]\nid = "rr"\n'
+    )
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(explicit_path=config_path, env={})
+
+    # Reported against the record, which is what has to be regenerated,
+    # rather than as a schema error about the config file.
+    message = str(excinfo.value)
+    assert "pair_template" in message
+    assert "model_info.json" in message
+
+
+def test_a_record_with_a_pair_template_for_an_embedding_model_is_rejected(tmp_path: Path) -> None:
+    """An embedding record naming a pair template contradicts what a pair template is for."""
+    _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        format_version=3,
+        pair_template=_PAIR_TEMPLATE,
+    )
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="pair_template"):
+        load_config(explicit_path=config_path, env={})
+
+
+def test_format_version_3_record_is_read(tmp_path: Path) -> None:
+    """The release must accept the record version that carries pair templates."""
+    _write_cached_model(tmp_path / "cache", "org/emb", format_version=3)
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.embedding_model.buckets == (128, 512)
+
+
+def test_format_version_4_record_is_rejected(tmp_path: Path) -> None:
+    """The next record version may mean other things by these keys, so it must be refused."""
+    _write_cached_model(tmp_path / "cache", "org/emb", overrides={"format_version": 4})
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    with pytest.raises(ConfigError, match="format_version"):
         load_config(explicit_path=config_path, env={})
 
 

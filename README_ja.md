@@ -32,10 +32,12 @@ GPUとユニファイドメモリの大部分を他の作業のために空け�
 - **マルチモデルサービング**: リクエスト単位のルーティング、受付
   制御(429/503 + `Retry-After`)、同一リクエストの併合、グレース
   フルシャットダウンに対応。
-- **現時点で対応するアーキテクチャ系統は3つ**: ModernBERTと
+- **現時点で対応するアーキテクチャ系統は4つ**: ModernBERTと
   XLM-RoBERTa(いずれもembeddingモデルとクロスエンコーダ型reranker
-  モデルの両方に対応)、そしてBERT(embeddingモデルのみに対応)。
-  さらなる系統の追加を計画中です。
+  モデルの両方に対応)、BERT(embeddingモデルのみに対応)、そして
+  Qwen3(デコーダ型: 系列の最終トークンをプーリングするembedding
+  モデルと、分類ヘッドの代わりにyes/noのロジット対からスコアを出す
+  生成型reranker)。さらなる系統の追加を計画中です。
 
 ## 動作要件
 
@@ -153,26 +155,33 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 ### `eeane compile`について
 
 `eeane compile`はモデルの`config.json`からバックエンドを自動選択
-します。対応するアーキテクチャ系統は3つです: **ModernBERT**と
+します。対応するアーキテクチャ系統は4つです: **ModernBERT**と
 **XLM-RoBERTa**(embeddingとクロスエンコーダrerankerの両方に対応)、
-そして**BERT**(embeddingモデルのみに対応 — BERT系クロスエンコーダ
+**BERT**(embeddingモデルのみに対応 — BERT系クロスエンコーダ
 rerankerは代わりに明確なエラーで拒否されます。理由は、コンパイル
 済みグラフではsegment idをゼロに固定せざるを得ず、それがこの
 アーキテクチャにおけるquery/documentペアの意味を変えてしまうため
-です)。`RobertaModel`アーキテクチャのモデルもXLM-RoBERTaバックエン
+です)、そして**Qwen3**(デコーダ型: 系列の最終トークンをプーリング
+するembeddingモデルと、分類ヘッドの代わりに2つの語彙ロジットから
+query/documentペアのスコアを出す生成型reranker — 詳細は後述)です。
+`RobertaModel`アーキテクチャのモデルもXLM-RoBERTaバックエン
 ドで扱われます — transformers上ではRoBERTaとXLM-RoBERTaは語彙のみ
 が異なる同一のエンコーダ実装だからです。さらなる系統の追加を計画中
-です。embeddingモデルでは、3つの
-バックエンドすべてが、モデルディレクトリのsentence-transformers宣
-言(`1_Pooling/config.json`)からmean/CLSプーリングを検出し、対応す
-るグラフをコンパイルします。対応するプーリングモードを宣言していな
-いembeddingモデルは、推測でコンパイルするのではなくエラーで拒否さ
-れます — 誤ったプーリングでコンパイルされた成果物は、一見もっとも
-らしいのに意味の違うベクトルを返してしまうためです。rerankerはこの
-宣言と無関係です — プーリングはモデル自身の分類ヘッドの一部であり、
-独立したsentence-transformersモジュールではありません。コンパイル
-ログには、embeddingモデルごとに検出されたプーリングが表示されます。
-実際に一通り動作を検証したモデルは
+です。embeddingモデルでは、いずれの
+バックエンドも、モデルディレクトリのsentence-transformers宣
+言(`1_Pooling/config.json`)からプーリング方式を検出し、対応す
+るグラフをコンパイルします — 3つのエンコーダ系バックエンドはmean/
+CLSプーリング、Qwen3のみlast-tokenプーリングです。last-tokenプーリ
+ングは因果(左から右への)アーキテクチャを前提とするため、エンコー
+ダ系バックエンドはこれを受け付けません。対応するプーリングモードを
+宣言していないembeddingモデルは、推測でコンパイルするのではなく
+エラーで拒否されます — 誤ったプーリングでコンパイルされた成果物は、
+一見もっともらしいのに意味の違うベクトルを返してしまうためです。
+rerankerはこの宣言と無関係です — スコアリングはモデル自身の分類
+ヘッド(Qwen3の生成型rerankerの場合は自身の指示文テンプレート —
+詳細は後述)の一部であり、独立したsentence-transformersモジュール
+ではありません。コンパイルログには、embeddingモデルごとに検出された
+プーリングが表示されます。実際に一通り動作を検証したモデルは
 [検証済みモデル](#検証済みモデル)を参照してください。
 
 sentence-transformers形式のモデルディレクトリは、`modules.json`で
@@ -190,8 +199,19 @@ Normalize(任意・末尾)`という構成に対応しており、宣言され�
 に従います(`.bin`のみのDenseチェックポイントには`--allow-pickle`
 が必要。[チェックポイント形式](#チェックポイント形式)を参照)。
 
-コンパイラは
-モデルがembeddingモデルかrerankerかを自動判別し、既定のバケツは
+コンパイラは、ModernBERT・XLM-RoBERTa・BERTの3つのエンコーダ系
+バックエンドについては、`config.json`のアーキテクチャ名の末尾から
+モデルがembeddingモデルかrerankerかを判別します(`ForSequence
+Classification`で終わればreranker、`...Model`で終わればembedding)。
+Qwen3のembeddingと生成型rerankerのチェックポイントは、どちらも
+同じアーキテクチャ名`Qwen3ForCausalLM`で配布されるため、`ForCausal
+LM`で終わるアーキテクチャ名は別の方法で解決します: `eeane compile`
+はモデルディレクトリのsentence-transformersモジュール宣言
+(`modules.json`)を読み、プーリングモジュールがあればembedding、
+スコアリングモジュールがあればrerankerと判断します。どちらも宣言
+していないディレクトリは、`--kind`の明示を案内するエラーで拒否
+されます。他のアーキテクチャの判別方法は変わりません。いずれの
+場合も、既定のバケツは
 embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 にクリップされます — 最大512トークンのモデルはembeddingなら
 128/512、rerankerなら512のみとしてコンパイルされ、外したバケツは
@@ -219,6 +239,24 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 必要としません([docs/dependency-policy.md](docs/dependency-policy.md)
 を参照)。
 
+Qwen3の生成型reranker系統は分類ヘッドを持ちません: `eeane compile`
+はクエリと文書を固定のチャット形式の指示文テンプレートに埋め込み、
+コンパイル済みグラフは分類スコアの代わりに1つの値 — 系列の最終
+位置における語彙"yes"のロジットから"no"のロジットを引いた値 — を
+出力します。このテンプレートの組み立て方(前置き・ペアごとの本文・
+末尾の後置き)は、コンパイル時にモデル自身の宣言から一度だけ解決
+され、コンパイル済み成果物に記録されます。サーバーはそれを読み
+戻し、リクエストごとに適用します。クエリ/文書のペアがコンパイル済み
+バケツに対して長すぎる場合、切り詰められるのは本文だけです —
+前置きと後置きは常にそのまま残ります。後置きにはテンプレートが
+モデルへ回答を書かせる位置が含まれるためです。この単一の出力値は、
+2択の恒等式`softmax([no, yes])[yes] = sigmoid(yes − no)`の引数その
+ものであるため、意味を変えることなく`/rerank`の既存のsigmoidスコア
+リングにそのまま組み込めます。`raw_scores=true`は、他のreranker
+アーキテクチャで生のロジットを返すのと同じように、この生のロジット
+差を返します。APIそのものは一切変わりません — 呼び出し側は、サービ
+ング中のrerankerが生成型かどうかを意識する必要がありません。
+
 ### 検証済みモデル
 
 以下のモデルはいずれも、Hugging Faceの配布形式そのままからコンパイル
@@ -230,7 +268,7 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 ください(`paraphrase-multilingual-mpnet-base-v2`はXLM-RoBERTa系、
 `multilingual-e5-small`はBERT系です)。
 
-これら3系統のアーキテクチャに基づく他のモデルも動作する可能性が高く、
+これら4系統のアーキテクチャに基づく他のモデルも動作する可能性が高く、
 以下は実際に一通り動作を確認したものの一覧にすぎません。
 
 **ModernBERT**
@@ -317,6 +355,17 @@ embeddingが128/512/1024、rerankerが512/1024で、モデルの最大系列長
 <sup>1</sup> `pytorch_model.bin`のみを配布しているため、コンパイルには
 `--allow-pickle`が必要です([チェックポイント形式](#チェックポイント形式)
 を参照)。
+
+**Qwen3(デコーダ型)**
+
+生成型rerankerのスコアは、他のrerankerと同じ意味を持ちます(上記の
+「`eeane compile`について」を参照) — コンパイル後は`/rerank`から
+区別なく扱われます。
+
+| モデル | 種別 | バケツ |
+|---|---|---|
+| Qwen/Qwen3-Embedding-0.6B | embedding | 128/512/1024 |
+| Qwen/Qwen3-Reranker-0.6B | reranker | 512/1024 |
 
 ### チェックポイント形式
 
@@ -514,6 +563,25 @@ embeddingsリクエストの`dimensions`フィールド(省略可能、OpenAI互
 モデルで有効です。モデルの埋め込み次元を超える値を指定すると400が
 返ります。
 
+eeANEはリクエストのテキストを一切加工しません — `input`と`query`は
+そのままトークナイザに渡ります。一部のembeddingモデルは、検索クエリ
+だけに(文書には付けない)指示文を前置して使うことを前提に学習されて
+います。サービング対象のモデルがそのように学習されている場合、その
+文字列を付けるのは呼び出し側の責任です。たとえばQwen3-Embedding-0.6B
+は次の書式を公開しています:
+
+```
+Instruct: Given a web search query, retrieve relevant passages that answer the query
+Query:{検索クエリ本文}
+```
+
+[Open WebUI](https://github.com/open-webui/open-webui)(v0.6.0以降)
+からは、環境変数`RAG_EMBEDDING_QUERY_PREFIX`にこの指示文を設定すれば
+クエリ側にだけ付与され、`RAG_EMBEDDING_CONTENT_PREFIX`(文書側)は
+空のままにしておけます。この方式は、`sentence-transformers`が同じ
+モデルのプロンプト機能を使って同じ埋め込みを作る場合と比較検証済み
+です: 両者はコサイン0.9999で一致します。
+
 [Open WebUI](https://github.com/open-webui/open-webui)からeeANEを
 使うには: 埋め込みエンジンをOpenAIに設定し、base URLを
 `http://127.0.0.1:7997/v1`にします。rerankingエンジンはExternalに
@@ -585,6 +653,14 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   推測でmeanプーリングを補う挙動には戻しません。誤ったプーリング
   でコンパイルされた成果物は、黙って意味の違うベクトルを返してし
   まうためです。
+- **`eeane compile`が`cannot tell whether ... is an embedding model or
+  a reranker ...`で失敗する**: これは`ForCausalLM`アーキテクチャの
+  モデルディレクトリ(例: Qwen3)が、sentence-transformersのプーリ
+  ングモジュールもスコアリングモジュールも`modules.json`に宣言して
+  いない場合にのみ発生します — このアーキテクチャでembeddingと生成
+  型rerankerのチェックポイントを見分けるために`eeane compile`が
+  頼れる唯一の手がかりだからです。`--kind embedding`または
+  `--kind reranker`を明示して指定すれば、そのままコンパイルできます。
 
 ## 既知の制限
 
@@ -629,6 +705,20 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   際には、同じ注意が依然として当てはまります。モデルが想定する言語
   の範囲内では一致度はずっと高くなります(上記一覧の全モデルで
   コサイン0.9999以上)。
+- **メモリはロードしたバケツの数に応じて増えるが、バケツごとに
+  複製はされない**: コンパイル済みの重みはメモリマップされるため、
+  同じモデルの複数バケツをサービングしても、常駐メモリがバケツ数
+  倍に増えることはありません。0.6Bクラスのembeddingモデルで実測
+  したところ、3バケツすべてをロードしてもサーバープロセスの物理
+  フットプリントの増分は約150MBでした(未ロード時313MB →
+  128/512/1024すべてロード後456MB)。8モデルを並べた構成でも
+  ワーカーは592MB(ピーク730MB)に収まりました。
+- **Neural Engineが受け付けるモデルサイズの上限**: Qwen3系統の4B・
+  8Bモデルは対応していません。コンパイル済みモデルのサイズが約
+  2 GiBを超えると、Neural Engineは全演算をCPUへ落としてしまいます
+  — 変換・ロード・推論自体は成功するため、見た目の症状は推論が
+  遅くなるだけです。パラメータ数ではこの上限は約1.07Bで、上記の
+  0.6Bモデルはこの範囲に十分収まります。
 
 ## 開発
 
@@ -695,13 +785,15 @@ uv run python poc/benchmark_mps.py --model embedding --chunk-tokens 512 --batch 
 
 ### デコーダ型モデルの調査を試す
 
-`eeane compile`が対応しているアーキテクチャはいずれもエンコーダ型
-です。`poc_qwen/`配下のスクリプトは別の問いを扱います。全トークンを
-平均するのではなく最終トークンを取り出すデコーダ型(causal language
-model)の埋め込みモデルも、変換してNeural Engineで動かせるのか?
-また、Neural Engineが受け付けなくなるのはどのくらいの大きさからか?
-これは調査であってサポートされた変換手段ではなく、`eeane compile`の
-挙動を変えるものは含まれていません:
+デコーダ型(causal language model)アーキテクチャは、現在では通常の
+`eeane compile`で扱えます — 上記の「`eeane compile`について」および
+「検証済みモデル」のQwen3の項を参照してください。`poc_qwen/`配下の
+スクリプトは、その対応の判断のもとになった研究記録としてリポジトリ
+に残してあり、引き続き実行できます。この記録のうち一部分だけは本体
+には対応物がありません: サイズを変えた合成モデル(大きなモデルの
+ダウンロードは発生しません)を使って、Neural Engineが受け付けなく
+なるのはどのくらいの大きさからかを探る部分です(その結果は上記の
+「既知の制限」を参照してください):
 
 ```sh
 # 変換(モデルは初回実行時にHubから取得されます)
@@ -747,6 +839,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 1.5.0 | Qwen3(デコーダ型)がeeANEの4つ目の対応アーキテクチャ系統になり、通常の`eeane compile`/`eeane serve`の流れでコンパイル・サービングできるように。embeddingモデルにlast-tokenプーリング、分類ヘッドの代わりにyes/noロジット対からスコアを出す生成型rerankerを追加。`ForCausalLM`アーキテクチャのモデル種別判定は、アーキテクチャ名だけでなくモデルのsentence-transformersモジュール宣言も読むように変更。検証済みモデルを2件追加(Qwen3-Embedding-0.6B、Qwen3-Reranker-0.6B) |
 | 1.4.5 | `poc_qwen/`を追加。デコーダ型(causal LM)の埋め込みモデルがNeural Engineで動作するか、また、どのくらいの大きさまで受け付けられるかを調べる調査用スクリプト群。エンジンの変更なし |
 | 1.4.0 | コンパイルのセルフチェックが、英語・日本語・中国語の3つの固定言語セットで評価し、いずれか1セットが閾値を満たせば合格とするようになった(モデルが実際に語彙を持つ言語で判定するため)。sentence-transformersのDenseモジュール(`Transformer → Pooling → Dense → Normalize`)に対応。`RobertaModel`アーキテクチャのモデルがXLM-RoBERTaバックエンドで動作するように。OpenAI互換の`dimensions`パラメータを`/v1/embeddings`に追加。検証済みモデルを9件追加(51→60) |
 | 1.3.0 | ModernBERTバックエンドが、meanのみのコンパイルから、モデルのsentence-transformers宣言に基づくmean/CLSプーリングの自動判別に対応し、CLSプーリングを宣言するModernBERT系embeddingモデル(granite-embedding-*-r2系など)も正しくコンパイルできるようになった。判別したプーリングはコンパイルログと成果物メタデータに記録される。検証済みモデルを5件追加(gte-modernbert-base、granite-embedding-*-r2系4件) |

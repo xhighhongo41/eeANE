@@ -401,7 +401,8 @@ def _print_effective_config(loaded: LoadedConfig) -> None:
     Values that are only meaningful when set (the cache root, an entry's
     embedding width and the buckets excluded on the cache's
     recommendation) are printed only then, so the common output stays
-    short.
+    short. A reranker's pair template is reported as a yes/no instead of
+    in full, since only its presence is a deployment decision.
 
     Also checks whether every configured artifact path exists; missing
     ones are marked ``[MISSING]`` inline and logged as one WARNING each
@@ -437,6 +438,11 @@ def _print_effective_config(loaded: LoadedConfig) -> None:
             print(f"    normalize: {entry.normalize}")
             if entry.embedding_dim is not None:
                 print(f"    embedding_dim: {entry.embedding_dim}")
+        if entry.kind == "reranker":
+            # Reported as a yes/no: the template's own text is a
+            # compile-time detail, and printing it would bury the rest of
+            # the report under it.
+            print(f"    pair_template: {'yes' if entry.pair_template is not None else 'no'}")
         print("    artifacts:")
         for bucket in entry.buckets:
             path = entry.artifacts[bucket]

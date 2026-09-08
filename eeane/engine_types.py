@@ -230,6 +230,11 @@ class _ServedModel:
             is what an entry without batched artifacts is served with.
             Inputs of one request that share such a bucket are predicted
             together instead of one at a time.
+        pair_template: How a rerank pair is spelled out for this model,
+            with the template's fixed parts already tokenized, or
+            ``None`` for a model scored through the tokenizer's own pair
+            encoding. Always ``None`` for an embedding model, which has
+            no pair to shape.
         output_name: Output tensor name requested at conversion time.
         normalize: The entry's ``normalize`` flag, recorded so callers can
             inspect the served model. The engine always returns raw
@@ -251,6 +256,7 @@ class _ServedModel:
     normalize: bool
     embedding_dim: int | None
     compiled_batch: dict[int, Any] = field(default_factory=dict)
+    pair_template: runtime.PreparedPairTemplate | None = None
 
 
 @dataclass

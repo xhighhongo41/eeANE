@@ -55,6 +55,11 @@ import numpy as np
 
 from eeane import runtime
 from eeane.compiler import conversion
+from eeane.compiler.backends.base import (
+    SCORE_SPACE_LOGIT,
+    SCORE_SPACE_PROBABILITY,
+    SCORE_SPACES,
+)
 
 if TYPE_CHECKING:
     from eeane.compiler.pipeline import SelfcheckContext
@@ -71,8 +76,29 @@ STATUS_FAILED = "failed"
 # Minimum cosine similarity against the PyTorch FP32 baseline (embedding).
 SANITY_COSINE_THRESHOLD = 0.99
 
-# Maximum tolerated |sigmoid(coreml) - sigmoid(fp32)| (reranker).
+# Maximum tolerated |sigmoid(coreml) - sigmoid(fp32)| for a reranker whose
+# backend declares the probability space: the head emits one calibrated
+# value per pair, and the probability its sigmoid produces is the number
+# the server hands out, so that is the number a conversion has to keep.
 SANITY_SIGMOID_TOLERANCE = 0.02
+
+# Maximum tolerated |coreml - fp32| for a reranker whose backend declares
+# the logit space.
+#
+# Such a score is a difference of two raw logits and is spread over a wide
+# range, which the sigmoid then squashes unevenly: its slope peaks at 0.25
+# in the middle and falls away to nothing at either end. Measured after
+# the sigmoid, the same conversion error would therefore count for a great
+# deal on a pair that happens to land near the middle and for almost
+# nothing on a pair at the edge -- so a variant would pass or fail on
+# where its fixtures happen to sit rather than on how faithfully it was
+# converted. Compared before the sigmoid, every pair is measured on one
+# and the same scale.
+#
+# 0.3 is the width of that scale: at the sigmoid's steepest point it is
+# worth about 0.075 in probability, and it never means less than that
+# anywhere else.
+SANITY_LOGIT_TOLERANCE = 0.3
 
 # Minimum cosine similarity between rows of a batch holding the same text
 # (embedding batch consistency check).
@@ -272,20 +298,38 @@ def _sanity_reranker(
     roles; when the spec declares no relevant/irrelevant pair, the
     ordering check is skipped and the report says so (``ordering_checked``)
     instead of silently passing an unperformed check.
+
+    What is compared, and against which tolerance, is decided by the space
+    the backend declares its scores are faithful in (see
+    :func:`_score_comparison`). The ordering is checked in either space:
+    the sigmoid is monotonic, so it ranks the pairs the same way the raw
+    logits do.
+
+    A backend that wants its pairs spelled out is measured on exactly the
+    rows a request would produce -- the template reaches every encoding
+    below, the batch check included -- since measuring anything else would
+    say nothing about the model that will be served.
     """
     spec = context.backend.sanity_spec(context.kind)
     raw_pairs: list[tuple[str, str]] = [(query, document) for query, document in spec.all_inputs]
-    tokens = runtime.tokenize_pairs(frozen_tokenizer, raw_pairs, context.seq_len)
+    declared = context.backend.pair_template(context.model_dir, context.kind)
+    template = (
+        None if declared is None else runtime.prepare_pair_template(frozen_tokenizer, declared)
+    )
+    tokens = runtime.tokenize_pairs(frozen_tokenizer, raw_pairs, context.seq_len, template)
     padding = runtime.tokenize_pairs(
-        frozen_tokenizer, [context.backend.padding_input(context.kind)], context.seq_len
+        frozen_tokenizer,
+        [context.backend.padding_input(context.kind)],
+        context.seq_len,
+        template,
     )
     output_key, coreml_out = _predict_rows(compiled, tokens, padding, context.batch_size, context)
     coreml_logits = coreml_out.reshape(-1)
     fp32_logits = context.backend.reference_outputs(
         context.model_dir, context.kind, raw_pairs, context.seq_len
     )
-    coreml_scores = runtime.sigmoid(coreml_logits)
-    fp32_scores = runtime.sigmoid(fp32_logits)
+    space = context.backend.reranker_score_space()
+    coreml_scores, fp32_scores, tolerance = _score_comparison(space, coreml_logits, fp32_logits)
     abs_diff = np.abs(coreml_scores - fp32_scores)
     ordering_checked = spec.relevant_index is not None and spec.irrelevant_index is not None
 
@@ -302,17 +346,16 @@ def _sanity_reranker(
         set_reports[language] = {
             "coreml_logits": [float(value) for value in coreml_logits[rows]],
             "fp32_logits": [float(value) for value in fp32_logits[rows]],
-            "coreml_scores": [float(value) for value in coreml_scores[rows]],
-            "fp32_scores": [float(value) for value in fp32_scores[rows]],
-            "sigmoid_abs_diff": [float(value) for value in abs_diff[rows]],
-            "sigmoid_max_abs_diff": max_abs_diff,
+            **_score_record(
+                space, tolerance, coreml_scores[rows], fp32_scores[rows], abs_diff[rows]
+            ),
             "ordering_checked": ordering_checked,
             "ordering_ok_coreml": ordering_coreml,
             "ordering_ok_fp32": ordering_fp32,
             "finite": finite,
             "passed": (
                 finite
-                and max_abs_diff <= SANITY_SIGMOID_TOLERANCE
+                and max_abs_diff <= tolerance
                 and (not ordering_checked or (bool(ordering_coreml) and bool(ordering_fp32)))
             ),
         }
@@ -332,6 +375,7 @@ def _sanity_reranker(
             context.seq_len,
             context.batch_size,
             output_key,
+            template=template,
         )
 
     best_report = set_reports[best]
@@ -342,15 +386,11 @@ def _sanity_reranker(
         # best set, the per-set table below describes all of them.
         "coreml_logits": best_report["coreml_logits"],
         "fp32_logits": best_report["fp32_logits"],
-        "coreml_scores": best_report["coreml_scores"],
-        "fp32_scores": best_report["fp32_scores"],
-        "sigmoid_abs_diff": best_report["sigmoid_abs_diff"],
-        "sigmoid_max_abs_diff": best_report["sigmoid_max_abs_diff"],
+        **{key: best_report[key] for key in _score_record_keys(space)},
         "ordering_checked": best_report["ordering_checked"],
         "ordering_ok_coreml": best_report["ordering_ok_coreml"],
         "ordering_ok_fp32": best_report["ordering_ok_fp32"],
         "finite": best_report["finite"],
-        "sigmoid_tolerance": SANITY_SIGMOID_TOLERANCE,
         "batch_consistency": consistency,
         "sets": set_reports,
         "best_set": best,
@@ -359,8 +399,105 @@ def _sanity_reranker(
             and (consistency is None or bool(consistency["passed"]))
         ),
     }
+    if space == SCORE_SPACE_PROBABILITY:
+        # Recorded where it always was, for readers (and recorded reports)
+        # that predate the per-space keys.
+        sanity["sigmoid_tolerance"] = SANITY_SIGMOID_TOLERANCE
     best_tokens = _slice_tokens(tokens, best_rows)
     return sanity, _first_predict_batch(best_tokens, padding, context.batch_size)
+
+
+def _score_comparison(
+    space: str, coreml_logits: np.ndarray, fp32_logits: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Turn both sides' raw graph outputs into the values to compare.
+
+    Args:
+        space: Space the backend declares its scores are faithful in.
+        coreml_logits: Raw outputs of the compiled model, one per pair.
+        fp32_logits: Raw outputs of the FP32 baseline, one per pair.
+
+    Returns:
+        The compiled scores, the baseline scores and the tolerance
+        between them, all in ``space``.
+
+    Raises:
+        ValueError: If ``space`` is not a space this check knows how to
+            measure in. Guessing would compare two things on a threshold
+            calibrated for neither.
+    """
+    if space == SCORE_SPACE_PROBABILITY:
+        return (
+            runtime.sigmoid(coreml_logits),
+            runtime.sigmoid(fp32_logits),
+            SANITY_SIGMOID_TOLERANCE,
+        )
+    if space == SCORE_SPACE_LOGIT:
+        return coreml_logits, fp32_logits, SANITY_LOGIT_TOLERANCE
+    raise ValueError(
+        f"the backend declares the reranker score space '{space}', which this self-check "
+        f"cannot measure in (known: {', '.join(SCORE_SPACES)})"
+    )
+
+
+# Keys describing the comparison itself, written into every set's report
+# and copied to the report's top level for the best set. The generic four
+# are always written, so a reader can tell what was compared without
+# knowing the backend; the four after them are the names every earlier
+# report used and are kept for the space they were introduced for.
+_GENERIC_SCORE_KEYS: tuple[str, ...] = (
+    "score_space",
+    "score_abs_diff",
+    "score_max_abs_diff",
+    "score_tolerance",
+)
+_SIGMOID_SCORE_KEYS: tuple[str, ...] = (
+    "coreml_scores",
+    "fp32_scores",
+    "sigmoid_abs_diff",
+    "sigmoid_max_abs_diff",
+)
+
+
+def _score_record_keys(space: str) -> tuple[str, ...]:
+    """Return the comparison keys a report records in ``space``."""
+    if space == SCORE_SPACE_PROBABILITY:
+        return _GENERIC_SCORE_KEYS + _SIGMOID_SCORE_KEYS
+    return _GENERIC_SCORE_KEYS
+
+
+def _score_record(
+    space: str,
+    tolerance: float,
+    coreml_scores: np.ndarray,
+    fp32_scores: np.ndarray,
+    abs_diff: np.ndarray,
+) -> dict[str, Any]:
+    """Describe one set's comparison, in the space it was made in.
+
+    Args:
+        space: Space the comparison was made in.
+        tolerance: Largest difference accepted in that space.
+        coreml_scores: Compiled model's scores of this set.
+        fp32_scores: Baseline's scores of this set.
+        abs_diff: Absolute difference between the two, per pair.
+
+    Returns:
+        The JSON-serializable entries to merge into the set's report, one
+        per key of :func:`_score_record_keys`.
+    """
+    record: dict[str, Any] = {
+        "score_space": space,
+        "score_abs_diff": [float(value) for value in abs_diff],
+        "score_max_abs_diff": float(abs_diff.max()),
+        "score_tolerance": tolerance,
+    }
+    if space == SCORE_SPACE_PROBABILITY:
+        record["coreml_scores"] = [float(value) for value in coreml_scores]
+        record["fp32_scores"] = [float(value) for value in fp32_scores]
+        record["sigmoid_abs_diff"] = record["score_abs_diff"]
+        record["sigmoid_max_abs_diff"] = record["score_max_abs_diff"]
+    return record
 
 
 def _set_row_slices(input_sets: Sequence[tuple[str, Sequence[Any]]]) -> dict[str, slice]:
@@ -602,6 +739,7 @@ def _check_batch_consistency_reranker(
     seq_len: int,
     batch_size: int,
     output_key: str,
+    template: Any = None,
 ) -> dict[str, Any]:
     """Verify that rows of one reranker batch do not influence each other.
 
@@ -614,12 +752,17 @@ def _check_batch_consistency_reranker(
         seq_len: Fixed sequence length S.
         batch_size: Fixed batch size B of the model (must be > 1).
         output_key: Output key resolved by :func:`_predict_rows`.
+        template: Prepared pair template the pair is spelled out with, or
+            ``None`` for a model whose pairs go through the tokenizer's own
+            pair encoding. It must be the one the accuracy check just used:
+            a batch built from different rows would test a different model
+            input.
 
     Returns:
         Dict with the per-row absolute logit differences against row 0,
         their min/max, the tolerance, and the pass/fail flag.
     """
-    tokens = runtime.tokenize_pairs(frozen_tokenizer, [pair] * batch_size, seq_len)
+    tokens = runtime.tokenize_pairs(frozen_tokenizer, [pair] * batch_size, seq_len, template)
     prediction = compiled.predict(
         {"input_ids": tokens["input_ids"], "attention_mask": tokens["attention_mask"]}
     )
@@ -866,11 +1009,14 @@ def _sanity_summary_metric(sanity: dict[str, Any]) -> str:
 
     Returns:
         ``"cosine_min=..."`` for an embedding sanity report,
-        ``"sigmoid_max_abs_diff=..."`` for a reranker one, or an empty
-        string if neither key is present.
+        ``"sigmoid_max_abs_diff=..."`` for a reranker measured in the
+        probability space, ``"score_max_abs_diff=..."`` for one measured
+        in another space, or an empty string if no key is present.
     """
     if "cosine_min" in sanity:
         return f"cosine_min={sanity['cosine_min']:.5f}"
     if "sigmoid_max_abs_diff" in sanity:
         return f"sigmoid_max_abs_diff={sanity['sigmoid_max_abs_diff']:.5f}"
+    if "score_max_abs_diff" in sanity:
+        return f"score_max_abs_diff={sanity['score_max_abs_diff']:.5f}"
     return ""

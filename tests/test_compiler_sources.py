@@ -307,6 +307,20 @@ def test_hf_allow_patterns_request_the_module_declaration_and_its_dense(
     )
 
 
+def test_hf_allow_patterns_request_the_generative_reranker_files(
+    download_calls: dict[str, Any],
+) -> None:
+    """The score declaration and a separate chat template must be fetched.
+
+    A generative reranker scores a pair from two vocabulary entries named
+    by its score declaration, and formats that pair with a chat template
+    that some models ship as a file of its own; neither can be recovered
+    from the weights.
+    """
+    assert "1_LogitScore/*.json" in sources.HF_ALLOW_PATTERNS
+    assert "*.jinja" in sources.HF_ALLOW_PATTERNS
+
+
 # --- repo id detection -------------------------------------------------------
 
 
