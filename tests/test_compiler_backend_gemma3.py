@@ -1,10 +1,14 @@
 """Tests for the Gemma 3 compile backend (bidirectional embedding models).
 
-Four layers:
+Five layers:
 
-* The two conversion patches, checked against the upstream implementations
-  they replace, and the in-graph attention masks, checked against
-  hand-written expectations and against the framework's own mask path.
+* The three conversion patches, checked against the upstream
+  implementations they replace, and the in-graph attention masks, checked
+  against hand-written expectations and against the framework's own mask
+  path.
+* The FP16 range conditioning: how its factors are derived from measured
+  activation ranges, and that a model whose weights were rescaled still
+  computes the same function.
 * The traceable wrapper: what it pools, what it projects, and what its
   traced graph must no longer contain.
 * Conformance to the backend interface declared in
@@ -19,10 +23,13 @@ initialised Gemma 3 text model built from an in-test configuration.
 
 from __future__ import annotations
 
+import copy
 import gc
 import inspect
 import json
+import math
 from collections.abc import Iterator
+from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +54,7 @@ from eeane.compiler.backends import gemma3 as g3
 # for the patch tests and the value the autouse fixture restores.
 _UPSTREAM_ROTATE_HALF = modeling_gemma3.rotate_half
 _UPSTREAM_REPEAT_KV = modeling_gemma3.repeat_kv
+_UPSTREAM_EAGER_ATTENTION = modeling_gemma3.eager_attention_forward
 
 # The same two symbols of another decoder family, which the patches of
 # this backend must leave alone.
@@ -114,22 +122,53 @@ _DYNAMIC_SIZE_NODE = "aten::Int"
 # compiler rejects a subgraph working on anything wider.
 _MAX_GRAPH_RANK = 4
 
+# Graph node of the attention softmax: one per layer when the query rows
+# are attended in one piece, one per layer and range when they are split.
+_SOFTMAX_NODE = "aten::softmax"
+
+# Minimum cosine between a model computed with split query rows, or with
+# rescaled weights, and the same model without: both are rewrites that
+# claim to leave the FP32 function unchanged.
+_EQUIVALENCE_COSINE_THRESHOLD = 0.999999
+
+# Largest absolute difference tolerated between hidden states computed
+# with and without split query rows; what is left is accumulation order.
+_SPLIT_HIDDEN_TOLERANCE = 1e-6
+
+# Largest absolute difference tolerated between the hidden states (which
+# are of order 1) of a model before and after its weights were rescaled.
+# Scaling by a power of two is exact; what is left comes from storing a
+# normalization gain ``g`` as the offset ``g / divisor - 1``, which keeps
+# it to within ``divisor * 2**-24`` of itself in float32.
+_CONDITIONED_HIDDEN_TOLERANCE = 1e-4
+
+# Factors applied by hand in the conditioning tests: a residual divisor of
+# the size a real model calls for, and one gain per layer of the tiny
+# model, above and below 1 and including "leave this layer alone".
+_TEST_DIVISOR = 128.0
+_TEST_GAINS = (8.0, 512.0, 0.5, 1.0)
+
+
+def _restore_upstream_symbols() -> None:
+    """Point every symbol the backend rebinds back at its upstream function."""
+    modeling_gemma3.rotate_half = _UPSTREAM_ROTATE_HALF
+    modeling_gemma3.repeat_kv = _UPSTREAM_REPEAT_KV
+    modeling_gemma3.eager_attention_forward = _UPSTREAM_EAGER_ATTENTION
+
 
 @pytest.fixture(autouse=True)
 def _restore_transformers_patches() -> Iterator[None]:
     """Undo the process-wide Gemma 3 monkeypatches after every test.
 
-    ``patch_rotate_half`` and ``patch_repeat_kv`` rebind names in the
-    transformers module, which affects every Gemma 3 model in the process,
-    so each test starts and ends on the upstream implementations.
+    The patch functions rebind names in the transformers module, which
+    affects every Gemma 3 model in the process, so each test starts and
+    ends on the upstream implementations.
     """
-    modeling_gemma3.rotate_half = _UPSTREAM_ROTATE_HALF
-    modeling_gemma3.repeat_kv = _UPSTREAM_REPEAT_KV
+    _restore_upstream_symbols()
     try:
         yield
     finally:
-        modeling_gemma3.rotate_half = _UPSTREAM_ROTATE_HALF
-        modeling_gemma3.repeat_kv = _UPSTREAM_REPEAT_KV
+        _restore_upstream_symbols()
 
 
 def _tiny_config(vocab_size: int = _TINY_VOCAB) -> Gemma3TextConfig:
@@ -187,6 +226,48 @@ def _row_cosines(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.cosine_similarity(left, right, dim=-1)
 
 
+def _toy_tokenizer(model_max_length: int = _TINY_POSITIONS) -> PreTrainedTokenizerFast:
+    """Build a byte-level toy tokenizer for the tiny model.
+
+    Byte-level vocabulary with no merges: every byte is its own token, so
+    the multilingual fixtures tokenize without shipping a real vocab file.
+    The template wraps the text in the begin- and end-of-sequence tokens,
+    as this family's own tokenizers do, and the padding goes on the right.
+
+    Args:
+        model_max_length: Length the tokenizer declares; only used to keep
+            its own warnings quiet, since every encoding here is truncated
+            by the caller.
+    """
+    vocab = {"<pad>": _PAD_ID, "<eos>": _EOS_ID, "<bos>": _BOS_ID, "<unk>": 3}
+    first_byte_id = len(vocab)
+    for index, character in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet())):
+        vocab[character] = index + first_byte_id
+    tokenizer = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="<bos> $A <eos>",
+        pair="<bos> $A <eos> $B <eos>",
+        special_tokens=[("<bos>", _BOS_ID), ("<eos>", _EOS_ID)],
+    )
+    tokenizer.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        pad_token="<pad>",
+        unk_token="<unk>",
+        bos_token="<bos>",
+        eos_token="<eos>",
+        padding_side="right",
+        model_max_length=model_max_length,
+    )
+
+
+@cache
+def _shared_tokenizer() -> PreTrainedTokenizerFast:
+    """Return one toy tokenizer shared by every handle built in memory."""
+    return _toy_tokenizer()
+
+
 def _loaded(
     model: Any,
     kind: str = "embedding",
@@ -195,10 +276,14 @@ def _loaded(
     model_dir: Path = Path("/nonexistent-model-dir"),
     dense: Any = None,
 ) -> base.LoadedModel:
-    """Build the handle the backend interface passes between its stages."""
+    """Build the handle the backend interface passes between its stages.
+
+    A handle always carries a tokenizer, as one returned by ``load``
+    does: applying the patches measures the model on encoded sentences.
+    """
     return base.LoadedModel(
         model=model,
-        tokenizer=tokenizer,
+        tokenizer=tokenizer if tokenizer is not None else _shared_tokenizer(),
         config=getattr(model, "config", None),
         model_dir=model_dir,
         kind=kind,
@@ -255,7 +340,7 @@ def _model_dir(tmp_path: Path, config: dict[str, Any] | None = None, **pooling: 
     return model_dir
 
 
-# --- the two conversion patches ----------------------------------------------
+# --- the conversion patches --------------------------------------------------
 
 
 def test_patched_rotate_half_matches_the_upstream_formula() -> None:
@@ -303,6 +388,7 @@ def test_apply_patches_rebinds_both_module_functions() -> None:
 
     assert modeling_gemma3.rotate_half is not _UPSTREAM_ROTATE_HALF
     assert modeling_gemma3.repeat_kv is not _UPSTREAM_REPEAT_KV
+    assert modeling_gemma3.eager_attention_forward is not _UPSTREAM_EAGER_ATTENTION
 
 
 def test_apply_patches_leaves_another_decoder_family_alone() -> None:
@@ -319,19 +405,27 @@ def test_apply_patches_returns_a_json_serializable_record() -> None:
 
     applied = backend.apply_patches(_loaded(_tiny_model()))
 
+    conditioning = applied.pop(g3.FP16_RANGE_CONDITIONING_KEY)
     assert applied == {
         "rotate_half_static": True,
         "repeat_kv_rank4": True,
+        "attention_query_chunks": True,
         "mask_fill_value": g3.MASK_FILL_VALUE,
     }
+    assert set(conditioning) == {"residual_divisor", "mlp_output_gains", "calibration_inputs"}
     assert json.loads(json.dumps(applied)) == applied
+    assert json.loads(json.dumps(conditioning)) == conditioning
 
 
 def test_the_record_names_every_patch_of_the_patch_list() -> None:
     """A rewrite added to the list must show up in the metadata without further wiring."""
     applied = g3.Gemma3Backend().apply_patches(_loaded(_tiny_model()))
 
-    assert [name for name, _ in g3.PATCHES] == ["rotate_half_static", "repeat_kv_rank4"]
+    assert [name for name, _ in g3.PATCHES] == [
+        "rotate_half_static",
+        "repeat_kv_rank4",
+        "attention_query_chunks",
+    ]
     assert all(applied[name] is True for name, _ in g3.PATCHES)
 
 
@@ -353,16 +447,22 @@ def test_apply_patches_rejects_an_odd_rope_head_dim(config: SimpleNamespace) -> 
 
     assert modeling_gemma3.rotate_half is _UPSTREAM_ROTATE_HALF
     assert modeling_gemma3.repeat_kv is _UPSTREAM_REPEAT_KV
+    assert modeling_gemma3.eager_attention_forward is _UPSTREAM_EAGER_ATTENTION
 
 
 def test_apply_patches_refuses_a_fill_value_the_wrapper_cannot_apply() -> None:
     """The graph's mask fill is fixed by the wrapper; a different one must not be claimed."""
     backend = g3.Gemma3Backend()
+    model = _tiny_model()
+    before = copy.deepcopy(model.state_dict())
 
     with pytest.raises(ValueError, match="mask fill"):
-        backend.apply_patches(_loaded(_tiny_model()), mask_fill_value=-30000.0)
+        backend.apply_patches(_loaded(model), mask_fill_value=-30000.0)
 
     assert modeling_gemma3.rotate_half is _UPSTREAM_ROTATE_HALF
+    assert modeling_gemma3.eager_attention_forward is _UPSTREAM_EAGER_ATTENTION
+    # A refused request must not have rescaled the weights either.
+    assert all(torch.equal(value, before[name]) for name, value in model.state_dict().items())
 
 
 def test_apply_patches_accepts_the_fill_value_the_wrapper_uses() -> None:
@@ -388,6 +488,784 @@ def test_the_patches_do_not_change_what_the_model_computes() -> None:
         patched = model(input_ids=input_ids, attention_mask=masks)[0]
 
     assert torch.allclose(patched, upstream, rtol=0, atol=1e-6)
+
+
+# --- attention over split query rows -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("num_queries", "num_keys", "expected"),
+    [
+        (512, 512, 512),
+        # The last sequence length whose score matrix stays below the limit.
+        (1023, 1023, 1023),
+        # Exactly the limit: it has to be split, in two.
+        (1024, 1024, 512),
+        (1040, 1040, 520),
+        # Half the rows still reach the limit, so they are halved again.
+        (2048, 2048, 256),
+        (1, 1, 1),
+        # Rows cannot be split below one, however many keys there are.
+        (4, 1 << 21, 1),
+    ],
+)
+def test_query_rows_stay_strictly_below_the_score_limit(
+    num_queries: int, num_keys: int, expected: int
+) -> None:
+    """The row count is halved until one score matrix holds fewer than 2**20 elements."""
+    assert g3.ATTENTION_SCORE_ELEMENT_LIMIT == 1 << 20
+
+    rows = g3.attention_query_rows(num_queries, num_keys)
+
+    assert rows == expected
+    assert rows == 1 or rows * num_keys < g3.ATTENTION_SCORE_ELEMENT_LIMIT
+
+
+def _attention_arguments(
+    seq_len: int = 6, masked: bool = True, seed: int = 3
+) -> tuple[SimpleNamespace, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Build the arguments one attention call receives, for a batch of two."""
+    torch.manual_seed(seed)
+    module = SimpleNamespace(
+        head_dim=_TINY_HEAD_DIM,
+        num_key_value_groups=_TINY_HEADS // _TINY_KV_HEADS,
+        training=False,
+    )
+    query = torch.randn(2, _TINY_HEADS, seq_len, _TINY_HEAD_DIM)
+    key = torch.randn(2, _TINY_KV_HEADS, seq_len, _TINY_HEAD_DIM)
+    value = torch.randn(2, _TINY_KV_HEADS, seq_len, _TINY_HEAD_DIM)
+    mask = None
+    if masked:
+        attention_mask = torch.ones(2, seq_len, dtype=torch.long)
+        attention_mask[0, seq_len - 2 :] = 0
+        _, mask = g3.build_bidirectional_masks(attention_mask, window=3)
+    return module, query, key, value, mask
+
+
+@pytest.mark.parametrize("masked", [True, False], ids=["masked", "unmasked"])
+@pytest.mark.parametrize("softcap", [None, 5.0], ids=["uncapped", "softcapped"])
+@pytest.mark.parametrize("scaling", [None, 0.25], ids=["default-scaling", "given-scaling"])
+def test_the_unsplit_attention_is_the_upstream_attention(
+    masked: bool, softcap: float | None, scaling: float | None
+) -> None:
+    """Below the limit nothing is split, and the numbers are upstream's, bit for bit."""
+    module, query, key, value, mask = _attention_arguments(masked=masked)
+    expected_output, expected_weights = _UPSTREAM_EAGER_ATTENTION(
+        module, query, key, value, mask, scaling=scaling, softcap=softcap
+    )
+
+    g3.patch_attention_query_chunks()
+    output, weights = modeling_gemma3.eager_attention_forward(
+        module, query, key, value, mask, scaling=scaling, softcap=softcap
+    )
+
+    assert modeling_gemma3.eager_attention_forward is not _UPSTREAM_EAGER_ATTENTION
+    assert torch.equal(output, expected_output)
+    assert torch.equal(weights, expected_weights)
+
+
+@pytest.mark.parametrize("masked", [True, False], ids=["masked", "unmasked"])
+@pytest.mark.parametrize("softcap", [None, 5.0], ids=["uncapped", "softcapped"])
+@pytest.mark.parametrize(
+    ("seq_len", "limit"),
+    [(6, 19), (6, 13), (7, 25), (7, 8)],
+    ids=["two-ranges", "three-ranges", "uneven-ranges", "single-rows"],
+)
+def test_the_split_attention_returns_what_upstream_returns(
+    monkeypatch: pytest.MonkeyPatch, masked: bool, softcap: float | None, seq_len: int, limit: int
+) -> None:
+    """Both returned tensors keep their shape and their values when the rows are split."""
+    module, query, key, value, mask = _attention_arguments(seq_len=seq_len, masked=masked)
+    expected_output, expected_weights = _UPSTREAM_EAGER_ATTENTION(
+        module, query, key, value, mask, softcap=softcap
+    )
+    monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", limit)
+    assert g3.attention_query_rows(seq_len, seq_len) < seq_len  # the rows really are split
+
+    g3.patch_attention_query_chunks()
+    output, weights = modeling_gemma3.eager_attention_forward(
+        module, query, key, value, mask, softcap=softcap
+    )
+
+    assert output.shape == expected_output.shape
+    assert weights.shape == expected_weights.shape
+    assert torch.allclose(output, expected_output, rtol=0, atol=1e-6)
+    assert torch.allclose(weights, expected_weights, rtol=0, atol=1e-6)
+
+
+def test_the_split_attention_broadcasts_a_mask_without_query_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mask holding a single row for every query is broadcast to each range, not cut."""
+    module, query, key, value, _ = _attention_arguments(seq_len=6, masked=False)
+    mask = torch.zeros(2, 1, 1, 6)
+    mask[0, 0, 0, 4:] = g3.MASK_FILL_VALUE
+    expected_output, expected_weights = _UPSTREAM_EAGER_ATTENTION(module, query, key, value, mask)
+    monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", 13)
+
+    g3.patch_attention_query_chunks()
+    output, weights = modeling_gemma3.eager_attention_forward(module, query, key, value, mask)
+
+    assert torch.allclose(output, expected_output, rtol=0, atol=1e-6)
+    assert torch.allclose(weights, expected_weights, rtol=0, atol=1e-6)
+
+
+def test_the_split_attention_uses_only_the_mask_columns_of_its_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mask wider than the keys is cut to them, as upstream cuts it."""
+    module, query, key, value, mask = _attention_arguments(seq_len=6)
+    assert mask is not None
+    wider = torch.cat([mask, torch.zeros(2, 1, 6, 3)], dim=-1)
+    expected_output, _ = _UPSTREAM_EAGER_ATTENTION(module, query, key, value, wider)
+
+    g3.patch_attention_query_chunks()
+    unsplit, _ = modeling_gemma3.eager_attention_forward(module, query, key, value, wider)
+    monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", 13)
+    split, _ = modeling_gemma3.eager_attention_forward(module, query, key, value, wider)
+
+    assert torch.equal(unsplit, expected_output)
+    assert torch.allclose(split, expected_output, rtol=0, atol=1e-6)
+
+
+# Sequence length, real lengths per row and score limit of the model-level
+# split comparisons, with the number of ranges each limit leads to. The
+# tiny model's window is 5, so every case but the last runs beyond it.
+_SPLIT_CASES: dict[str, tuple[int, tuple[int, ...], int, int]] = {
+    "two-ranges": (16, (16, 16), 129, 2),
+    "four-ranges": (16, (16, 16), 65, 4),
+    "padded-two-ranges": (16, (16, 9, 3), 129, 2),
+    "padded-four-ranges": (16, (11, 16), 65, 4),
+    "uneven-two-ranges": (13, (13, 6), 92, 2),
+    "uneven-four-ranges": (13, (13, 13), 53, 4),
+    "inside-window": (4, (4, 2), 9, 2),
+}
+
+
+@pytest.mark.parametrize("case", list(_SPLIT_CASES))
+def test_splitting_the_query_rows_does_not_change_what_the_model_computes(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Split, unsplit and upstream attention must give the same hidden states."""
+    seq_len, lengths, limit, ranges = _SPLIT_CASES[case]
+    model = _tiny_model()
+    input_ids, attention_mask = _right_padded_batch(seq_len=seq_len, lengths=lengths)
+    masks = _mask_mapping(attention_mask)
+
+    with torch.no_grad():
+        upstream = model(input_ids=input_ids, attention_mask=masks)[0]
+        g3.patch_attention_query_chunks()
+        unsplit = model(input_ids=input_ids, attention_mask=masks)[0]
+        monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", limit)
+        split = model(input_ids=input_ids, attention_mask=masks)[0]
+
+    rows = g3.attention_query_rows(seq_len, seq_len)
+    assert math.ceil(seq_len / rows) == ranges  # the case is what its name says
+    assert torch.equal(unsplit, upstream)
+    assert float((split - upstream).abs().max()) <= _SPLIT_HIDDEN_TOLERANCE
+    real = attention_mask.to(torch.bool)
+    assert float(_row_cosines(split[real], upstream[real]).min()) >= _EQUIVALENCE_COSINE_THRESHOLD
+    pooled_split = common.mean_pool(split, attention_mask)
+    pooled_upstream = common.mean_pool(upstream, attention_mask)
+    assert float(_row_cosines(pooled_split, pooled_upstream).min()) >= (
+        _EQUIVALENCE_COSINE_THRESHOLD
+    )
+
+
+def test_splitting_also_holds_on_the_frameworks_own_mask_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The split must not depend on who built the mask the layers receive."""
+    model = _tiny_model()
+    input_ids, attention_mask = _right_padded_batch(seq_len=16, lengths=(16, 9, 3))
+
+    with torch.no_grad():
+        upstream = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+        g3.patch_attention_query_chunks()
+        monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", 65)
+        split = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+
+    real = attention_mask.to(torch.bool)
+    assert float((split[real] - upstream[real]).abs().max()) <= _SPLIT_HIDDEN_TOLERANCE
+
+
+def _softmax_count(traced: torch.jit.ScriptModule) -> int:
+    """Count the softmax nodes of a traced graph."""
+    return sum(1 for node in traced.inlined_graph.nodes() if node.kind() == _SOFTMAX_NODE)
+
+
+def test_the_unsplit_trace_attends_once_per_layer() -> None:
+    """Below the limit the graph holds one attention per layer and no row slicing for it."""
+    wrapper, input_ids, attention_mask = _patched_wrapper()
+
+    traced = conversion.trace_model(wrapper, _example(input_ids, attention_mask))
+
+    assert _softmax_count(traced) == len(_TINY_LAYER_TYPES)
+
+
+@pytest.mark.parametrize(("limit", "ranges"), [(129, 2), (65, 4)])
+def test_the_split_trace_is_static_and_stays_within_rank_four(
+    monkeypatch: pytest.MonkeyPatch, limit: int, ranges: int
+) -> None:
+    """Splitting must add neither shape arithmetic nor a wider tensor to the graph."""
+    monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", limit)
+    wrapper, input_ids, attention_mask = _patched_wrapper()
+
+    traced = conversion.trace_model(wrapper, _example(input_ids, attention_mask))
+
+    assert _softmax_count(traced) == len(_TINY_LAYER_TYPES) * ranges  # really split
+    assert _DYNAMIC_SIZE_NODE not in str(traced.inlined_graph)
+    assert max(_traced_ranks(traced)) <= _MAX_GRAPH_RANK
+
+
+def test_the_split_trace_replays_another_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ranges are constants of the graph; the padding of the example must not be."""
+    monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", 65)
+    wrapper, input_ids, attention_mask = _patched_wrapper()
+    traced = conversion.trace_model(wrapper, _example(input_ids, attention_mask))
+    other_ids, other_mask = _right_padded_batch(
+        seq_len=_SEQ_LEN_OUTSIDE_WINDOW, lengths=(_SEQ_LEN_OUTSIDE_WINDOW, 4), seed=8
+    )
+
+    with torch.no_grad():
+        expected = wrapper(other_ids, other_mask)
+        replayed = traced(other_ids, other_mask)
+
+    assert torch.allclose(replayed, expected, atol=1e-6)
+
+
+# --- the FP16 range conditioning ---------------------------------------------
+
+
+def _is_power_of_two(value: float) -> bool:
+    """Tell whether ``value`` is a positive power of two."""
+    return value > 0 and math.isfinite(value) and math.frexp(value)[0] == 0.5
+
+
+@pytest.mark.parametrize(
+    ("peak", "expected"),
+    [
+        # The peak a real model of this family reaches in its later layers.
+        (1.49e5, 128.0),
+        (1024.0, 1.0),
+        (2048.0, 2.0),
+        # Either side of the rounding point between two powers of two.
+        (1400.0, 1.0),
+        (1500.0, 2.0),
+        # A stream that already fits is never scaled up.
+        (100.0, 1.0),
+        (1e-3, 1.0),
+        # Beyond any working model: clamped rather than followed.
+        (1e30, 2.0**g3.MAX_RESIDUAL_DIVISOR_EXPONENT),
+    ],
+)
+def test_the_residual_divisor_brings_the_peak_near_its_target(peak: float, expected: float) -> None:
+    """The divisor is the power of two nearest to peak / target, and never below 1."""
+    assert g3.residual_divisor(peak) == expected
+
+
+@pytest.mark.parametrize(
+    ("rms", "expected"),
+    [
+        # The level the later layers of a real model fall to.
+        (0.002, 512.0),
+        (0.125, 8.0),
+        (1.0, 1.0),
+        (0.9, 1.0),
+        (4.0, 0.25),
+        (1e-30, 2.0**g3.MAX_GAIN_EXPONENT),
+        (1e30, 2.0**-g3.MAX_GAIN_EXPONENT),
+    ],
+)
+def test_the_mlp_output_gain_brings_the_level_near_one(rms: float, expected: float) -> None:
+    """The gain is the power of two nearest to 1 / rms, within its bounds."""
+    assert g3.mlp_output_gain(rms) == expected
+
+
+@pytest.mark.parametrize("measured", [0.0, -0.0, -3.0, math.nan, math.inf, -math.inf])
+def test_an_unusable_measurement_yields_no_rescaling(measured: float) -> None:
+    """Nothing can be derived from a zero, negative or non-finite measurement."""
+    assert g3.residual_divisor(measured) == 1.0
+    assert g3.mlp_output_gain(measured) == 1.0
+
+
+@pytest.mark.parametrize("exponent", range(-40, 41, 5))
+def test_every_factor_is_a_power_of_two(exponent: int) -> None:
+    """A power of two changes a float's exponent only, whatever was measured."""
+    measured = 1.7 * 10.0**exponent
+
+    assert _is_power_of_two(g3.residual_divisor(measured))
+    assert _is_power_of_two(g3.mlp_output_gain(measured))
+
+
+def _capture_norm_inputs(
+    model: Gemma3TextModel, input_ids: torch.Tensor, attention_mask: Any
+) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+    """Run ``model`` and capture what its normalization layers read.
+
+    Returns:
+        The last hidden state, the input of every layer's post-feedforward
+        normalization (the MLP output), and the input of the final
+        normalization (the residual stream).
+    """
+    mlp_outputs: list[torch.Tensor] = []
+    residual: list[torch.Tensor] = []
+    handles = [
+        layer.post_feedforward_layernorm.register_forward_pre_hook(
+            lambda _module, args: mlp_outputs.append(args[0].detach().clone())
+        )
+        for layer in model.layers
+    ]
+    handles.append(
+        model.norm.register_forward_pre_hook(
+            lambda _module, args: residual.append(args[0].detach().clone())
+        )
+    )
+    try:
+        with torch.no_grad():
+            hidden = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+    finally:
+        for handle in handles:
+            handle.remove()
+    return hidden, mlp_outputs, residual[0]
+
+
+def _tiny_model_with_norm_weights(seed: int = 0) -> Gemma3TextModel:
+    """Build the tiny model with non-zero normalization weights.
+
+    A fresh model holds zeros there, which would leave the rewrite of
+    those weights untested: any formula maps a zero gain offset right.
+    """
+    model = _tiny_model(seed)
+    generator = torch.Generator().manual_seed(seed + 100)
+    with torch.no_grad():
+        for layer in model.layers:
+            for norm in (
+                layer.input_layernorm,
+                layer.post_attention_layernorm,
+                layer.pre_feedforward_layernorm,
+                layer.post_feedforward_layernorm,
+            ):
+                norm.weight.copy_(torch.rand(norm.weight.shape, generator=generator) - 0.5)
+        model.norm.weight.copy_(torch.rand(model.norm.weight.shape, generator=generator) - 0.5)
+    return model
+
+
+def test_measuring_reads_the_ranges_off_the_normalization_inputs() -> None:
+    """The peak and the levels are those of the tensors the model really computes."""
+    model = _tiny_model_with_norm_weights()
+    tokenizer = _shared_tokenizer()
+    texts = ["a first sentence", "another, somewhat longer sentence"]
+    before = copy.deepcopy(model.state_dict())
+
+    ranges = g3.measure_activation_ranges(model, tokenizer, texts)
+
+    square_sums = [0.0] * len(model.layers)
+    counts = [0] * len(model.layers)
+    final_peak = 0.0
+    for text in texts:
+        encoded = tokenizer(text, return_tensors="pt")
+        _, mlp_outputs, residual = _capture_norm_inputs(
+            model, encoded["input_ids"], encoded["attention_mask"]
+        )
+        final_peak = max(final_peak, float(residual.abs().max()))
+        for index, output in enumerate(mlp_outputs):
+            square_sums[index] += float(output.double().pow(2).sum())
+            counts[index] += output.numel()
+    expected_rms = [
+        math.sqrt(total / count) for total, count in zip(square_sums, counts, strict=True)
+    ]
+    assert ranges.inputs == len(texts)
+    assert len(ranges.mlp_output_rms) == len(model.layers)
+    assert ranges.mlp_output_rms == pytest.approx(expected_rms, rel=1e-9)
+    # The stream is also read inside the layers, so its peak is at least
+    # what the final normalization sees.
+    assert math.isfinite(ranges.residual_peak)
+    assert ranges.residual_peak >= final_peak > 0.0
+    # Measuring leaves no hook and no changed weight behind.
+    assert all(not module._forward_pre_hooks for module in model.modules())
+    assert all(torch.equal(value, before[name]) for name, value in model.state_dict().items())
+
+
+def test_measuring_sees_a_peak_inside_the_layers() -> None:
+    """The stream between the two halves of a layer counts, not only between layers."""
+    model = _tiny_model()
+    tokenizer = _shared_tokenizer()
+    text = "a sentence"
+    baseline = g3.measure_activation_ranges(model, tokenizer, [text])
+    # Scaling up what the first layer's attention branch adds raises the
+    # stream that layer's second half reads.
+    with torch.no_grad():
+        model.layers[0].post_attention_layernorm.weight.fill_(1e4)
+
+    raised = g3.measure_activation_ranges(model, tokenizer, [text])
+
+    assert raised.residual_peak > 100 * baseline.residual_peak
+
+
+def test_measuring_truncates_to_the_given_length() -> None:
+    """A length limit bounds what is run; without it the whole text is."""
+    model = _tiny_model()
+    seen: list[int] = []
+    handle = model.norm.register_forward_pre_hook(
+        lambda _module, args: seen.append(args[0].shape[1])
+    )
+    try:
+        g3.measure_activation_ranges(model, _shared_tokenizer(), ["x" * 30], max_length=8)
+        g3.measure_activation_ranges(model, _shared_tokenizer(), ["x" * 30])
+    finally:
+        handle.remove()
+
+    assert seen == [8, 32]
+
+
+def test_measuring_reports_a_non_finite_stream_as_such() -> None:
+    """A NaN must not be stepped over by a maximum; it has to reach the caller."""
+    model = _tiny_model()
+    with torch.no_grad():
+        model.layers[1].mlp.down_proj.weight.fill_(math.nan)
+
+    ranges = g3.measure_activation_ranges(model, _shared_tokenizer(), ["a sentence"])
+
+    assert math.isnan(ranges.residual_peak)
+    assert math.isnan(ranges.mlp_output_rms[1])
+    assert g3.residual_divisor(ranges.residual_peak) == 1.0
+    assert g3.mlp_output_gain(ranges.mlp_output_rms[1]) == 1.0
+
+
+def test_measuring_nothing_reports_nothing() -> None:
+    """Without any input there is no range, and so no rescaling to derive."""
+    model = _tiny_model()
+
+    ranges = g3.measure_activation_ranges(model, _shared_tokenizer(), [])
+
+    assert ranges == g3.ActivationRanges(
+        residual_peak=0.0, mlp_output_rms=(0.0,) * len(model.layers), inputs=0
+    )
+
+
+@pytest.mark.parametrize("padded", [False, True], ids=["unpadded", "padded"])
+@pytest.mark.parametrize(
+    "seq_len",
+    [_SEQ_LEN_INSIDE_WINDOW, _SEQ_LEN_OUTSIDE_WINDOW],
+    ids=["inside-window", "outside-window"],
+)
+@pytest.mark.parametrize("mask_path", ["mapping", "framework"])
+def test_a_conditioned_model_computes_the_same_function(
+    seq_len: int, padded: bool, mask_path: str
+) -> None:
+    """Rescaled weights must leave the hidden states and the pooled vector where they were."""
+    original = _tiny_model_with_norm_weights()
+    conditioned = copy.deepcopy(original)
+    input_ids, attention_mask = _right_padded_batch(
+        seq_len=seq_len, lengths=_BATCH_LENGTHS[(seq_len, padded)]
+    )
+    masks = _mask_mapping(attention_mask) if mask_path == "mapping" else attention_mask
+
+    g3.condition_fp16_ranges(conditioned, _TEST_DIVISOR, _TEST_GAINS)
+    with torch.no_grad():
+        expected = original(input_ids=input_ids, attention_mask=masks)[0]
+        actual = conditioned(input_ids=input_ids, attention_mask=masks)[0]
+
+    real = attention_mask.to(torch.bool)
+    assert float(_row_cosines(actual[real], expected[real]).min()) >= _EQUIVALENCE_COSINE_THRESHOLD
+    assert float((actual[real] - expected[real]).abs().max()) <= _CONDITIONED_HIDDEN_TOLERANCE
+    pooled_actual = common.mean_pool(actual, attention_mask)
+    pooled_expected = common.mean_pool(expected, attention_mask)
+    assert float(_row_cosines(pooled_actual, pooled_expected).min()) >= (
+        _EQUIVALENCE_COSINE_THRESHOLD
+    )
+
+
+def test_conditioning_moves_the_ranges_it_is_meant_to_move() -> None:
+    """Guard for the comparison above: the stream and the MLP outputs really are rescaled."""
+    original = _tiny_model_with_norm_weights()
+    conditioned = copy.deepcopy(original)
+    input_ids, attention_mask = _right_padded_batch(
+        seq_len=_SEQ_LEN_OUTSIDE_WINDOW, lengths=(_SEQ_LEN_OUTSIDE_WINDOW, 9)
+    )
+
+    g3.condition_fp16_ranges(conditioned, _TEST_DIVISOR, _TEST_GAINS)
+    _, mlp_before, residual_before = _capture_norm_inputs(original, input_ids, attention_mask)
+    _, mlp_after, residual_after = _capture_norm_inputs(conditioned, input_ids, attention_mask)
+
+    assert torch.allclose(
+        residual_after * _TEST_DIVISOR,
+        residual_before,
+        rtol=1e-3,
+        atol=_CONDITIONED_HIDDEN_TOLERANCE,
+    )
+    assert float(residual_after.abs().max()) < float(residual_before.abs().max()) / 100
+    for gain, before, after in zip(_TEST_GAINS, mlp_before, mlp_after, strict=True):
+        assert torch.allclose(after, before * gain, rtol=1e-3, atol=1e-7 * gain)
+
+
+def test_conditioning_rewrites_exactly_the_documented_constants() -> None:
+    """Weights are scaled by exact powers of two, and nothing else is touched."""
+    original = _tiny_model_with_norm_weights()
+    conditioned = copy.deepcopy(original)
+    eps = original.config.rms_norm_eps
+
+    g3.condition_fp16_ranges(conditioned, _TEST_DIVISOR, _TEST_GAINS)
+
+    assert torch.equal(
+        conditioned.embed_tokens.embed_scale, original.embed_tokens.embed_scale / _TEST_DIVISOR
+    )
+    assert conditioned.norm.eps == eps / _TEST_DIVISOR**2
+    changed = {"embed_scale"}
+    for index, (gain, before, after) in enumerate(
+        zip(_TEST_GAINS, original.layers, conditioned.layers, strict=True)
+    ):
+        assert torch.equal(after.mlp.down_proj.weight, before.mlp.down_proj.weight * gain)
+        assert after.input_layernorm.eps == eps / _TEST_DIVISOR**2
+        assert after.pre_feedforward_layernorm.eps == eps / _TEST_DIVISOR**2
+        assert after.post_attention_layernorm.eps == eps
+        assert after.post_feedforward_layernorm.eps == eps * gain**2
+        assert after.self_attn.q_norm.eps == eps
+        assert after.self_attn.k_norm.eps == eps
+        for name in ("post_attention_layernorm", "post_feedforward_layernorm"):
+            new_gain = 1.0 + getattr(after, name).weight
+            old_gain = 1.0 + getattr(before, name).weight
+            assert torch.allclose(new_gain * _TEST_DIVISOR, old_gain, rtol=1e-4, atol=0)
+            changed.add(f"layers.{index}.{name}.weight")
+        if gain != 1.0:
+            changed.add(f"layers.{index}.mlp.down_proj.weight")
+    before_state = original.state_dict()
+    after_state = conditioned.state_dict()
+    assert {
+        name for name, value in after_state.items() if not torch.equal(value, before_state[name])
+    } == changed - {"embed_scale"}  # the scale is a non-persistent buffer
+
+
+def test_conditioning_with_unit_factors_changes_nothing() -> None:
+    """Factors of 1 must leave every weight bit-identical, not merely close."""
+    original = _tiny_model_with_norm_weights()
+    conditioned = copy.deepcopy(original)
+
+    g3.condition_fp16_ranges(conditioned, 1.0, [1.0] * len(_TINY_LAYER_TYPES))
+
+    before = original.state_dict()
+    assert all(torch.equal(value, before[name]) for name, value in conditioned.state_dict().items())
+    assert torch.equal(conditioned.embed_tokens.embed_scale, original.embed_tokens.embed_scale)
+    assert conditioned.norm.eps == original.norm.eps
+    assert all(
+        after.post_feedforward_layernorm.eps == before_layer.post_feedforward_layernorm.eps
+        for after, before_layer in zip(conditioned.layers, original.layers, strict=True)
+    )
+
+
+@pytest.mark.parametrize(
+    ("divisor", "gains"),
+    [
+        (_TEST_DIVISOR, _TEST_GAINS[:-1]),
+        (_TEST_DIVISOR, (*_TEST_GAINS, 2.0)),
+        (3.0, _TEST_GAINS),
+        (0.0, _TEST_GAINS),
+        (-2.0, _TEST_GAINS),
+        (math.nan, _TEST_GAINS),
+        (math.inf, _TEST_GAINS),
+        (_TEST_DIVISOR, (8.0, 6.0, 0.5, 1.0)),
+        (_TEST_DIVISOR, (8.0, 0.0, 0.5, 1.0)),
+        (_TEST_DIVISOR, (8.0, math.nan, 0.5, 1.0)),
+    ],
+    ids=[
+        "too-few-gains",
+        "too-many-gains",
+        "divisor-not-a-power",
+        "zero-divisor",
+        "negative-divisor",
+        "nan-divisor",
+        "infinite-divisor",
+        "gain-not-a-power",
+        "zero-gain",
+        "nan-gain",
+    ],
+)
+def test_conditioning_refuses_unusable_factors_without_touching_the_model(
+    divisor: float, gains: tuple[float, ...]
+) -> None:
+    """A factor that is not a power of two, or a missing one, must rewrite nothing."""
+    model = _tiny_model_with_norm_weights()
+    before = copy.deepcopy(model.state_dict())
+    scale = model.embed_tokens.embed_scale.clone()
+
+    with pytest.raises(ValueError, match="power of two|per layer"):
+        g3.condition_fp16_ranges(model, divisor, gains)
+
+    assert all(torch.equal(value, before[name]) for name, value in model.state_dict().items())
+    assert torch.equal(model.embed_tokens.embed_scale, scale)
+    assert model.norm.eps == model.config.rms_norm_eps
+
+
+def test_apply_patches_records_the_factors_it_applied() -> None:
+    """The record must name the factors the weights were really rescaled with."""
+    original = _tiny_model()
+    model = copy.deepcopy(original)
+    expected_inputs = 1 + len(g3.Gemma3Backend().sanity_spec("embedding").all_inputs)
+
+    applied = g3.Gemma3Backend().apply_patches(_loaded(model))
+
+    record = applied[g3.FP16_RANGE_CONDITIONING_KEY]
+    assert record["calibration_inputs"] == expected_inputs
+    assert _is_power_of_two(record["residual_divisor"])
+    assert record["residual_divisor"] >= 1.0
+    assert len(record["mlp_output_gains"]) == len(original.layers)
+    assert all(_is_power_of_two(gain) for gain in record["mlp_output_gains"])
+    # A randomly initialised model has tiny MLP outputs, so there is
+    # something to rescale and the comparison below is not vacuous.
+    assert any(gain != 1.0 for gain in record["mlp_output_gains"])
+    assert torch.equal(
+        model.embed_tokens.embed_scale,
+        original.embed_tokens.embed_scale / record["residual_divisor"],
+    )
+    for gain, before, after in zip(
+        record["mlp_output_gains"], original.layers, model.layers, strict=True
+    ):
+        assert torch.equal(after.mlp.down_proj.weight, before.mlp.down_proj.weight * gain)
+
+
+def test_apply_patches_derives_the_factors_from_the_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What is measured decides the factors: a real model's ranges give a real model's factors."""
+    measured = g3.ActivationRanges(
+        residual_peak=1.49e5, mlp_output_rms=(0.12, 0.002, 1.0, 0.03), inputs=10
+    )
+    monkeypatch.setattr(g3, "measure_activation_ranges", lambda *args, **kwargs: measured)
+    original = _tiny_model()
+    model = copy.deepcopy(original)
+
+    applied = g3.Gemma3Backend().apply_patches(_loaded(model))
+
+    assert applied[g3.FP16_RANGE_CONDITIONING_KEY] == {
+        "residual_divisor": 128.0,
+        "mlp_output_gains": [8.0, 512.0, 1.0, 32.0],
+        "calibration_inputs": 10,
+    }
+    assert torch.equal(model.embed_tokens.embed_scale, original.embed_tokens.embed_scale / 128.0)
+    assert torch.equal(
+        model.layers[1].mlp.down_proj.weight, original.layers[1].mlp.down_proj.weight * 512.0
+    )
+
+
+@pytest.mark.parametrize("unusable", [0.0, math.nan, math.inf, -1.0])
+def test_apply_patches_leaves_the_weights_alone_on_an_unusable_measurement(
+    monkeypatch: pytest.MonkeyPatch, unusable: float
+) -> None:
+    """A measurement nothing can be derived from must fall back to no rescaling at all."""
+    model = _tiny_model()
+    before = copy.deepcopy(model.state_dict())
+    scale = model.embed_tokens.embed_scale.clone()
+    measured = g3.ActivationRanges(
+        residual_peak=unusable, mlp_output_rms=(unusable,) * len(model.layers), inputs=10
+    )
+    monkeypatch.setattr(g3, "measure_activation_ranges", lambda *args, **kwargs: measured)
+
+    applied = g3.Gemma3Backend().apply_patches(_loaded(model))
+
+    assert applied[g3.FP16_RANGE_CONDITIONING_KEY] == {
+        "residual_divisor": 1.0,
+        "mlp_output_gains": [1.0] * len(model.layers),
+        "calibration_inputs": 10,
+    }
+    assert json.loads(json.dumps(applied)) == applied
+    assert all(torch.equal(value, before[name]) for name, value in model.state_dict().items())
+    assert torch.equal(model.embed_tokens.embed_scale, scale)
+
+
+def test_apply_patches_measures_within_the_position_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The calibration sentences are cut to the length the model is configured for."""
+    requested: list[int | None] = []
+    measure = g3.measure_activation_ranges
+
+    def spy(model: Any, tokenizer: Any, texts: Any, max_length: int | None = None) -> Any:
+        requested.append(max_length)
+        return measure(model, tokenizer, texts, max_length=max_length)
+
+    monkeypatch.setattr(g3, "measure_activation_ranges", spy)
+
+    g3.Gemma3Backend().apply_patches(_loaded(_tiny_model()))
+
+    assert requested == [_TINY_POSITIONS]
+
+
+def test_applying_the_patches_twice_rescales_once() -> None:
+    """A second request on the same model must return the first record and change nothing."""
+    backend = g3.Gemma3Backend()
+    model = _tiny_model()
+    first = backend.apply_patches(_loaded(model))
+    after_first = copy.deepcopy(model.state_dict())
+    scale = model.embed_tokens.embed_scale.clone()
+    eps = [layer.post_feedforward_layernorm.eps for layer in model.layers]
+
+    # Through a second handle on the same model, as another caller would.
+    second = backend.apply_patches(_loaded(model))
+
+    assert second == first
+    assert any(gain != 1.0 for gain in first[g3.FP16_RANGE_CONDITIONING_KEY]["mlp_output_gains"])
+    assert all(torch.equal(value, after_first[name]) for name, value in model.state_dict().items())
+    assert torch.equal(model.embed_tokens.embed_scale, scale)
+    assert [layer.post_feedforward_layernorm.eps for layer in model.layers] == eps
+
+
+def test_a_returned_record_cannot_alter_the_remembered_one() -> None:
+    """The record goes into metadata the caller owns; editing it must not leak back."""
+    backend = g3.Gemma3Backend()
+    model = _tiny_model()
+    first = backend.apply_patches(_loaded(model))
+    expected = copy.deepcopy(first)
+    first[g3.FP16_RANGE_CONDITIONING_KEY]["mlp_output_gains"].append(99.0)
+    first[g3.FP16_RANGE_CONDITIONING_KEY]["residual_divisor"] = 7.0
+
+    assert backend.apply_patches(_loaded(model)) == expected
+
+
+def test_conditioning_one_model_leaves_a_separate_copy_alone() -> None:
+    """The rescaling belongs to one model object; the baseline's own copy must not see it."""
+    compiled = _tiny_model()
+    baseline = _tiny_model()
+    untouched = copy.deepcopy(baseline.state_dict())
+    eps = baseline.config.rms_norm_eps
+
+    applied = g3.Gemma3Backend().apply_patches(_loaded(compiled))
+
+    assert any(gain != 1.0 for gain in applied[g3.FP16_RANGE_CONDITIONING_KEY]["mlp_output_gains"])
+    assert all(torch.equal(value, untouched[name]) for name, value in baseline.state_dict().items())
+    assert torch.equal(baseline.embed_tokens.embed_scale, torch.tensor(float(_TINY_HIDDEN) ** 0.5))
+    assert all(layer.post_feedforward_layernorm.eps == eps for layer in baseline.layers)
+    assert baseline.norm.eps == eps
+    # A module-level default shared between instances would show up here.
+    assert not hasattr(baseline, "_eeane_fp16_range_conditioning")
+
+
+@pytest.mark.parametrize("padded", [False, True], ids=["unpadded", "padded"])
+@pytest.mark.parametrize(
+    "seq_len",
+    [_SEQ_LEN_INSIDE_WINDOW, _SEQ_LEN_OUTSIDE_WINDOW],
+    ids=["inside-window", "outside-window"],
+)
+def test_the_patched_and_conditioned_wrapper_matches_the_untouched_model(
+    seq_len: int, padded: bool
+) -> None:
+    """Everything ``apply_patches`` does together must leave the embedding where it was."""
+    backend = g3.Gemma3Backend()
+    original = _tiny_model()
+    model = copy.deepcopy(original)
+    input_ids, attention_mask = _right_padded_batch(
+        seq_len=seq_len, lengths=_BATCH_LENGTHS[(seq_len, padded)]
+    )
+
+    with torch.no_grad():
+        # The untouched model on the upstream functions and the framework's
+        # own masks, before anything is rebound.
+        hidden = original(input_ids=input_ids, attention_mask=attention_mask)[0]
+        expected = common.mean_pool(hidden, attention_mask)
+        backend.apply_patches(_loaded(model))
+        actual = backend.wrap(_loaded(model))(input_ids, attention_mask)
+
+    assert float(_row_cosines(actual, expected).min()) >= _EQUIVALENCE_COSINE_THRESHOLD
 
 
 # --- the in-graph attention masks --------------------------------------------
@@ -1124,38 +2002,13 @@ def test_max_seq_len_of_an_unusable_config_is_none(tmp_path: Path, content: str)
 def _write_tokenizer_files(directory: Path, model_max_length: int = _TINY_POSITIONS) -> None:
     """Save a byte-level toy tokenizer into a synthetic model directory.
 
-    Byte-level vocabulary with no merges: every byte is its own token, so
-    the multilingual fixtures tokenize without shipping a real vocab file.
-    The template wraps the text in the begin- and end-of-sequence tokens,
-    as this family's own tokenizers do, and the padding goes on the right.
+    See :func:`_toy_tokenizer` for what the tokenizer is.
 
     Args:
         directory: Model directory the tokenizer files are written to.
-        model_max_length: Length the saved tokenizer declares; only used
-            to keep its own warnings quiet, since every encoding here is
-            truncated by the caller.
+        model_max_length: Length the saved tokenizer declares.
     """
-    vocab = {"<pad>": _PAD_ID, "<eos>": _EOS_ID, "<bos>": _BOS_ID, "<unk>": 3}
-    first_byte_id = len(vocab)
-    for index, character in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet())):
-        vocab[character] = index + first_byte_id
-    tokenizer = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="<unk>"))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tokenizer.post_processor = processors.TemplateProcessing(
-        single="<bos> $A <eos>",
-        pair="<bos> $A <eos> $B <eos>",
-        special_tokens=[("<bos>", _BOS_ID), ("<eos>", _EOS_ID)],
-    )
-    tokenizer.decoder = decoders.ByteLevel()
-    PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
-        pad_token="<pad>",
-        unk_token="<unk>",
-        bos_token="<bos>",
-        eos_token="<eos>",
-        padding_side="right",
-        model_max_length=model_max_length,
-    ).save_pretrained(directory)
+    _toy_tokenizer(model_max_length).save_pretrained(directory)
 
 
 def _write_dense_module(
@@ -1388,8 +2241,7 @@ def round_trip(embedding_dir: Path) -> Iterator[dict[str, Any]]:
     finally:
         # A module-scoped fixture is set up before the function-scoped
         # restore fixture runs, so it puts the upstream symbols back itself.
-        modeling_gemma3.rotate_half = _UPSTREAM_ROTATE_HALF
-        modeling_gemma3.repeat_kv = _UPSTREAM_REPEAT_KV
+        _restore_upstream_symbols()
     del loaded, wrapper
     gc.collect()
     yield {
@@ -1501,6 +2353,50 @@ def test_the_traced_wrapper_converts_and_agrees_with_the_fp32_wrapper(
     description = mlmodel.get_spec().description
     assert [tensor.name for tensor in description.input] == ["input_ids", "attention_mask"]
     assert [tensor.name for tensor in description.output] == ["embedding"]
+    assert embeddings.shape == expected.shape == (batch_size, _DENSE_OUT)
+    assert bool(np.isfinite(embeddings).all())
+    cosines = np.sum(embeddings * expected, axis=1) / (
+        np.linalg.norm(embeddings, axis=1) * np.linalg.norm(expected, axis=1)
+    )
+    assert float(cosines.min()) >= _CONVERSION_COSINE_THRESHOLD
+
+
+def test_the_split_traced_wrapper_converts_and_agrees_with_the_fp32_wrapper(
+    embedding_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graph whose attention is split over ranges of query rows must convert as well."""
+    monkeypatch.setattr(g3, "ATTENTION_SCORE_ELEMENT_LIMIT", 65)
+    backend = g3.Gemma3Backend()
+    loaded = backend.load(embedding_dir, "embedding")
+    backend.apply_patches(loaded)
+    wrapper = backend.wrap(loaded)
+    inputs = list(backend.sanity_spec("embedding").input_sets[0][1])
+    tokens = backend.tokenize(loaded, inputs, _ROUND_TRIP_SEQ_LEN)
+    batch_size = len(inputs)
+    with torch.no_grad():
+        expected = (
+            wrapper(
+                torch.from_numpy(tokens["input_ids"]).long(),
+                torch.from_numpy(tokens["attention_mask"]).long(),
+            )
+            .numpy()
+            .astype(np.float32)
+        )
+
+    traced = conversion.trace_model(wrapper, tokens)
+    mlmodel = conversion.convert_model(
+        traced,
+        _ROUND_TRIP_SEQ_LEN,
+        "fp16",
+        "macos13",
+        backend.output_name("embedding"),
+        batch_size=batch_size,
+    )
+    prediction = mlmodel.predict(dict(tokens))
+    embeddings = np.asarray(prediction["embedding"], dtype=np.float32).reshape(batch_size, -1)
+
+    # Four ranges per layer: the graph that was converted really is split.
+    assert _softmax_count(traced) == len(_TINY_LAYER_TYPES) * 4
     assert embeddings.shape == expected.shape == (batch_size, _DENSE_OUT)
     assert bool(np.isfinite(embeddings).all())
     cosines = np.sum(embeddings * expected, axis=1) / (

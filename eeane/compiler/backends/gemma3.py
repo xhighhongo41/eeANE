@@ -8,7 +8,7 @@ with bidirectional attention it behaves as an encoder: every position
 sees the whole sequence, and the sentence vector is a masked mean over
 all of them.
 
-Three properties decide how the conversion is built here:
+Four properties decide how the conversion is built here:
 
 * **Two attention masks are built in-graph, not one.** The layers of this
   architecture come in two types. A *full* layer lets every position
@@ -20,13 +20,30 @@ Three properties decide how the conversion is built here:
   computing the same numbers. A single 4-D mask shared by every layer --
   what a purely causal decoder is masked with -- would silently drop the
   window and compute a different model for any sequence longer than it.
-* **Two upstream constructs are replaced** before tracing:
+* **Three upstream constructs are replaced** before tracing:
   :func:`patch_rotate_half` removes shape arithmetic the Core ML
-  converter cannot fold, and :func:`patch_repeat_kv` removes the rank-5
+  converter cannot fold, :func:`patch_repeat_kv` removes the rank-5
   intermediate that makes the Neural Engine compiler reject the attention
-  subgraph. Both replacements compute exactly what upstream computes;
-  their bodies are shared with the other decoder-style backends through
+  subgraph, and :func:`patch_attention_query_chunks` computes the
+  attention of a long sequence over a few ranges of query rows, because
+  the Neural Engine returns wrong numbers for an attention score matrix
+  of 2**20 elements or more. All three replacements compute exactly what
+  upstream computes; the bodies of the first two are shared with the
+  other decoder-style backends through
   :mod:`eeane.compiler.backends.decoder_patches`.
+* **The weights of the compiled copy are rescaled into the FP16 range.**
+  The upstream model card states that the activations of this model do
+  not fit float16, and the compiled program runs in float16: the residual
+  stream grows past the largest float16 number in the later layers, and
+  the output of the later MLPs is so small that its square falls below
+  the smallest normal float16 number. :func:`condition_fp16_ranges`
+  divides the residual stream by one power of two and multiplies each MLP
+  output by a power of two of its own, by rewriting weights and
+  normalization constants only; every normalization layer undoes the
+  factor it is fed, so the function the model computes is unchanged. The
+  factors are measured on the loaded model by
+  :func:`measure_activation_ranges` and recorded in the metadata. The
+  FP32 baseline loads a copy of its own and is never rescaled.
 * **Only the bidirectional embedding model is compiled.** The same
   architecture configured causally is a language model, with another
   mask and another way of reading a sentence off it, so a directory that
@@ -48,9 +65,13 @@ requires the ``[compile]`` extra and must never be imported from the
 
 from __future__ import annotations
 
+import copy
 import gc
 import json
-from collections.abc import Callable
+import math
+import warnings
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -78,24 +99,37 @@ from eeane.compiler.backends.common import (
 
 # Public surface of this module.
 __all__ = [
+    "ATTENTION_SCORE_ELEMENT_LIMIT",
     "BIDIRECTIONAL_KEY",
     "CONFIG_FILENAME",
     "EMBEDDING_WRAPPERS",
+    "FP16_RANGE_CONDITIONING_KEY",
     "FULL_ATTENTION",
     "MASK_FILL_VALUE",
+    "MAX_GAIN_EXPONENT",
     "MAX_POSITION_KEY",
+    "MAX_RESIDUAL_DIVISOR_EXPONENT",
+    "MLP_OUTPUT_RMS_TARGET",
     "MODEL_TYPE",
     "OUTPUT_NAMES",
     "PATCHES",
+    "RESIDUAL_PEAK_TARGET",
     "SANITY_SPECS",
     "SLIDING_ATTENTION",
     "SLIDING_WINDOW_KEY",
     "SUPPORTED_KINDS",
+    "ActivationRanges",
     "BidirectionalMeanWrapper",
     "Gemma3Backend",
+    "attention_query_rows",
     "build_bidirectional_masks",
+    "condition_fp16_ranges",
+    "measure_activation_ranges",
+    "mlp_output_gain",
+    "patch_attention_query_chunks",
     "patch_repeat_kv",
     "patch_rotate_half",
+    "residual_divisor",
 ]
 
 # The only model kind this backend compiles.
@@ -155,6 +189,50 @@ TRACE_EXAMPLE_TEXT = "This is a short sample sentence used for conversion."
 # tokens the tokenizer at hand does or does not add.
 BATCH_PADDING_TEXT = "This sentence only fills an unused row of the batch."
 
+# Largest number of elements one head's attention score matrix (query rows
+# x keys) may hold; :func:`attention_query_rows` keeps every score matrix
+# strictly below it. On the Neural Engine an attention whose score matrix
+# reaches 2**20 elements returns wrong numbers -- the result no longer
+# resembles the model's -- while the very same program is correct on the
+# CPU, so the conversion itself gives no sign of it. The boundary was
+# observed exactly here: a sequence of 1023 tokens (1023 x 1023 scores) is
+# computed correctly, one of 1024 (2**20 scores) is not, with or without
+# an attention mask and however that mask is built. Computing the rows of
+# a 1024-token sequence in two halves (512 x 1024 scores each) is correct
+# again.
+ATTENTION_SCORE_ELEMENT_LIMIT = 1 << 20
+
+# Metadata key under which the FP16 range conditioning is recorded.
+FP16_RANGE_CONDITIONING_KEY = "fp16_range_conditioning"
+
+# Peak magnitude the residual stream is brought near by
+# :func:`residual_divisor`. Float16 ends at 65504, so a peak around 2**10
+# leaves a factor of about 64 for inputs that drive the stream harder than
+# the calibration sentences did, while keeping the stream itself far above
+# the float16 resolution.
+RESIDUAL_PEAK_TARGET = 1024.0
+
+# Root mean square each MLP output is brought near by
+# :func:`mlp_output_gain`. The normalization that reads the MLP output
+# squares it first; around 1 the squares sit in the middle of the float16
+# range, as far from its underflow as from its overflow.
+MLP_OUTPUT_RMS_TARGET = 1.0
+
+# Bounds on the exponents of the two kinds of power-of-two factors. A
+# residual divisor below 1 is never used: a stream that already fits
+# float16 is left as it is. The upper bounds are far beyond anything a
+# working model calls for (they allow factors of 65536); they only keep a
+# degenerate measurement from producing a normalization constant that
+# float32 itself can no longer hold.
+MAX_RESIDUAL_DIVISOR_EXPONENT = 16
+MAX_GAIN_EXPONENT = 16
+
+# Attribute of the model object under which the applied conditioning is
+# remembered. The conditioning rewrites weights, so applying it a second
+# time to the same model would compound it; the record on the model is
+# what makes a repeated request return the first result instead.
+_CONDITIONING_ATTRIBUTE = "_eeane_fp16_range_conditioning"
+
 # Sanity fixtures per kind, as handed to the pipeline and the self-check:
 # the shared per-language sets, unchanged. Embeddings are compared row by
 # row against their own baseline and carry no ordering expectation.
@@ -199,6 +277,221 @@ def patch_repeat_kv() -> None:
     modeling_gemma3.repeat_kv = decoder_patches.repeat_kv
 
 
+def _static_size(tensor: torch.Tensor, dim: int) -> int:
+    """Return one dimension of ``tensor`` as a plain Python integer.
+
+    While a module is being traced, a tensor's size is handed out as a
+    traced value, and arithmetic or slicing on it is recorded as shape
+    operations in the graph. Every graph compiled here has fixed shapes,
+    so the size is deliberately read as the constant it is; the tracer's
+    warning that the value will be treated as a constant states the
+    intention and is therefore silenced for this one conversion.
+
+    Args:
+        tensor: Tensor whose size is read.
+        dim: Dimension to read.
+
+    Returns:
+        The size of ``tensor`` along ``dim``.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=torch.jit.TracerWarning)
+        return int(tensor.shape[dim])
+
+
+def attention_query_rows(num_queries: int, num_keys: int) -> int:
+    """Return how many query rows one attention score matrix may hold.
+
+    The row count starts at the whole sequence and is halved (rounding
+    up) until rows x keys falls strictly below
+    :data:`ATTENTION_SCORE_ELEMENT_LIMIT`. A sequence whose full score
+    matrix is already below the limit therefore keeps all of its rows,
+    which means its attention is not split at all.
+
+    Args:
+        num_queries: Number of query positions.
+        num_keys: Number of key positions.
+
+    Returns:
+        The largest row count reached by halving that keeps one score
+        matrix below the limit; never less than 1, which is as far as rows
+        can be split when the keys alone reach the limit.
+    """
+    rows = num_queries
+    while rows > 1 and rows * num_keys >= ATTENTION_SCORE_ELEMENT_LIMIT:
+        rows = (rows + 1) // 2
+    return rows
+
+
+def _attention_rows(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    keys_transposed: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float,
+    scaling: float,
+    softcap: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attend from a range of query rows to all keys, as upstream does.
+
+    This is the upstream eager attention from the score product up to the
+    product with the values, in the same order of operations. Each query
+    row is computed from that row alone -- the softmax runs over the keys
+    -- so the rows of a sequence may be computed in any number of ranges.
+
+    Args:
+        module: The attention module; only its training flag is read.
+        query: Query states of the rows, shape ``(B, heads, rows, D)``.
+        keys_transposed: Key states, shape ``(B, heads, D, keys)``.
+        value_states: Value states, shape ``(B, heads, keys, D)``.
+        attention_mask: Additive mask for these rows, or ``None``.
+        dropout: Dropout probability of the attention weights.
+        scaling: Factor applied to the scores.
+        softcap: Soft cap applied to the scores, or ``None``.
+
+    Returns:
+        Tuple ``(output, weights)`` of shapes ``(B, heads, rows, D)`` and
+        ``(B, heads, rows, keys)``.
+    """
+    attn_weights = torch.matmul(query, keys_transposed) * scaling
+    if softcap is not None:
+        attn_weights = attn_weights / softcap
+        attn_weights = torch.tanh(attn_weights)
+        attn_weights = attn_weights * softcap
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    # The softmax is taken in float32 whatever the precision of the states.
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
+    attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    return torch.matmul(attn_weights, value_states), attn_weights
+
+
+def _eager_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    softcap: float | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute eager attention, splitting the query rows of a long sequence.
+
+    Takes the arguments of the upstream function it replaces and returns
+    the same two tensors. When the score matrix of one head stays below
+    :data:`ATTENTION_SCORE_ELEMENT_LIMIT` the operations are the upstream
+    ones in the upstream order. Otherwise the query rows are cut into the
+    ranges :func:`attention_query_rows` allows, each range is attended
+    with its own rows of the mask, and the results are concatenated back
+    along the sequence axis. No query row depends on another, so the two
+    ways produce the same numbers.
+
+    The ranges are cut with constant indices rather than with a chunking
+    operation: the sequence length is a constant of the traced graph, a
+    chunk operation fails to convert, and constant slices leave no shape
+    arithmetic behind. The key/value expansion is looked up in the
+    upstream module at call time, so its own replacement stays in effect.
+
+    Args:
+        module: The attention module calling this function.
+        query: Query states, shape ``(B, heads, S, D)``.
+        key: Key states, shape ``(B, key/value heads, K, D)``.
+        value: Value states, shape ``(B, key/value heads, K, D)``.
+        attention_mask: Additive mask of shape ``(B, 1, S, >=K)`` (or with
+            a single row broadcast over all queries), or ``None``.
+        dropout: Dropout probability of the attention weights.
+        scaling: Factor applied to the scores; the head dimension's
+            inverse square root when ``None``.
+        softcap: Soft cap applied to the scores, or ``None``.
+        **kwargs: Accepted and ignored, as upstream does.
+
+    Returns:
+        Tuple ``(attn_output, attn_weights)`` of shapes ``(B, S, heads,
+        D)`` and ``(B, heads, S, K)``.
+    """
+    if scaling is None:
+        scaling = module.head_dim**-0.5
+
+    key_states = modeling_gemma3.repeat_kv(key, module.num_key_value_groups)
+    value_states = modeling_gemma3.repeat_kv(value, module.num_key_value_groups)
+    keys_transposed = key_states.transpose(2, 3)
+
+    num_queries = _static_size(query, 2)
+    num_keys = _static_size(key_states, 2)
+    if attention_mask is not None:
+        # Whatever the length of the mask, only the columns of the keys
+        # at hand are used.
+        attention_mask = attention_mask[:, :, :, :num_keys]
+
+    rows = attention_query_rows(num_queries, num_keys)
+    if rows >= num_queries:
+        # Nothing to split. This path must not go through a split and a
+        # concatenation of one piece: besides being pointless, a
+        # single-piece split is something the converter does not accept.
+        attn_output, attn_weights = _attention_rows(
+            module,
+            query,
+            keys_transposed,
+            value_states,
+            attention_mask,
+            dropout,
+            scaling,
+            softcap,
+        )
+        return attn_output.transpose(1, 2).contiguous(), attn_weights
+
+    # A mask holding one row for all queries is broadcast, not cut.
+    mask_has_query_rows = attention_mask is not None and _static_size(attention_mask, 2) != 1
+    outputs: list[torch.Tensor] = []
+    weights: list[torch.Tensor] = []
+    for start in range(0, num_queries, rows):
+        # The last range is shorter when the rows do not divide evenly.
+        stop = min(start + rows, num_queries)
+        mask_rows = attention_mask
+        if attention_mask is not None and mask_has_query_rows:
+            mask_rows = attention_mask[:, :, start:stop, :]
+        range_output, range_weights = _attention_rows(
+            module,
+            query[:, :, start:stop, :],
+            keys_transposed,
+            value_states,
+            mask_rows,
+            dropout,
+            scaling,
+            softcap,
+        )
+        outputs.append(range_output)
+        weights.append(range_weights)
+    attn_output = torch.cat(outputs, dim=2)
+    attn_weights = torch.cat(weights, dim=2)
+    return attn_output.transpose(1, 2).contiguous(), attn_weights
+
+
+def patch_attention_query_chunks() -> None:
+    """Replace the eager attention with one that splits long query axes.
+
+    On the Neural Engine, an attention whose per-head score matrix holds
+    :data:`ATTENTION_SCORE_ELEMENT_LIMIT` elements or more returns wrong
+    numbers, although the same program is correct on the CPU. The
+    replacement computes the query rows of such a sequence in a few
+    ranges, each with a score matrix below the limit, and concatenates
+    them; every row of an attention is independent of the others, so the
+    result is what upstream computes. Below the limit nothing is split
+    and the operations are the upstream ones.
+
+    Rebinds the module-level function, which the attention module looks
+    up at call time and only uses for the eager implementation, so the
+    replacement takes effect for every eager Gemma 3 model in the process.
+    Re-applying it is harmless.
+    """
+    modeling_gemma3.eager_attention_forward = _eager_attention_forward
+
+
 # The graph rewrites of this architecture, in the order they are applied,
 # each under the name it is recorded with in a compiled variant's
 # metadata. A rewrite added later -- another function rebinding something
@@ -206,7 +499,333 @@ def patch_repeat_kv() -> None:
 PATCHES: tuple[tuple[str, Callable[[], None]], ...] = (
     ("rotate_half_static", patch_rotate_half),
     ("repeat_kv_rank4", patch_repeat_kv),
+    ("attention_query_chunks", patch_attention_query_chunks),
 )
+
+
+@dataclass(frozen=True)
+class ActivationRanges:
+    """What :func:`measure_activation_ranges` observed on one model.
+
+    Attributes:
+        residual_peak: Largest absolute value the residual stream took,
+            over every layer, input and position; ``nan`` when any of it
+            was not finite, ``0.0`` when nothing was measured.
+        mlp_output_rms: Root mean square of each layer's MLP output, in
+            layer order, over every input, position and dimension; ``0.0``
+            for a layer nothing was measured on.
+        inputs: Number of inputs the measurement ran over.
+    """
+
+    residual_peak: float
+    mlp_output_rms: tuple[float, ...]
+    inputs: int
+
+
+def _calibration_texts() -> tuple[str, ...]:
+    """Return the fixed sentences the activation ranges are measured on.
+
+    The tracing example plus every language set of the shared sanity
+    fixtures: a small fixed collection that covers the scripts the
+    compiled model is checked on, so the measurement is reproducible and
+    costs a handful of forward passes.
+    """
+    return (TRACE_EXAMPLE_TEXT, *(text for _, texts in SANITY_TEXT_SETS for text in texts))
+
+
+def measure_activation_ranges(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    texts: Sequence[str],
+    max_length: int | None = None,
+) -> ActivationRanges:
+    """Measure the residual-stream peak and the MLP output level of a model.
+
+    Each text is encoded on its own, without padding, and run through the
+    model in the precision it was loaded in, with the plain 2-D attention
+    mask. Two things are read off the inputs of the normalization layers,
+    and nothing about the model is changed:
+
+    * the residual stream is what each layer's two pre-normalizations and
+      the final normalization read, so the largest absolute value among
+      those inputs is the peak of the stream;
+    * each layer's MLP output is what its post-feedforward normalization
+      reads, so the mean square of that input gives the level of the MLP
+      output.
+
+    Args:
+        model: The loaded text model, in eval mode.
+        tokenizer: Its tokenizer.
+        texts: Sentences to measure on.
+        max_length: Length the encodings are truncated to; ``None`` for
+            no truncation.
+
+    Returns:
+        The measured ranges. A text that encodes to no token at all is
+        skipped and not counted.
+    """
+    layers = list(model.layers)
+    residual_peaks: list[float] = []
+    square_sums = [0.0] * len(layers)
+    element_counts = [0] * len(layers)
+
+    def watch_residual(_module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+        residual_peaks.append(float(args[0].detach().abs().max()))
+
+    def watch_mlp_output(index: int) -> Callable[[torch.nn.Module, tuple[Any, ...]], None]:
+        def hook(_module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+            values = args[0].detach().to(torch.float64)
+            square_sums[index] += float(values.pow(2).sum())
+            element_counts[index] += values.numel()
+
+        return hook
+
+    handles = []
+    inputs = 0
+    try:
+        for index, layer in enumerate(layers):
+            handles.append(layer.input_layernorm.register_forward_pre_hook(watch_residual))
+            handles.append(
+                layer.pre_feedforward_layernorm.register_forward_pre_hook(watch_residual)
+            )
+            handles.append(
+                layer.post_feedforward_layernorm.register_forward_pre_hook(watch_mlp_output(index))
+            )
+        handles.append(model.norm.register_forward_pre_hook(watch_residual))
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            for text in texts:
+                encoded = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=max_length is not None,
+                    max_length=max_length,
+                )
+                input_ids = encoded["input_ids"]
+                if input_ids.shape[-1] == 0:
+                    continue
+                model(
+                    input_ids=input_ids.to(device),
+                    attention_mask=encoded["attention_mask"].to(device),
+                )
+                inputs += 1
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # ``max`` would silently step over a NaN; a stream that is not finite
+    # must be reported as such, so that no factor is derived from it.
+    if all(math.isfinite(peak) for peak in residual_peaks):
+        residual_peak = max(residual_peaks, default=0.0)
+    else:
+        residual_peak = math.nan
+    mlp_output_rms = tuple(
+        math.sqrt(square_sum / count) if count else 0.0
+        for square_sum, count in zip(square_sums, element_counts, strict=True)
+    )
+    return ActivationRanges(
+        residual_peak=residual_peak, mlp_output_rms=mlp_output_rms, inputs=inputs
+    )
+
+
+def _power_of_two_factor(ratio: float, min_exponent: int, max_exponent: int) -> float:
+    """Round ``ratio`` to the nearest power of two within exponent bounds.
+
+    Every factor of the range conditioning is a power of two because
+    multiplying or dividing a binary floating-point number by one changes
+    its exponent only: neither float32 nor float16 rounds the mantissa,
+    so the rescaled weights carry exactly the precision of the original
+    ones.
+
+    Args:
+        ratio: The factor that would be exact for the measured value.
+        min_exponent: Smallest exponent allowed.
+        max_exponent: Largest exponent allowed.
+
+    Returns:
+        ``2.0 ** e`` with ``e`` the rounded binary logarithm of ``ratio``
+        clamped to the bounds; ``1.0`` -- no rescaling -- when ``ratio``
+        is not a positive finite number, since nothing can be derived from
+        a measurement that is zero, negative, infinite or NaN.
+    """
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        return 1.0
+    exponent = round(math.log2(ratio))
+    return 2.0 ** max(min_exponent, min(max_exponent, exponent))
+
+
+def residual_divisor(residual_peak: float) -> float:
+    """Return the power of two the residual stream is divided by.
+
+    The divisor brings the measured peak of the stream to about
+    :data:`RESIDUAL_PEAK_TARGET`. It is never below 1: a stream that is
+    already at or under the target is left alone.
+
+    Args:
+        residual_peak: Measured peak magnitude of the residual stream.
+
+    Returns:
+        The divisor, a power of two of at least 1; ``1.0`` when the peak
+        is not a positive finite number.
+    """
+    if not math.isfinite(residual_peak) or residual_peak <= 0.0:
+        return 1.0
+    return _power_of_two_factor(
+        residual_peak / RESIDUAL_PEAK_TARGET, 0, MAX_RESIDUAL_DIVISOR_EXPONENT
+    )
+
+
+def mlp_output_gain(mlp_output_rms: float) -> float:
+    """Return the power of two one layer's MLP output is multiplied by.
+
+    The gain brings the measured root mean square of the MLP output to
+    about :data:`MLP_OUTPUT_RMS_TARGET`.
+
+    Args:
+        mlp_output_rms: Measured root mean square of the layer's MLP
+            output.
+
+    Returns:
+        The gain, a power of two; ``1.0`` when the measurement is not a
+        positive finite number.
+    """
+    if not math.isfinite(mlp_output_rms) or mlp_output_rms <= 0.0:
+        return 1.0
+    return _power_of_two_factor(
+        MLP_OUTPUT_RMS_TARGET / mlp_output_rms, -MAX_GAIN_EXPONENT, MAX_GAIN_EXPONENT
+    )
+
+
+def _check_power_of_two(name: str, value: float) -> None:
+    """Refuse a conditioning factor that is not a positive power of two.
+
+    Raises:
+        ValueError: If ``value`` is not finite, not positive, or has a
+            mantissa other than that of a power of two.
+    """
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0.0
+        or math.frexp(value)[0] != 0.5
+    ):
+        raise ValueError(f"{name} must be a positive power of two (got {value!r})")
+
+
+def condition_fp16_ranges(model: torch.nn.Module, divisor: float, gains: Sequence[float]) -> None:
+    """Rescale a model's activations into the float16 range, in place.
+
+    Only weights, one buffer and the ``eps`` attributes of normalization
+    layers are rewritten; no forward code changes, and in float32 the
+    model computes the same function as before. Two rescalings are
+    applied, each undone by the normalization layers that read what it
+    scaled:
+
+    * **The residual stream is divided by ``divisor``.** Everything
+      written to the stream is divided: the embedding, through its scale
+      buffer, and the two branch outputs of every layer, through the
+      weights of the post-attention and post-feedforward normalizations
+      (upstream multiplies their output by ``1 + weight``, so storing
+      ``(1 + weight) / divisor - 1`` divides it). Everything read from
+      the stream goes through a normalization computing
+      ``x / sqrt(mean(x**2) + eps)``; dividing its ``eps`` by
+      ``divisor**2`` makes that expression return for ``x / divisor``
+      exactly what it returned for ``x``.
+    * **Each MLP output is multiplied by that layer's gain.** The output
+      projection of the MLP is multiplied by the gain, and the ``eps`` of
+      the post-feedforward normalization reading it by the gain squared,
+      which by the same identity leaves that normalization's output
+      unchanged.
+
+    The first keeps the stream below the float16 maximum; the second
+    lifts the squares the post-feedforward normalization computes out of
+    the float16 underflow range. Both factors must be powers of two, so
+    that rescaling a weight changes its exponent and nothing else.
+
+    The function is not idempotent: applying it twice rescales twice.
+    :meth:`Gemma3Backend.apply_patches` is what applies it at most once
+    per model.
+
+    Args:
+        model: The loaded text model to rewrite.
+        divisor: Power of two the residual stream is divided by; ``1.0``
+            leaves it alone.
+        gains: Power of two each layer's MLP output is multiplied by, in
+            layer order; ``1.0`` leaves a layer alone.
+
+    Raises:
+        ValueError: If a factor is not a positive power of two, or if
+            ``gains`` does not hold one factor per layer. Nothing is
+            rewritten in either case.
+    """
+    layers = list(model.layers)
+    if len(gains) != len(layers):
+        raise ValueError(
+            f"expected one MLP output gain per layer ({len(layers)}), got {len(gains)}"
+        )
+    _check_power_of_two("the residual divisor", divisor)
+    for gain in gains:
+        _check_power_of_two("an MLP output gain", gain)
+
+    with torch.no_grad():
+        # A factor of exactly 1 is skipped rather than applied: rewriting
+        # a weight as ``(1 + w) / 1 - 1`` would round it for nothing.
+        if divisor != 1.0:
+            model.embed_tokens.embed_scale.div_(divisor)
+            model.norm.eps = model.norm.eps / divisor**2
+            for layer in layers:
+                for norm in (layer.post_attention_layernorm, layer.post_feedforward_layernorm):
+                    norm.weight.copy_((1.0 + norm.weight) / divisor - 1.0)
+                for norm in (layer.input_layernorm, layer.pre_feedforward_layernorm):
+                    norm.eps = norm.eps / divisor**2
+        for layer, gain in zip(layers, gains, strict=True):
+            if gain == 1.0:
+                continue
+            down_proj = layer.mlp.down_proj
+            down_proj.weight.mul_(gain)
+            if down_proj.bias is not None:
+                down_proj.bias.mul_(gain)
+            norm = layer.post_feedforward_layernorm
+            norm.eps = norm.eps * gain**2
+
+
+def _condition_loaded_model(loaded: LoadedModel) -> dict[str, Any]:
+    """Measure, derive and apply the range conditioning of a loaded model.
+
+    The record of what was applied is kept on the model object itself.
+    A model that already carries one is not measured or rewritten again;
+    its record is returned instead, so asking any number of times -- once
+    per compile run or once per variant -- rescales the weights once.
+
+    Args:
+        loaded: Handle whose model is rewritten in place.
+
+    Returns:
+        A JSON-serializable record: the residual divisor, the MLP output
+        gain of every layer and the number of calibration inputs.
+    """
+    model = loaded.model
+    record = getattr(model, _CONDITIONING_ATTRIBUTE, None)
+    if record is None:
+        max_length = getattr(loaded.config, MAX_POSITION_KEY, None)
+        if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length <= 0:
+            max_length = None
+        ranges = measure_activation_ranges(
+            model, loaded.tokenizer, _calibration_texts(), max_length=max_length
+        )
+        divisor = residual_divisor(ranges.residual_peak)
+        gains = [mlp_output_gain(rms) for rms in ranges.mlp_output_rms]
+        condition_fp16_ranges(model, divisor, gains)
+        record = {
+            "residual_divisor": divisor,
+            "mlp_output_gains": gains,
+            "calibration_inputs": ranges.inputs,
+        }
+        setattr(model, _CONDITIONING_ATTRIBUTE, record)
+    # A copy, so that a caller editing its metadata cannot alter what the
+    # model remembers.
+    return copy.deepcopy(record)
 
 
 def build_bidirectional_masks(
@@ -429,15 +1048,24 @@ class Gemma3Backend:
     def apply_patches(
         self, loaded: LoadedModel, mask_fill_value: float | None = None
     ) -> dict[str, Any]:
-        """Apply the mandatory Gemma 3 graph patches.
+        """Apply the mandatory Gemma 3 graph patches and range conditioning.
 
         Every rewrite in :data:`PATCHES` is a constituent of the
         conversion rather than an optional tweak -- without them the model
-        either fails to convert or converts into a program that runs on
-        the CPU -- so all of them are always applied. They patch global
-        ``transformers`` symbols and therefore affect every Gemma 3
-        instance in the process; all are semantically equivalent to
-        upstream, and re-applying them is harmless.
+        fails to convert, converts into a program that runs on the CPU,
+        or computes wrong numbers on the Neural Engine -- so all of them
+        are always applied. They patch global ``transformers`` symbols and
+        therefore affect every Gemma 3 instance in the process; all are
+        semantically equivalent to upstream, and re-applying them is
+        harmless.
+
+        After them, the activations of ``loaded.model`` are rescaled into
+        the float16 range (:func:`condition_fp16_ranges`), with factors
+        measured on that model (:func:`measure_activation_ranges`). This
+        rewrites the weights of that one model object, not a global
+        symbol: a copy loaded separately, such as the FP32 baseline's, is
+        unaffected. The rescaled model computes the same function, and a
+        model is rescaled once however often this method is called on it.
 
         Args:
             loaded: Handle returned by :meth:`load`.
@@ -449,14 +1077,16 @@ class Gemma3Backend:
                 very value.
 
         Returns:
-            The applied rewrites plus the mask fill value the traced graph
-            uses, recorded verbatim in the compiled variant's metadata.
+            The applied rewrites, the mask fill value the traced graph
+            uses and, under :data:`FP16_RANGE_CONDITIONING_KEY`, the
+            factors of the range conditioning; recorded verbatim in the
+            compiled variant's metadata.
 
         Raises:
             ValueError: If the rotary head dimension is odd (which would
                 make the ``chunk``-based ``rotate_half`` inexact), or if a
                 mask fill value other than :data:`MASK_FILL_VALUE` is
-                requested. Nothing is rebound in either case.
+                requested. Nothing is rebound or rescaled in either case.
         """
         head_dim = _rope_head_dim(loaded.config)
         if head_dim % 2 != 0:
@@ -473,6 +1103,7 @@ class Gemma3Backend:
             patch()
             applied[patch_name] = True
         applied["mask_fill_value"] = MASK_FILL_VALUE
+        applied[FP16_RANGE_CONDITIONING_KEY] = _condition_loaded_model(loaded)
         return applied
 
     def wrap(self, loaded: LoadedModel) -> torch.nn.Module:
