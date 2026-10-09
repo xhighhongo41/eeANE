@@ -30,20 +30,27 @@ KINDS: tuple[str, ...] = (KIND_EMBEDDING, KIND_RERANKER)
 SUPPORTED_ARCHITECTURES = (
     "BERT embedding models (e.g. BAAI/bge-large-en-v1.5), "
     "ModernBERT (e.g. cl-nagoya/ruri-v3-310m), "
-    "XLM-RoBERTa / RoBERTa (e.g. intfloat/multilingual-e5-base, BAAI/bge-reranker-v2-m3) and "
-    "Qwen3 decoder-style models (e.g. Qwen/Qwen3-Embedding-0.6B, Qwen/Qwen3-Reranker-0.6B)"
+    "XLM-RoBERTa / RoBERTa (e.g. intfloat/multilingual-e5-base, BAAI/bge-reranker-v2-m3), "
+    "Qwen3 decoder-style models (e.g. Qwen/Qwen3-Embedding-0.6B, Qwen/Qwen3-Reranker-0.6B) and "
+    "Gemma 3 bidirectional embedding models (e.g. google/embeddinggemma-300m)"
 )
 
 # Architecture-name prefix -> "module:attribute" of the backend class. The
 # value is a string so that selecting a backend never imports torch. No key
 # may start with another key, or prefix matching would depend on the order
 # of this mapping.
+#
+# ``Gemma3Text`` is spelled out in full on purpose: the shorter ``Gemma3``
+# would also capture the multimodal model of that family and the models of
+# a later generation whose names merely begin the same way, none of which
+# the backend registered here implements.
 BACKEND_REGISTRY: dict[str, str] = {
     "Bert": "eeane.compiler.backends.bert:BertBackend",
     "ModernBert": "eeane.compiler.backends.modernbert:ModernBertBackend",
     "XLMRoberta": "eeane.compiler.backends.xlm_roberta:XlmRobertaBackend",
     "Roberta": "eeane.compiler.backends.xlm_roberta:XlmRobertaBackend",
     "Qwen3": "eeane.compiler.backends.qwen3:Qwen3Backend",
+    "Gemma3Text": "eeane.compiler.backends.gemma3:Gemma3Backend",
 }
 
 # Architecture-name suffix that identifies a cross-encoder reranker.

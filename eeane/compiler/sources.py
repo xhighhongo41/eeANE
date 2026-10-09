@@ -218,6 +218,38 @@ def _download_snapshot(repo_id: str, revision: str | None, *, allow_pickle: bool
     return snapshot_dir.resolve()
 
 
+def _access_guidance(exc: Exception) -> str:
+    """Return a remediation hint when a Hub failure signals missing access.
+
+    Only the exception class and HTTP status are inspected; no credential is
+    read, stored or printed.
+
+    Args:
+        exc: The exception raised by the Hub download.
+
+    Returns:
+        A short hint for gated repos or authentication failures, or an empty
+        string for any other failure.
+    """
+    from huggingface_hub import errors as hub_errors
+
+    if isinstance(exc, hub_errors.GatedRepoError):
+        return (
+            "This repository is gated: open its page on the Hugging Face Hub and "
+            "accept its terms, log in with `hf auth login`, then run again."
+        )
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(exc, hub_errors.RepositoryNotFoundError) or (
+        isinstance(exc, hub_errors.HfHubHTTPError) and status in (401, 403)
+    ):
+        return (
+            "The repository may be private, require accepting its terms, or the repo id "
+            "may be wrong: check the repo id, accept any terms on the model page, "
+            "log in with `hf auth login`, then run again."
+        )
+    return ""
+
+
 def _fetch_snapshot(
     huggingface_hub_module: Any,
     repo_id: str,
@@ -251,9 +283,11 @@ def _fetch_snapshot(
             allow_patterns=list(allow_patterns),
         )
     except Exception as exc:
-        raise SourceError(
-            f"failed to download '{repo_id}' from the Hugging Face Hub: {exc}"
-        ) from exc
+        message = f"failed to download '{repo_id}' from the Hugging Face Hub: {exc}"
+        guidance = _access_guidance(exc)
+        if guidance:
+            message = f"{message}\n{guidance}"
+        raise SourceError(message) from exc
 
     snapshot_dir = Path(snapshot)
     if not snapshot_dir.is_dir():

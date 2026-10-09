@@ -9,6 +9,8 @@ from typing import Any
 
 import huggingface_hub
 import pytest
+import requests
+from huggingface_hub import errors as hub_errors
 
 from eeane.compiler import sources
 
@@ -475,6 +477,82 @@ def test_resolve_source_wraps_download_failures(
 
     assert "org/name" in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def _raise_from_hub(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    """Make snapshot_download raise ``exc`` without touching the network."""
+
+    def boom(**_kwargs: Any) -> str:
+        raise exc
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", boom)
+
+
+def _http_response(status_code: int) -> requests.Response:
+    """Build a bare HTTP response carrying only a status code."""
+    response = requests.Response()
+    response.status_code = status_code
+    return response
+
+
+def test_resolve_source_gated_repo_error_adds_terms_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gated-repo failure must tell the user to accept the terms and log in."""
+    _raise_from_hub(monkeypatch, hub_errors.GatedRepoError("gated"))
+
+    with pytest.raises(sources.SourceError) as excinfo:
+        sources.resolve_source("org/name")
+
+    message = str(excinfo.value)
+    assert message.startswith("failed to download 'org/name' from the Hugging Face Hub: gated")
+    assert "accept its terms" in message
+    assert "hf auth login" in message
+    assert isinstance(excinfo.value.__cause__, hub_errors.GatedRepoError)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        hub_errors.RepositoryNotFoundError("missing"),
+        hub_errors.HfHubHTTPError("unauthorized", response=_http_response(401)),
+        hub_errors.HfHubHTTPError("forbidden", response=_http_response(403)),
+    ],
+)
+def test_resolve_source_auth_failure_adds_login_guidance(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    """Auth-looking failures must suggest checking the id and logging in."""
+    _raise_from_hub(monkeypatch, exc)
+
+    with pytest.raises(sources.SourceError) as excinfo:
+        sources.resolve_source("org/name")
+
+    message = str(excinfo.value)
+    assert message.startswith("failed to download 'org/name' from the Hugging Face Hub: ")
+    assert "hf auth login" in message
+    assert "repo id" in message
+    assert "accept its terms" not in message
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError("network unreachable"),
+        hub_errors.HfHubHTTPError("server error", response=_http_response(500)),
+        hub_errors.HfHubHTTPError("no response"),
+    ],
+)
+def test_resolve_source_other_failures_get_no_guidance(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    """Failures unrelated to access keep the plain message."""
+    _raise_from_hub(monkeypatch, exc)
+
+    with pytest.raises(sources.SourceError) as excinfo:
+        sources.resolve_source("org/name")
+
+    assert str(excinfo.value) == (f"failed to download 'org/name' from the Hugging Face Hub: {exc}")
 
 
 def test_resolve_source_errors_when_snapshot_path_is_missing(

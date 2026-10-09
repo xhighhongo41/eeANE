@@ -64,6 +64,7 @@ from safetensors import safe_open
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3 import modeling_qwen3
 
+from eeane.compiler.backends import decoder_patches
 from eeane.compiler.backends.base import (
     SCORE_SPACE_LOGIT,
     LoadedModel,
@@ -148,12 +149,12 @@ SAFETENSORS_SUFFIX = ".safetensors"
 TIE_WORD_EMBEDDINGS_KEY = "tie_word_embeddings"
 
 # Additive value written into the masked-out positions of the attention
-# mask. The value the framework itself uses is the float32 minimum, which
-# is not representable in FP16: once the converted graph runs in FP16 it
-# becomes -inf, and a row whose keys are all masked then computes
-# -inf - (-inf) = NaN inside the softmax. -1e4 is exact in FP16, drives
-# exp() to exactly 0.0 in both precisions, and keeps such a row finite.
-MASK_FILL_VALUE = -1e4
+# mask: a finite number, because the float32 minimum the framework itself
+# uses turns into -inf once the converted graph runs in FP16. The value
+# and the full reasoning are shared by every decoder-style backend, so
+# they live in :mod:`eeane.compiler.backends.decoder_patches`; the name is
+# kept here for the callers that read it off this backend.
+MASK_FILL_VALUE = decoder_patches.MASK_FILL_VALUE
 
 # Model directory file, and the keys read from it. ``model_type`` is what
 # distinguishes this architecture from its relatives, which the
@@ -244,14 +245,12 @@ def patch_rotate_half() -> None:
 
     Rebinds the module-level function, which the rotary helper looks up at
     call time, so the replacement takes effect for every Qwen3 model in
-    the process. Re-applying it is harmless.
+    the process. Re-applying it is harmless. The replacement body itself
+    is :func:`eeane.compiler.backends.decoder_patches.rotate_half`, shared
+    with the other decoder-style backends; which module it is bound into
+    is what this function decides.
     """
-
-    def rotate_half(x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
-    modeling_qwen3.rotate_half = rotate_half
+    modeling_qwen3.rotate_half = decoder_patches.rotate_half
 
 
 def patch_repeat_kv() -> None:
@@ -270,15 +269,13 @@ def patch_repeat_kv() -> None:
     expansion by one returns the input untouched.
 
     Rebinds the module-level function, so the replacement takes effect for
-    every Qwen3 model in the process. Re-applying it is harmless.
+    every Qwen3 model in the process. Re-applying it is harmless. The
+    replacement body itself is
+    :func:`eeane.compiler.backends.decoder_patches.repeat_kv`, shared with
+    the other decoder-style backends; which module it is bound into is
+    what this function decides.
     """
-
-    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-        if n_rep == 1:
-            return hidden_states
-        return hidden_states.repeat_interleave(n_rep, dim=1)
-
-    modeling_qwen3.repeat_kv = repeat_kv
+    modeling_qwen3.repeat_kv = decoder_patches.repeat_kv
 
 
 def build_causal_padding_mask(

@@ -48,7 +48,7 @@ coremltools, numpy, or tokenizers must be accompanied by:
    ruri-v3-reranker-310m; BERT: bge-base-en-v1.5, embedding only;
    XLM-RoBERTa: multilingual-e5-base,
    bge-reranker-v2-m3, and bge-m3, the last of which also exercises the
-   `--allow-pickle` path),
+   `--allow-pickle` path; Gemma 3: embeddinggemma-300m, embedding only),
 2. all self-checks passing (accuracy sanity, NE placement, warm latency
    recorded — the self-check is the designed detector for a conversion
    silently degrading),
