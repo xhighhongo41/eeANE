@@ -31,12 +31,12 @@ and most of your unified memory free for other work.
 - **Multi-model serving** with per-request routing, admission control
   (429/503 + `Retry-After`), identical-request coalescing, and graceful
   shutdown.
-- **Four architecture families supported today**: ModernBERT and
+- **Five architecture families supported today**: ModernBERT and
   XLM-RoBERTa (both embedding and cross-encoder reranker models), BERT
-  (embedding models only), and Qwen3 (decoder-only: embedding models
+  (embedding models only), Qwen3 (decoder-only: embedding models
   that pool the sequence's last token, and generative rerankers that
-  score from a yes/no logit pair instead of a classification head).
-  More are planned.
+  score from a yes/no logit pair instead of a classification head), and
+  Gemma 3 (bidirectional embedding models only). More are planned.
 
 ## Requirements
 
@@ -154,7 +154,7 @@ curl -s http://127.0.0.1:7997/v1/embeddings \
 ### About `eeane compile`
 
 `eeane compile` picks the model backend from the model's `config.json`.
-Four architecture families are supported: **ModernBERT** and
+Five architecture families are supported: **ModernBERT** and
 **XLM-RoBERTa** (both embedding and cross-encoder reranker models),
 **BERT** (embedding models only — a BERT cross-encoder reranker is
 rejected instead, because the compiled graph would have to pin its
@@ -162,14 +162,15 @@ segment ids to zero, which changes the meaning of a query/document pair
 for this architecture), and **Qwen3** (decoder-only: embedding models
 that pool the sequence's last token, and generative rerankers that score
 a query/document pair from two vocabulary logits instead of a
-classification head — see below). `RobertaModel`-architecture models are
+classification head — see below), and **Gemma 3** (bidirectional
+embedding models only — see below). `RobertaModel`-architecture models are
 routed to the XLM-RoBERTa backend as well — transformers implements
 RoBERTa and XLM-RoBERTa as the same encoder, differing only in
 vocabulary. More families are planned. For embedding models, every
 backend detects the pooling declared by the model directory's
 sentence-transformers `1_Pooling/config.json` and compiles the matching
-graph — mean or CLS pooling for the three encoder backends, and
-last-token pooling for Qwen3 only, since last-token pooling assumes a
+graph — mean or CLS pooling for the three encoder backends, mean
+pooling for Gemma 3, and last-token pooling for Qwen3 only, since last-token pooling assumes a
 causal (left-to-right) architecture that the encoder backends do not
 have; an embedding model that does not declare a supported pooling mode
 is rejected with an error rather than compiled on a guess, because an
@@ -257,6 +258,16 @@ difference, just as it returns a raw logit for the other reranker
 architectures. The API itself does not change at all — callers do not
 need to know whether a served reranker is generative.
 
+The Gemma 3 backend compiles bidirectional embedding models such as
+`google/embeddinggemma-300m` (mean pooling followed by two Dense
+projections, 768-dimensional output; L2 normalization is applied by the
+server). Generative (causal) Gemma 3, multimodal Gemma 3 and Gemma 3n
+models are not supported: `eeane compile` rejects them with an error that
+gives the reason. Gemma 3's activations do not fit in float16 as they
+are, so the compiler applies function-preserving rewrites to the copy of
+the model it converts; see [Measured accuracy and speed
+(EmbeddingGemma)](#measured-accuracy-and-speed-embeddinggemma).
+
 ### Verified models
 
 Every model below was compiled from its stock Hugging Face
@@ -269,7 +280,7 @@ maximum sequence length. Models are grouped by the backend their
 predict it (`paraphrase-multilingual-mpnet-base-v2` is an
 XLM-RoBERTa model, and `multilingual-e5-small` is a BERT one).
 
-Any other model built on one of these four architectures is likely to
+Any other model built on one of these five architectures is likely to
 work as well; these are simply the ones that have been run end to end.
 
 **ModernBERT**
@@ -366,6 +377,83 @@ differently once compiled.
 |---|---|---|
 | Qwen/Qwen3-Embedding-0.6B | embedding | 128/512/1024 |
 | Qwen/Qwen3-Reranker-0.6B | reranker | 512/1024 |
+
+These two models were verified on macOS 26.6.2; see Known limitations for
+what changes on macOS 27.0.1.
+
+**Gemma 3 (bidirectional embedding models only)**
+
+| Model | Type | Buckets |
+|---|---|---|
+| google/embeddinggemma-300m <sup>2</sup> | embedding | 128/512/1024 |
+
+<sup>2</sup> Requires accepting the model's terms of use on Hugging Face
+before it can be downloaded (see Troubleshooting). eeANE converts models
+on your machine and does not distribute model weights; you are
+responsible for complying with each model's license and terms of use,
+including Gemma's.
+
+### Measured accuracy and speed (EmbeddingGemma)
+
+Measured with `google/embeddinggemma-300m` on an M2 Mac mini (16 GB,
+macOS 27.0.1), FP16 on the Neural Engine. The built-in self-check passes
+for every default bucket; its measurements are in the table below.
+
+| Bucket | Cosine vs. FP32 (en / ja / zh) | NE placement | Warm latency (median) |
+|---|---|---|---|
+| 128 | 0.99936 / 0.99934 / 0.99914 | 99.3% | 5.05 ms |
+| 512 | 0.99936 / 0.99934 / 0.99926 | 99.2% | 24.98 ms |
+| 1024 | 0.99936 / 0.99934 / 0.99926 | 99.2% | 68.94 ms |
+
+**Agreement with the original model.** The reference is
+sentence-transformers 5.7.0 `encode` run on the CPU in FP32, one input at
+a time; each row is the per-input cosine against the compiled model run
+on the Neural Engine.
+
+| Condition | Inputs | Bucket (tokens) | Cosine min | Cosine mean |
+|---|---|---|---|---|
+| No prefix (short en / ja / zh texts) | 9 | 128 (11–37) | 0.99914 | 0.99938 |
+| Query (`prompt_name="query"` vs. the same string concatenated client-side) | 9 | 128 (18–45) | 0.99930 | 0.99945 |
+| Document (`prompt_name="document"` vs. client-side concatenation) | 9 | 128 (17–44) | 0.99941 | 0.99957 |
+| Japanese paragraphs | 60 | 512 (94–512) | 0.99841 | 0.99867 |
+| Long texts | 12 | 512 (302–483) | 0.99845 | 0.99867 |
+| Long texts | 12 | 1024 (604–961) | 0.99821 | 0.99843 |
+| `dimensions` 512 / 256 / 128 | 9 each | 128 | 0.99920 / 0.99932 / 0.99944 | — |
+
+Running the same conversion steps in FP32 (in PyTorch) agrees with the
+reference at cosine 0.9999998 or better, so the differences above come
+from the arithmetic precision of FP16 and the Neural Engine, not from
+the conversion. The query and document rows show that prepending the
+prefix strings on the client gives the same result as the model's own
+`prompt_name`.
+
+**Speed.** One input at a time (batch 1), the median of 20 runs after 3
+warm-up runs, measured serially on the same Mac mini M2. eeANE's time
+covers tokenization, inference and normalization; PyTorch is
+sentence-transformers `encode` in FP32 (torch 2.7.1, 4 CPU threads).
+
+| Sequence length | eeANE (Neural Engine) | PyTorch CPU | PyTorch MPS | vs. CPU | vs. MPS |
+|---|---|---|---|---|---|
+| 128 | 7.56 ms (16,925 tokens/s) | 67.63 ms (1,893) | 82.47 ms (1,552) | 8.9x | 10.9x |
+| 512 | 27.27 ms (18,774) | 189.58 ms (2,701) | 136.32 ms (3,756) | 7.0x | 5.0x |
+| 1024 | 70.40 ms (14,545) | 510.24 ms (2,007) | 246.21 ms (4,159) | 7.2x | 3.5x |
+
+**How FP16 is handled.** The upstream model card states that this
+model's activations do not fit in float16. `eeane compile` applies
+function-preserving rewrites to the copy of the model it converts, always
+and without any flag:
+
+1. The residual stream is divided by a power of two, because values in the
+   later layers exceed float16's maximum.
+2. Each layer's MLP output is scaled up by a power of two, because it
+   becomes too small in the later layers and loses precision on the
+   Neural Engine.
+3. From sequence length 1024 up, attention is computed in chunks of the
+   query range, because a single head's score matrix reaching 2^20
+   elements gives corrupted results on the Neural Engine only.
+
+The factors are measured on short texts at conversion time and recorded
+in the artifact metadata.
 
 ### Checkpoint formats
 
@@ -569,12 +657,22 @@ Instruct: Given a web search query, retrieve relevant passages that answer the q
 Query:{the actual query text}
 ```
 
+EmbeddingGemma is designed the same way, with a prefix on documents as
+well. For retrieval, put `task: search result | query: ` before a search
+query and `title: none | text: ` before a document, in each case ahead of
+the text itself (the model card lists the formats for other tasks).
+
 From [Open WebUI](https://github.com/open-webui/open-webui) (v0.6.0 or
 later), set the `RAG_EMBEDDING_QUERY_PREFIX` environment variable to the
 instruction string so it is added to queries only, and leave
 `RAG_EMBEDDING_CONTENT_PREFIX` (documents) empty. This has been checked
 against letting `sentence-transformers` build the same embedding through
 the model's own prompt feature instead: the two agree at cosine 0.9999.
+For EmbeddingGemma, set `RAG_EMBEDDING_QUERY_PREFIX` to
+`task: search result | query: ` and `RAG_EMBEDDING_CONTENT_PREFIX` to
+`title: none | text: ` (the query and document rows in Measured accuracy
+and speed show that client-side concatenation matches the model's own
+prompts).
 
 To use eeANE from [Open WebUI](https://github.com/open-webui/open-webui):
 set the embedding engine to OpenAI with base URL
@@ -649,6 +747,14 @@ exactly (`tools/verify_server.py` in a repository checkout).
   telling that architecture's embedding and generative-reranker
   checkpoints apart. Pass `--kind embedding` or `--kind reranker`
   explicitly to compile it anyway.
+- **`eeane compile` cannot download a model that requires accepting
+  terms (for example `google/embeddinggemma-300m`)**: the model's
+  Hugging Face page asks you to agree to its terms of use before the
+  files can be downloaded. Accept them on the model page, log in with
+  `hf auth login`, and run `eeane compile` again. eeANE does not handle
+  your token itself; that is left to the Hugging Face libraries. When a
+  download fails because the terms are not accepted or you are not logged
+  in, the error now carries a line saying what to do.
 
 ## Known limitations
 
@@ -691,7 +797,8 @@ exactly (`tools/verify_server.py` in a repository checkout).
   above), but the same caution still applies whenever you compare a
   model's fp16 and fp32 output on input outside its intended languages
   yourself. Within a model's intended languages the agreement is far
-  tighter (cosine ≥ 0.9999 on every model listed above).
+  tighter (cosine ≥ 0.9999 on every model listed above except
+  EmbeddingGemma, whose measurements are in Measured accuracy and speed).
 - **Memory scales with buckets loaded, not duplicated per bucket**:
   compiled weights are memory-mapped, so serving several buckets of the
   same model does not multiply its resident memory by the bucket count.
@@ -706,6 +813,18 @@ exactly (`tools/verify_server.py` in a repository checkout).
   inference all still succeed, so the only visible symptom is much
   slower inference. In parameter count this ceiling sits at about 1.07B;
   the 0.6B models above are comfortably under it.
+- **EmbeddingGemma at bucket 2048**: the model's maximum length is 2048,
+  and `--buckets 2048` compiles, but in measurements here that bucket is
+  not placed on the Neural Engine and runs on the CPU (0% placement,
+  about 3.3 s per input). Stay with the default 128/512/1024.
+- **Qwen3 on macOS 27.0.1**: with macOS 27.0.1 the two Qwen3 models
+  (`Qwen/Qwen3-Embedding-0.6B` and `Qwen/Qwen3-Reranker-0.6B`) were not
+  placed on the Neural Engine and ran on the CPU; on macOS 26.6.2, 99.3 to
+  99.4% was placed (same artifacts, same code, only the OS differs).
+  Results stay correct but inference is slower: about 70 ms warm at
+  S=128, against 18.76 ms on 26.6.2. The other families (BERT, ModernBERT,
+  XLM-RoBERTa, Gemma 3) are placed on macOS 27.0.1 as before. The cause is
+  under investigation.
 
 ## Development
 
@@ -823,6 +942,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.6.0 | Gemma 3 (bidirectional embedding models) becomes eeANE's fifth supported architecture family, compiled through the regular `eeane compile` path and served as-is; generative, multimodal and Gemma 3n variants are rejected with a reason; function-preserving rewrites keep the model within the FP16 range; one more verified model (google/embeddinggemma-300m; 62 -> 63); fetch failures for models that require accepting terms now say what to do |
 | 1.5.0 | Qwen3 (decoder-only) becomes eeANE's fourth supported architecture family, compiled and served through the regular `eeane compile`/`eeane serve` path: last-token pooling for embedding models, and a generative reranker scored from a yes/no logit pair instead of a classification head; model-kind detection for `ForCausalLM` architectures now reads the model's sentence-transformers module declaration instead of the architecture name alone; two verified models (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B) |
 | 1.4.5 | Adds `poc_qwen/`, a study of whether decoder-only (causal LM) embedding models run on the Neural Engine, and of how large a model can get before it stops being accepted there; no engine changes |
 | 1.4.0 | Compile self-check now scores three fixed language sets (English, Japanese, Chinese) and accepts whichever clears the threshold, instead of one fixed set that could fail on a model with different vocabulary; support for sentence-transformers Dense projection modules (`Transformer -> Pooling -> Dense -> Normalize`); `RobertaModel`-architecture models now route to the XLM-RoBERTa backend; OpenAI-compatible `dimensions` parameter on `/v1/embeddings`; nine more verified models (51 -> 60) |
