@@ -36,6 +36,7 @@ from transformers import PreTrainedTokenizerFast
 from transformers.models.modernbert import modeling_modernbert
 
 from eeane.compiler.backends import base, bert, common
+from eeane.compiler.backends import gemma3 as g3
 from eeane.compiler.backends import modernbert as mb
 from eeane.compiler.backends import xlm_roberta as xlmr
 
@@ -240,6 +241,7 @@ _SANITY_SPEC_CASES = [
     (mb.ModernBertBackend(), "reranker"),
     (xlmr.XlmRobertaBackend(), "embedding"),
     (xlmr.XlmRobertaBackend(), "reranker"),
+    (g3.Gemma3Backend(), "embedding"),
 ]
 _SANITY_SPEC_IDS = [f"{backend.name}-{kind}" for backend, kind in _SANITY_SPEC_CASES]
 
@@ -422,7 +424,12 @@ _PROTOCOL_METHODS = sorted(
 
 # Every registered backend implementation, so that a new architecture is
 # held to the same interface as the existing ones.
-_BACKEND_CLASSES = [bert.BertBackend, mb.ModernBertBackend, xlmr.XlmRobertaBackend]
+_BACKEND_CLASSES = [
+    bert.BertBackend,
+    mb.ModernBertBackend,
+    xlmr.XlmRobertaBackend,
+    g3.Gemma3Backend,
+]
 
 
 def _parameters(function: Any) -> list[tuple[str, Any]]:

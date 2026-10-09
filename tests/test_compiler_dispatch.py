@@ -175,6 +175,61 @@ def test_resolve_dispatch_detects_a_roberta_reranker(tmp_path: Path) -> None:
     assert result.load_backend().name == "XLMRoberta"
 
 
+def test_resolve_dispatch_detects_a_gemma3_embedding_model(tmp_path: Path) -> None:
+    """A bare Gemma3TextModel must be dispatched to the Gemma 3 backend as an embedding model."""
+    model_dir = _write_config(tmp_path / "m", {"architectures": ["Gemma3TextModel"]})
+
+    result = dispatch.resolve_dispatch(model_dir)
+
+    assert result.kind == dispatch.KIND_EMBEDDING
+    assert result.architecture == "Gemma3TextModel"
+    assert result.backend_name == "Gemma3Text"
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        # The multimodal model of the same family, and its bare backbone.
+        "Gemma3ForConditionalGeneration",
+        "Gemma3Model",
+        # The causal language model, which is not published under the
+        # text-model name this backend is registered for.
+        "Gemma3ForCausalLM",
+        # A later generation whose names begin the same way.
+        "Gemma3nModel",
+        "Gemma3nForConditionalGeneration",
+        "Gemma3nForCausalLM",
+        # Earlier generations.
+        "Gemma2Model",
+        "GemmaModel",
+    ],
+)
+def test_the_gemma3_backend_captures_the_text_model_only(tmp_path: Path, architecture: str) -> None:
+    """A relative whose name merely begins the same way must not reach this backend."""
+    model_dir = _write_config(tmp_path / "m", {"architectures": [architecture]})
+
+    with pytest.raises(dispatch.UnsupportedArchitectureError):
+        dispatch.resolve_dispatch(model_dir)
+
+
+def test_a_gemma3_text_model_is_never_detected_as_a_reranker(tmp_path: Path) -> None:
+    """The kind rules are the ones every architecture follows; an explicit kind still wins.
+
+    Dispatch resolves architecture and kind only; the backend then refuses
+    the reranker kind, which the compile pipeline reports as a plain error
+    message.
+    """
+    model_dir = _write_config(tmp_path / "m", {"architectures": ["Gemma3TextModel"]})
+
+    with pytest.warns(UserWarning):
+        result = dispatch.resolve_dispatch(model_dir, kind=dispatch.KIND_RERANKER)
+
+    assert result.kind == dispatch.KIND_RERANKER
+    assert result.backend_name == "Gemma3Text"
+    with pytest.raises(ValueError, match="kind"):
+        result.load_backend().output_name(result.kind)
+
+
 # --- decoder-style models: the kind comes from the module declaration --------
 
 
@@ -324,6 +379,7 @@ def test_no_registry_key_is_a_prefix_of_another_one() -> None:
         ("BertModel", dispatch.KIND_EMBEDDING),
         ("XLMRobertaModel", dispatch.KIND_EMBEDDING),
         ("RobertaModel", dispatch.KIND_EMBEDDING),
+        ("Gemma3TextModel", dispatch.KIND_EMBEDDING),
         ("ModernBertForSequenceClassification", dispatch.KIND_RERANKER),
         ("BertForSequenceClassification", dispatch.KIND_RERANKER),
         ("XLMRobertaForSequenceClassification", dispatch.KIND_RERANKER),
@@ -436,6 +492,8 @@ def test_resolve_dispatch_unsupported_architecture_lists_supported_models(tmp_pa
     assert "Qwen3" in message
     assert "Qwen/Qwen3-Embedding-0.6B" in message
     assert "Qwen/Qwen3-Reranker-0.6B" in message
+    assert "Gemma 3" in message
+    assert "google/embeddinggemma-300m" in message
 
 
 def test_resolve_dispatch_missing_config_json(tmp_path: Path) -> None:
@@ -492,6 +550,7 @@ def test_resolve_dispatch_bad_architectures_field(tmp_path: Path, config: object
         ("ModernBertModel", "ModernBertBackend", "ModernBert"),
         ("XLMRobertaModel", "XlmRobertaBackend", "XLMRoberta"),
         ("RobertaModel", "XlmRobertaBackend", "XLMRoberta"),
+        ("Gemma3TextModel", "Gemma3Backend", "Gemma3Text"),
     ],
 )
 def test_dispatch_load_backend_returns_the_registered_backend(
