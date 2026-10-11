@@ -76,6 +76,13 @@ Members to implement:
     :data:`SCORE_SPACE_PROBABILITY` or :data:`SCORE_SPACE_LOGIT`. This
     states a property of the architecture only; how much difference is
     tolerated is the self-check's own policy.
+``shrinkable_weight_elements(loaded)``
+    Element count of the weight tensor that may be quantized to 8-bit
+    integers when the compiled model turns out larger than the Neural
+    Engine accepts, or ``None`` for a backend that has no such remedy.
+    Every weight of at least that many elements is quantized, so the
+    number names the smallest weight the backend is willing to give up
+    precision on.
 ``trace_example(kind)``
     One fixed raw input used to build the tracing example.
 ``sanity_spec(kind)``
@@ -446,6 +453,24 @@ class CompileBackend(Protocol):
             compares -- the sigmoid of the graph's output or the raw
             output itself -- and says nothing about how much difference is
             tolerated, which is the self-check's own policy.
+        """
+        ...
+
+    def shrinkable_weight_elements(self, loaded: LoadedModel) -> int | None:
+        """Return the size of the weights that may be quantized to 8 bits.
+
+        Asked only when the compiled model exceeds the size the Neural
+        Engine accepts. Every weight tensor of at least the returned
+        number of elements is then quantized to 8-bit integers and the
+        model is compiled again; smaller weights are left untouched.
+
+        Args:
+            loaded: Handle returned by :meth:`load`.
+
+        Returns:
+            The element count of the weight tensor that may be quantized,
+            or ``None`` when the backend has no way of shrinking the
+            model.
         """
         ...
 

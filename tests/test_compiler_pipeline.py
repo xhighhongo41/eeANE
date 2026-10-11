@@ -2683,3 +2683,289 @@ def test_an_untemplated_run_reports_no_template_line(
     assert _run_stub_compile(monkeypatch, source, out_dir, kind="reranker") == 0
 
     assert "pair template" not in capsys.readouterr().err
+
+
+# --- shrinking a model the Neural Engine would refuse -------------------------
+
+# Stand-in for the Neural Engine size limit, small enough for a stub
+# artifact of a few bytes to cross it.
+_STUB_SIZE_LIMIT = 100
+
+# Size of the stub artifact as first compiled, and after its weights were
+# quantized.
+_STUB_SIZE_BEFORE = 150
+_STUB_SIZE_AFTER = 60
+
+# Element count the shrinking stub backend declares.
+_STUB_SHRINKABLE_ELEMENTS = 4096
+
+
+class _ShrinkableBackend(_FamilyBackend):
+    """Stub backend declaring a weight that may be quantized."""
+
+    def shrinkable_weight_elements(self, loaded: Any) -> int | None:
+        """Declare the fixed element count."""
+        return _STUB_SHRINKABLE_ELEMENTS
+
+
+class _UnshrinkableBackend(_FamilyBackend):
+    """Stub backend with no weight to quantize."""
+
+    def shrinkable_weight_elements(self, loaded: Any) -> int | None:
+        """Declare that nothing can be shrunk."""
+        return None
+
+
+def _install_size_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    limit_applies: bool = True,
+    size_before: int = _STUB_SIZE_BEFORE,
+    size_after: int = _STUB_SIZE_AFTER,
+) -> dict[str, list[Any]]:
+    """Make the stubbed conversion produce artifacts of a chosen size.
+
+    Must be called after the conversion stubs are installed, since it
+    replaces the stubbed compile step with one that writes real bytes.
+
+    Args:
+        monkeypatch: Fixture the stubs are installed with.
+        limit_applies: Whether the running system is reported as one
+            that enforces the size limit.
+        size_before: Size of the artifact compiled from an untouched
+            package, in bytes.
+        size_after: Size of the artifact compiled from a quantized
+            package, in bytes.
+
+    Returns:
+        The recorded calls: ``"quantize"`` holds one ``(package name,
+        min_elements)`` tuple per quantization, ``"compile"`` one artifact
+        size per compilation.
+    """
+    calls: dict[str, list[Any]] = {"quantize": [], "compile": []}
+    quantized: set[Path] = set()
+
+    def _fake_compile_model(mlpackage_path: Path, mlmodelc_path: Path) -> None:
+        size = size_after if mlpackage_path in quantized else size_before
+        mlmodelc_path.mkdir(parents=True, exist_ok=True)
+        (mlmodelc_path / "weight.bin").write_bytes(b"\0" * size)
+        calls["compile"].append(size)
+
+    def _fake_quantize(mlpackage_path: Path, min_elements: int) -> None:
+        assert mlpackage_path.is_dir(), "the package must still exist when it is quantized"
+        quantized.add(mlpackage_path)
+        calls["quantize"].append((mlpackage_path.name, min_elements))
+
+    monkeypatch.setattr(pipeline.conversion, "compile_model", _fake_compile_model)
+    monkeypatch.setattr(pipeline.conversion, "quantize_weights_to_int8", _fake_quantize)
+    monkeypatch.setattr(pipeline.ne_limits, "ne_size_limit_applies", lambda: limit_applies)
+    monkeypatch.setattr(pipeline.ne_limits, "NE_MODEL_SIZE_LIMIT_BYTES", _STUB_SIZE_LIMIT)
+    return calls
+
+
+def _run_sized_compile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend_class: type,
+    **size_options: Any,
+) -> tuple[dict[str, list[Any]], dict[str, Any]]:
+    """Run the whole stubbed pipeline over artifacts of a chosen size.
+
+    Args:
+        monkeypatch: Fixture the stubs are installed with.
+        tmp_path: Directory the source and the cache are created under.
+        backend_class: Stub backend the dispatch hands back.
+        **size_options: Passed on to :func:`_install_size_stubs`.
+
+    Returns:
+        The recorded calls and the variant's metadata record.
+    """
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    _install_family_stubs(monkeypatch, backend_class=backend_class)
+    calls = _install_size_stubs(monkeypatch, **size_options)
+
+    exit_code = pipeline.run(
+        _compile_args(str(source), "--buckets", str(_FAMILY_SEQ_LEN), "--out-dir", str(out_dir))
+    )
+
+    assert exit_code == 0
+    metadata_path = out_dir / "compiled" / source.name / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json"
+    return calls, json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def test_an_oversized_model_is_quantized_and_compiled_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over the limit, with a declared weight: quantize once, compile twice, record it."""
+    calls, metadata = _run_sized_compile(monkeypatch, tmp_path, _ShrinkableBackend)
+
+    assert calls["quantize"] == [
+        (f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlpackage", _STUB_SHRINKABLE_ELEMENTS)
+    ]
+    assert calls["compile"] == [_STUB_SIZE_BEFORE, _STUB_SIZE_AFTER]
+    assert metadata["size_reduction"] == {
+        "method": "linear_int8_per_channel",
+        "min_elements": _STUB_SHRINKABLE_ELEMENTS,
+        "limit_bytes": _STUB_SIZE_LIMIT,
+        "size_before_bytes": _STUB_SIZE_BEFORE,
+        "size_after_bytes": _STUB_SIZE_AFTER,
+        "within_limit": True,
+    }
+    assert "shrink" in metadata["timings_sec"]
+
+
+def test_a_shrunk_model_leaves_the_served_artifact_and_no_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What ends up in the cache is the artifact compiled from the quantized package."""
+    _run_sized_compile(monkeypatch, tmp_path, _ShrinkableBackend)
+
+    model_root = tmp_path / "cache" / "compiled" / "stub-model"
+    artifact = model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlmodelc"
+    assert (artifact / "weight.bin").stat().st_size == _STUB_SIZE_AFTER
+    assert not (model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlpackage").exists()
+
+
+def test_a_shrunk_model_reports_what_was_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The progress log must say that the model was quantized, and why."""
+    _run_sized_compile(monkeypatch, tmp_path, _ShrinkableBackend)
+
+    log = capsys.readouterr().err
+    assert "Neural Engine size limit" in log
+    assert "quantizing" in log
+    assert "still" not in log
+
+
+def test_a_system_without_the_limit_never_shrinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Where the limit is not enforced, the artifact and its record stay as they were."""
+    calls, metadata = _run_sized_compile(
+        monkeypatch, tmp_path, _ShrinkableBackend, limit_applies=False
+    )
+
+    assert calls["quantize"] == []
+    assert calls["compile"] == [_STUB_SIZE_BEFORE]
+    assert "size_reduction" not in metadata
+    assert "shrink" not in metadata["timings_sec"]
+    assert "Neural Engine size limit" not in capsys.readouterr().err
+
+
+def test_a_backend_without_a_shrinkable_weight_is_reported_and_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Over the limit with nothing to shrink: say so, and change nothing."""
+    calls, metadata = _run_sized_compile(monkeypatch, tmp_path, _UnshrinkableBackend)
+
+    assert calls["quantize"] == []
+    assert calls["compile"] == [_STUB_SIZE_BEFORE]
+    assert "size_reduction" not in metadata
+    assert "shrink" not in metadata["timings_sec"]
+    log = capsys.readouterr().err
+    assert "Neural Engine size limit" in log
+    assert "will not run on the Neural Engine" in log
+
+
+@pytest.mark.parametrize("size_before", [_STUB_SIZE_LIMIT, _STUB_SIZE_LIMIT - 1, 0])
+def test_a_model_within_the_limit_is_never_shrunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    size_before: int,
+) -> None:
+    """A model of exactly the limit is still accepted, so it is left alone."""
+    calls, metadata = _run_sized_compile(
+        monkeypatch, tmp_path, _ShrinkableBackend, size_before=size_before
+    )
+
+    assert calls["quantize"] == []
+    assert calls["compile"] == [size_before]
+    assert "size_reduction" not in metadata
+    assert "shrink" not in metadata["timings_sec"]
+    assert "Neural Engine size limit" not in capsys.readouterr().err
+
+
+def test_a_model_within_the_limit_never_asks_the_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backend that predates the declaration keeps working for a small model."""
+    calls, metadata = _run_sized_compile(
+        monkeypatch, tmp_path, _FamilyBackend, size_before=_STUB_SIZE_LIMIT
+    )
+
+    assert not hasattr(_FamilyBackend, "shrinkable_weight_elements")
+    assert calls["quantize"] == []
+    assert "size_reduction" not in metadata
+
+
+def test_a_model_still_oversized_after_quantization_is_recorded_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Quantization that does not get under the limit is a fact to record, not an error."""
+    calls, metadata = _run_sized_compile(
+        monkeypatch, tmp_path, _ShrinkableBackend, size_after=_STUB_SIZE_LIMIT + 1
+    )
+
+    assert calls["compile"] == [_STUB_SIZE_BEFORE, _STUB_SIZE_LIMIT + 1]
+    assert metadata["size_reduction"]["within_limit"] is False
+    assert metadata["size_reduction"]["size_after_bytes"] == _STUB_SIZE_LIMIT + 1
+    log = capsys.readouterr().err
+    assert "still" in log
+    assert "will not run on the Neural Engine" in log
+
+
+def test_a_failed_quantization_fails_the_compile_and_drops_the_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A quantization error is a conversion error like any other step's."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    _install_family_stubs(monkeypatch, backend_class=_ShrinkableBackend)
+    _install_size_stubs(monkeypatch)
+
+    def _failing_quantize(mlpackage_path: Path, min_elements: int) -> None:
+        raise RuntimeError("quantization failed")
+
+    monkeypatch.setattr(pipeline.conversion, "quantize_weights_to_int8", _failing_quantize)
+
+    exit_code = pipeline.run(
+        _compile_args(str(source), "--buckets", str(_FAMILY_SEQ_LEN), "--out-dir", str(out_dir))
+    )
+
+    assert exit_code != 0
+    assert "quantization failed" in capsys.readouterr().err
+    model_root = out_dir / "compiled" / source.name
+    assert not (model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlpackage").exists()
+    assert not (model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json").exists()
+
+
+def test_build_metadata_without_a_size_reduction_has_no_such_key(tmp_path: Path) -> None:
+    """A record of a model that was never shrunk must read exactly as it always did."""
+    context = _stub_compile_context(tmp_path)
+    plan = artifacts.VariantPlan(
+        seq_len=128,
+        stem="s128_b1_eager_macos13",
+        mlpackage_path=tmp_path / "s128.mlpackage",
+        mlmodelc_path=tmp_path / "s128.mlmodelc",
+        metadata_path=tmp_path / "s128.json",
+        convert=True,
+    )
+    arguments = (context, plan, {"load": 0.0}, {"mlmodelc": "x"}, {}, {"status": "skipped"})
+
+    plain = pipeline._build_metadata(*arguments)
+    explicit = pipeline._build_metadata(*arguments, size_reduction=None)
+    reduced = pipeline._build_metadata(*arguments, size_reduction={"method": "m"})
+
+    assert "size_reduction" not in plain
+    assert explicit == plain
+    assert reduced == {**plain, "size_reduction": {"method": "m"}}
+    assert plain["format_version"] == artifacts.METADATA_FORMAT_VERSION
+
+
+def test_the_selfcheck_shares_the_placement_threshold_of_the_limits_module() -> None:
+    """The self-check and the server must warn below one and the same share."""
+    assert selfcheck.NE_PLACEMENT_WARN_THRESHOLD == pipeline.ne_limits.NE_PLACEMENT_WARN_THRESHOLD
+    assert selfcheck.NE_PLACEMENT_WARN_THRESHOLD == 90.0

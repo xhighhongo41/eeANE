@@ -60,6 +60,7 @@ from eeane.compiler.backends.base import (
     SCORE_SPACE_PROBABILITY,
     SCORE_SPACES,
 )
+from eeane.ne_limits import NE_PLACEMENT_WARN_THRESHOLD
 
 if TYPE_CHECKING:
     from eeane.compiler.pipeline import SelfcheckContext
@@ -110,9 +111,10 @@ BATCH_CONSISTENCY_LOGIT_TOLERANCE = 0.01
 
 # --- NE placement ---
 
-# Below this NE-placement percentage the report is downgraded to "warned"
-# (never "failed": the goal is data collection on unverified machines).
-NE_PLACEMENT_WARN_THRESHOLD = 90.0
+# Below NE_PLACEMENT_WARN_THRESHOLD (an NE-placement percentage) the report
+# is downgraded to "warned" -- never "failed": the goal is data collection
+# on unverified machines. The value is imported from :mod:`eeane.ne_limits`,
+# which the server shares, so both sides warn below one and the same share.
 
 # --- warm latency (a simplified measurement) ---
 

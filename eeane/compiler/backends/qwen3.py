@@ -827,6 +827,29 @@ class Qwen3Backend:
             suffix=RERANKER_PROMPT_SUFFIX,
         )
 
+    def shrinkable_weight_elements(self, loaded: LoadedModel) -> int | None:
+        """Return the size of the weights that may be quantized to 8 bits.
+
+        The input embedding table (vocabulary x hidden size) is by far
+        the largest single weight of this family, and it is only ever
+        read row by row, so storing it as 8-bit integers costs little
+        accuracy while removing a large share of the compiled model.
+        Either kind is loaded as the bare backbone, so the table is found
+        in the same place for both.
+
+        Args:
+            loaded: Handle returned by :meth:`load`.
+
+        Returns:
+            The element count of the input embedding table.
+
+        Raises:
+            ValueError: If ``loaded.kind`` is not supported by this
+                backend.
+        """
+        self._check_kind(loaded.kind)
+        return int(loaded.model.get_input_embeddings().weight.numel())
+
     def trace_example(self, kind: str) -> Any:
         """Return the fixed raw example input used for ``torch.jit.trace``.
 

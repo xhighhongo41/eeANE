@@ -12,6 +12,15 @@ eeANEは、Apple Silicon MacのApple Neural Engine (ANE) 上でテキスト
 します。この成果物は数秒でロードでき、ANE上で実行されるため、
 GPUとユニファイドメモリの大部分を他の作業のために空けておけます。
 
+> **macOS 27以降をお使いの場合: 大きなモデルは作り直してください。**
+> macOS 27では、Neural Engineが受け付けるモデルの大きさの上限が
+> 2 GiBから1 GiBへ下がりました。エラーも警告も出ず、上限を超える
+> モデルは黙ってCPUで実行されます。Qwen3系のモデルが該当し、eeANE
+> 1.6.0以前で、またはmacOS 26以前でコンパイルした成果物は、macOS 27上で
+> eeANE 1.6.1以降を使ってコンパイルし直す必要があります。
+> [macOS 27とNeural Engineの1 GiB上限](#macos-27とneural-engineの1-gib上限)を
+> 参照してください。
+
 ## ハイライト
 
 - **ANE推論**: M2 Mac miniで埋め込み処理は最大約13,600実効
@@ -57,6 +66,92 @@ eeANEはApple Neural Engineを必須とします: CPUのみでの実行はサポ
 していません(既知の制限を参照)。Dockerもサポート対象外です —
 macOS上のコンテナはLinux VM内で動作し、ANEはそのVMへパススルー
 されません。
+
+## macOS 27とNeural Engineの1 GiB上限
+
+**何が変わったか。** macOS 26までは、Neural Engineは約2 GiBまでの
+コンパイル済みモデルを受け付けていました。macOS 27以降、この上限は
+1 GiB(1,073,741,824バイト)です。上限を超えるモデルは拒否されるわけ
+ではありません。変換・ロード・推論はすべて成功し、システムのログにも
+何も出ません。モデルの全演算が、ただCPUで実行されます。これはM2 Mac
+miniのmacOS 27.0.1で計測したものです。Appleはこの変更を文書化して
+いないため、ほかの機種では上限が異なる可能性や、今後また変わる
+可能性があります。
+
+**どう見えるか。**
+
+| モデル | コンパイル後の大きさ | macOS 27で対策なしの場合 |
+|---|---|---|
+| `Qwen/Qwen3-Embedding-0.6B`、`Qwen/Qwen3-Reranker-0.6B` | 1.11 GiB | 結果は正しいがCPU実行になる: 128トークンで約3.5倍遅い(19 msが67 msに) |
+| XLM-RoBERTa large級のモデル(下記) | 1.04 GiB以上 | 使えない: 出力が数値にならず(NaN)、`eeane compile`はセルフチェック不合格を報告する |
+| そのほかの検証済みモデル(既定のruri-v3の2モデルを含む) | 1 GiB未満 | 影響なし |
+
+**対処: macOS 27上で、eeANE 1.6.1以降を使ってコンパイルし直す。**
+該当するモデルごとに、そのモデルを配信するMacで`eeane compile`を
+もう一度実行してください:
+
+```
+eeane compile Qwen/Qwen3-Embedding-0.6B
+eeane compile Qwen/Qwen3-Reranker-0.6B
+```
+
+オプションは要りません。`--force`も不要です: 古いeeANEで作った成果物は
+自動的に作り直されます。対応している種類のモデルが上限を超える
+場合、`eeane compile`は語彙の埋め込み表を8ビット整数で保存します
+(ほかの重みはFP16のまま)。これでコンパイル済みモデルが1 GiB未満に
+戻ります。`eeane compile`の出力にその旨が表示されます:
+
+```
+s128: the compiled model (1.111 GiB) exceeds the Neural Engine size limit (1.000 GiB); quantizing weights of 155309056 or more elements to 8 bits and compiling again
+s128: reduced to 0.966 GiB, within the limit
+```
+
+コンパイルし直した後の、macOS 27.0.1での計測(M2 Mac mini、16 GB):
+
+| モデル | バケツ | Neural Engine配置率 | ウォーム時のレイテンシ | CPUのみとの比 |
+|---|---|---|---|---|
+| Qwen/Qwen3-Embedding-0.6B | 128 | 99.4% | 19.3 ms | 3.5倍 |
+| Qwen/Qwen3-Embedding-0.6B | 512 | 99.4% | 104.2 ms | 2.5倍 |
+| Qwen/Qwen3-Embedding-0.6B | 1024 | 99.4% | 287.6 ms | 2.3倍 |
+| Qwen/Qwen3-Reranker-0.6B | 512 | 99.3% | 105.5 ms | 2.4倍 |
+| Qwen/Qwen3-Reranker-0.6B | 1024 | 99.3% | 288.0 ms | 2.3倍 |
+
+配置率と速度は、これらのモデルがmacOS 26で示していた値(99.3〜99.4%、
+128トークンで18.76 ms)に戻ります。内蔵のセルフチェックでは精度は
+変わりません(embeddingモデルのcosineは0.99994で、以前と同じ値)。
+参照実装との比較では、embeddingモデルの行ごとのcosineは0.9996以上を
+保ち、rerankerのスコアの差はロジット空間で最大0.23です(合否の閾値は
+0.3)。参照スコアの差が0.2を超える567組の文書の対のうち、明らかに
+無関係な文書どうし(関連度0.0001前後)の1組で順序が入れ替わりました。
+
+**コンパイルするときのOSで決まります。** この縮小は、`eeane compile`を
+macOS 27以降で実行したときだけ適用されます。macOS 26以前では、モデルは
+これまでと全く同じようにコンパイルされます(そこでは2 GiBの上限に
+収まるため)。したがって、**MacをmacOS 27へ上げた場合は、その後で該当
+するモデルをコンパイルし直してください**: 古いシステムで作った成果物は
+新しい上限を超えており、CPUで実行されます。この経路はmacOS 26以前の
+実機では検証できていません。
+
+**サーバーが知らせます。** `eeane serve`は起動時に、設定された全モデルを
+確かめ、Neural Engineで実行されないモデルについて警告をログに出します。
+コンパイルした時点でそう記録されていた場合と、macOS 27以降で1 GiBを
+超えている場合のどちらも対象です:
+
+```
+WARNING eeane.server: model 'Qwen/Qwen3-Embedding-0.6B': the compiled model for bucket(s) [128, 512, 1024] will not run on the Neural Engine (it is 1.11 GiB, above the 1 GiB the Neural Engine accepts on macOS 27 and later); it will run on the CPU instead, which is slower and, for some models, gives invalid results. Run `eeane compile Qwen/Qwen3-Embedding-0.6B` with this version of eeANE to rebuild it; that does not fix every model. See the README section "macOS 27 and the 1 GiB Neural Engine limit"
+```
+
+サーバーはそのまま起動します。兆候はこの警告だけです。
+
+**まだ解消しないモデル。** 大きさの縮小が適用されるのはQwen3系だけ
+です。検証済み一覧にあるXLM-RoBERTa large級のモデルも1 GiBを超えて
+おり、**macOS 27以降では現在使えません**: `intfloat/multilingual-e5-large`
+は実測済み(配置率0%、出力がNaN)で、`BAAI/bge-m3`、
+`Snowflake/snowflake-arctic-embed-l-v2.0`、
+`intfloat/multilingual-e5-large-instruct`、`BAAI/bge-reranker-v2-m3`、
+`BAAI/bge-reranker-large`、`hotchpotch/japanese-bge-reranker-v2-m3-v1`は
+同じ大きさのため同じ挙動になると見込まれます(未計測)。macOS 26以前
+では引き続き動作します。対応は今後のリリースで予定しています。
 
 ## インストール
 
@@ -315,22 +410,22 @@ embeddingモデルをコンパイルします(meanプーリングの後に2段�
 
 | モデル | 種別 | バケツ |
 |---|---|---|
-| BAAI/bge-m3 <sup>1</sup> | embedding | 128/512/1024 |
-| Snowflake/snowflake-arctic-embed-l-v2.0 | embedding | 128/512/1024 |
+| BAAI/bge-m3 <sup>1</sup> <sup>3</sup> | embedding | 128/512/1024 |
+| Snowflake/snowflake-arctic-embed-l-v2.0 <sup>3</sup> | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-107m-multilingual | embedding | 128/512 |
 | ibm-granite/granite-embedding-278m-multilingual | embedding | 128/512 |
 | ibm-granite/granite-embedding-30m-english | embedding | 128/512 |
 | ibm-granite/granite-embedding-125m-english | embedding | 128/512 |
 | intfloat/multilingual-e5-base | embedding | 128/512 |
-| intfloat/multilingual-e5-large | embedding | 128/512 |
-| intfloat/multilingual-e5-large-instruct | embedding | 128/512 |
+| intfloat/multilingual-e5-large <sup>3</sup> | embedding | 128/512 |
+| intfloat/multilingual-e5-large-instruct <sup>3</sup> | embedding | 128/512 |
 | sentence-transformers/paraphrase-multilingual-mpnet-base-v2 | embedding | 128/512 |
-| BAAI/bge-reranker-v2-m3 | reranker | 512/1024 |
+| BAAI/bge-reranker-v2-m3 <sup>3</sup> | reranker | 512/1024 |
 | BAAI/bge-reranker-base | reranker | 512 |
-| BAAI/bge-reranker-large | reranker | 512 |
+| BAAI/bge-reranker-large <sup>3</sup> | reranker | 512 |
 | hotchpotch/japanese-reranker-cross-encoder-xsmall-v1 | reranker | 512 |
 | hotchpotch/japanese-reranker-cross-encoder-small-v1 | reranker | 512 |
-| hotchpotch/japanese-bge-reranker-v2-m3-v1 | reranker | 512/1024 |
+| hotchpotch/japanese-bge-reranker-v2-m3-v1 <sup>3</sup> | reranker | 512/1024 |
 
 **BERT**(embeddingモデルのみ)
 
@@ -368,6 +463,11 @@ embeddingモデルをコンパイルします(meanプーリングの後に2段�
 `--allow-pickle`が必要です([チェックポイント形式](#チェックポイント形式)
 を参照)。
 
+<sup>3</sup> コンパイル後に1 GiBを超えるため、macOS 27以降では現在
+使えません。
+[macOS 27とNeural Engineの1 GiB上限](#macos-27とneural-engineの1-gib上限)を
+参照してください。macOS 26以前では動作します。
+
 **Qwen3(デコーダ型)**
 
 生成型rerankerのスコアは、他のrerankerと同じ意味を持ちます(上記の
@@ -379,8 +479,11 @@ embeddingモデルをコンパイルします(meanプーリングの後に2段�
 | Qwen/Qwen3-Embedding-0.6B | embedding | 128/512/1024 |
 | Qwen/Qwen3-Reranker-0.6B | reranker | 512/1024 |
 
-この2モデルはmacOS 26.6.2で検証したものです。macOS 27.0.1での挙動
-は「既知の制限」を参照してください。
+この2モデルは、macOS 26.6.2と、eeANE 1.6.1でコンパイルしたうえで
+macOS 27.0.1で検証したものです。macOS 27以降では、eeANE 1.6.1以降で
+コンパイルする必要があります。
+[macOS 27とNeural Engineの1 GiB上限](#macos-27とneural-engineの1-gib上限)を
+参照してください。
 
 **Gemma 3(双方向のembeddingモデルのみ)**
 
@@ -725,6 +828,15 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   制限を参照してください。これはモデルがNeural Engine以外で実行
   されたことを意味します。リクエストを処理しているマシンでNeural
   Engineが利用可能か確認してください。
+  macOS 27以降では、1 GiBを超えるモデルであることが主な原因です。
+  [macOS 27とNeural Engineの1 GiB上限](#macos-27とneural-engineの1-gib上限)を
+  参照してください。
+- **起動時に、モデルが"will not run on the Neural Engine"という警告が
+  出る**、またはmacOSを上げた後にモデルが数倍遅くなった: 現在の
+  システム上で`eeane compile <id>`を実行してコンパイルし直して
+  ください。どのモデルがそれで解消するかは
+  [macOS 27とNeural Engineの1 GiB上限](#macos-27とneural-engineの1-gib上限)を
+  参照してください。
 - **リクエストがまれに通常よりずっと時間がかかる**: モデルが
   `keep_alive`を超えてアイドルだった後の最初のリクエストは、オン
   デマンド再ロードのコストを負担します(通常は1秒未満)。また、
@@ -818,24 +930,20 @@ HTTP経由のレスポンスは、Core ML直接推論と完全に一致するこ
   フットプリントの増分は約150MBでした(未ロード時313MB →
   128/512/1024すべてロード後456MB)。8モデルを並べた構成でも
   ワーカーは592MB(ピーク730MB)に収まりました。
-- **Neural Engineが受け付けるモデルサイズの上限**: Qwen3系統の4B・
-  8Bモデルは対応していません。コンパイル済みモデルのサイズが約
-  2 GiBを超えると、Neural Engineは全演算をCPUへ落としてしまいます
-  — 変換・ロード・推論自体は成功するため、見た目の症状は推論が
-  遅くなるだけです。パラメータ数ではこの上限は約1.07Bで、上記の
-  0.6Bモデルはこの範囲に十分収まります。
+- **Neural Engineが受け付けるモデルサイズの上限**: コンパイル済み
+  モデルが一定の大きさを超えると、Neural Engineには一切配置されず、
+  全演算がCPUへ落ちます — 変換・ロード・推論自体は成功します。
+  この上限はmacOS 26までは約2 GiB、**macOS 27以降は1 GiB**です。
+  Qwen3系統の4B・8Bモデルはどちらも大きく超えるため対応していません。
+  macOS 27以降では、0.6BのQwen3モデル(1.6.1以降の`eeane compile`が
+  対処します)と、XLM-RoBERTa large級のモデル(未対処で、そこでは
+  使えません)もこの上限に掛かります。
+  [macOS 27とNeural Engineの1 GiB上限](#macos-27とneural-engineの1-gib上限)を
+  参照してください。
 - **EmbeddingGemmaのバケツ2048**: このモデルの上限長は2048で、
   `--buckets 2048`は変換できますが、手元の計測ではそのバケツは
   Neural Engineに配置されずCPU実行になります(配置率0%、約3.3秒/件)。
   既定の128/512/1024を推奨します。
-- **macOS 27.0.1でのQwen3**: macOS 27.0.1では、Qwen3系の2モデル
-  (`Qwen/Qwen3-Embedding-0.6B`、`Qwen/Qwen3-Reranker-0.6B`)が
-  Neural Engineに配置されずCPU実行になることを確認しました。macOS
-  26.6.2では99.3〜99.4%が配置されていました(同じ成果物・同じコードで
-  OSだけが違います)。結果の正しさは保たれますが、遅くなります:
-  S=128のウォーム時で約70 ms(26.6.2では18.76 ms)。ほかの系統(BERT、
-  ModernBERT、XLM-RoBERTa、Gemma 3)はmacOS 27.0.1でも従来どおり
-  配置されます。原因は調査中です。
 
 ## 開発
 
@@ -956,6 +1064,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 1.6.1 | macOS 27(Neural Engineが受け付けるモデルの大きさが2 GiBから1 GiBへ下がった)で、Qwen3系のモデルが再びNeural Engineで動くようになった: macOS 27以降でコンパイルしたQwen3モデルが上限を超える場合、`eeane compile`が語彙の埋め込み表を8ビット整数で保存し、コンパイル済みモデルが上限に収まる(配置率・速度・精度はmacOS 26と同水準)。`eeane serve`は、Neural Engineで実行されないモデルを起動時に警告する。XLM-RoBERTa large級のモデルは、当面macOS 27では使えないことを明記 |
 | 1.6.0 | Gemma 3(双方向のembeddingモデル)がeeANEの5つ目の対応アーキテクチャ系統になり、通常の`eeane compile`でコンパイルして既存のサーバーでそのまま提供できるように。生成用・マルチモーダル・Gemma 3nは理由つきで拒否。関数としては同値な書き換えでモデルをFP16の範囲に収める。検証済みモデルを1件追加(google/embeddinggemma-300m、62→63)。利用承諾の要るモデルの取得に失敗したとき、対処を案内するように |
 | 1.5.0 | Qwen3(デコーダ型)がeeANEの4つ目の対応アーキテクチャ系統になり、通常の`eeane compile`/`eeane serve`の流れでコンパイル・サービングできるように。embeddingモデルにlast-tokenプーリング、分類ヘッドの代わりにyes/noロジット対からスコアを出す生成型rerankerを追加。`ForCausalLM`アーキテクチャのモデル種別判定は、アーキテクチャ名だけでなくモデルのsentence-transformersモジュール宣言も読むように変更。検証済みモデルを2件追加(Qwen3-Embedding-0.6B、Qwen3-Reranker-0.6B) |
 | 1.4.5 | `poc_qwen/`を追加。デコーダ型(causal LM)の埋め込みモデルがNeural Engineで動作するか、また、どのくらいの大きさまで受け付けられるかを調べる調査用スクリプト群。エンジンの変更なし |
