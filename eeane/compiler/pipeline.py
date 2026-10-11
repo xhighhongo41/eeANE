@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from eeane import __version__
+from eeane import __version__, ne_limits
 from eeane.compiler import conversion, sources
 from eeane.compiler.artifacts import (
     CACHE_SUBDIR,
@@ -107,6 +107,18 @@ BATCH_ARTIFACTS_RECORD_KEY = "batch_artifacts"
 # it is made of. A record carrying none is served through the tokenizer's
 # own pair encoding, as every record written before templates existed.
 PAIR_TEMPLATE_RECORD_KEY = "pair_template"
+
+# Key a variant's metadata records a size reduction under. Only a variant
+# that was actually reduced carries it, so the record of every other one
+# reads exactly as it did before reductions existed.
+SIZE_REDUCTION_RECORD_KEY = "size_reduction"
+
+# Name recorded for the one reduction method there is: weights quantized
+# linearly to 8-bit integers, with one scale per output channel.
+SIZE_REDUCTION_METHOD = "linear_int8_per_channel"
+
+# Bytes per GiB, for the sizes quoted in progress messages.
+_BYTES_PER_GIB = 1 << 30
 
 # Building block of the long tokenizer-verification input. The gate inputs
 # must be self-contained (a user's machine has no repository test data),
@@ -775,6 +787,9 @@ def _convert_variant(
         step = time.perf_counter()
         conversion.compile_model(plan.mlpackage_path, plan.mlmodelc_path)
         timings["compile"] = time.perf_counter() - step
+
+        # Needs the package, so it runs before the package is dropped.
+        size_reduction = _reduce_oversized_model(context, plan, loaded, timings)
     except CompileError:
         raise
     except Exception as exc:
@@ -797,7 +812,9 @@ def _convert_variant(
     timings["total"] = time.perf_counter() - started + load_seconds
     write_json_record(
         plan.metadata_path,
-        _build_metadata(context, plan, timings, artifacts, patches, selfcheck),
+        _build_metadata(
+            context, plan, timings, artifacts, patches, selfcheck, size_reduction=size_reduction
+        ),
     )
     _progress(
         f"      s{plan.seq_len}: done in {timings['total']:.1f}s -> {plan.mlmodelc_path.name}"
@@ -808,6 +825,90 @@ def _convert_variant(
             f"the self-check of bucket {plan.seq_len} failed; see {plan.metadata_path}"
         )
     return selfcheck
+
+
+def _reduce_oversized_model(
+    context: _CompileContext,
+    plan: VariantPlan,
+    loaded: Any,
+    timings: dict[str, float],
+) -> dict[str, Any] | None:
+    """Shrink a compiled variant the Neural Engine would otherwise refuse.
+
+    A compiled model above the Neural Engine's size limit is not an error
+    anywhere: it silently runs on the CPU instead. So when the system
+    converting the model enforces that limit, the freshly compiled
+    variant exceeds it, and the backend declares a weight that may be
+    quantized, that weight is stored as 8-bit integers and the variant is
+    compiled again. If any of the three does not hold, nothing is touched
+    and the variant stays byte-for-byte what it would have been.
+
+    Args:
+        context: Per-invocation state.
+        plan: The variant just compiled; its package must still exist.
+        loaded: Handle of the loaded and patched model, which the backend
+            reads the size of its shrinkable weight from.
+        timings: Per-step durations of this variant. A ``"shrink"`` entry
+            (quantization plus the second compilation) is added only when
+            the variant was reduced.
+
+    Returns:
+        A JSON-serializable record of the reduction -- method, element
+        threshold, the limit, the compiled size before and after, and
+        whether the result fits -- or ``None`` when nothing was done.
+    """
+    if not ne_limits.ne_size_limit_applies():
+        return None
+    limit = ne_limits.NE_MODEL_SIZE_LIMIT_BYTES
+    size_before = ne_limits.compiled_model_size_bytes(plan.mlmodelc_path)
+    if size_before <= limit:
+        return None
+
+    # Asked only now, so a backend is never consulted about a model that
+    # fits anyway.
+    min_elements = context.backend.shrinkable_weight_elements(loaded)
+    if min_elements is None:
+        _progress(
+            f"      s{plan.seq_len}: the compiled model ({_gib(size_before)}) exceeds the "
+            f"Neural Engine size limit ({_gib(limit)}) and this kind of model has no weight "
+            "that can be shrunk; it will not run on the Neural Engine"
+        )
+        return None
+
+    _progress(
+        f"      s{plan.seq_len}: the compiled model ({_gib(size_before)}) exceeds the "
+        f"Neural Engine size limit ({_gib(limit)}); quantizing weights of {min_elements} "
+        "or more elements to 8 bits and compiling again"
+    )
+    step = time.perf_counter()
+    conversion.quantize_weights_to_int8(plan.mlpackage_path, min_elements)
+    conversion.compile_model(plan.mlpackage_path, plan.mlmodelc_path)
+    timings["shrink"] = time.perf_counter() - step
+
+    size_after = ne_limits.compiled_model_size_bytes(plan.mlmodelc_path)
+    within_limit = size_after <= limit
+    if within_limit:
+        _progress(f"      s{plan.seq_len}: reduced to {_gib(size_after)}, within the limit")
+    else:
+        # Recorded rather than refused: the artifact is correct and
+        # usable, it merely runs on the CPU.
+        _progress(
+            f"      s{plan.seq_len}: still {_gib(size_after)} after quantization, above the "
+            "Neural Engine size limit; it will not run on the Neural Engine"
+        )
+    return {
+        "method": SIZE_REDUCTION_METHOD,
+        "min_elements": min_elements,
+        "limit_bytes": limit,
+        "size_before_bytes": size_before,
+        "size_after_bytes": size_after,
+        "within_limit": within_limit,
+    }
+
+
+def _gib(size_bytes: int) -> str:
+    """Format a byte count as GiB for a progress message."""
+    return f"{size_bytes / _BYTES_PER_GIB:.3f} GiB"
 
 
 def _plan_variants(context: _CompileContext, buckets: Sequence[int]) -> list[VariantPlan]:
@@ -1042,6 +1143,7 @@ def _build_metadata(
     artifacts: Mapping[str, str],
     patches: Mapping[str, Any],
     selfcheck: Mapping[str, Any],
+    size_reduction: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble one variant's metadata record.
 
@@ -1055,14 +1157,18 @@ def _build_metadata(
             records what was actually applied rather than an assumption
             tied to one architecture.
         selfcheck: Self-check report (possibly ``status="skipped"``).
+        size_reduction: Record of how the variant was shrunk to fit the
+            Neural Engine, or ``None`` when it was not.
 
     Returns:
         A JSON-serializable metadata record. Its ``variant.pooling`` and
         ``variant.dense`` are ``None`` (JSON ``null``) for a reranker, or
         when the embedding model's declaration could not be read; see
         :attr:`_CompileContext.pooling` and :attr:`_CompileContext.dense`.
+        It carries a ``size_reduction`` entry only when one is given, so
+        the record of a variant that was not shrunk is unchanged.
     """
-    return {
+    metadata: dict[str, Any] = {
         "format_version": METADATA_FORMAT_VERSION,
         "source": {"requested": context.args.source, "resolved": str(context.model_dir)},
         "variant": {
@@ -1081,6 +1187,9 @@ def _build_metadata(
         "artifacts": dict(artifacts),
         "selfcheck": dict(selfcheck),
     }
+    if size_reduction is not None:
+        metadata[SIZE_REDUCTION_RECORD_KEY] = dict(size_reduction)
+    return metadata
 
 
 def _build_model_info(
