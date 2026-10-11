@@ -10,8 +10,10 @@ injected engine mirrors.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterator
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -1581,3 +1583,104 @@ def test_deadline_is_set_when_queue_timeout_is_enabled() -> None:
     assert rerank_response.status_code == 200
     assert engine.embed_deadlines[0] is not None
     assert engine.rerank_deadlines[0] is not None
+
+
+# --- start-up Neural Engine placement warnings ------------------------------
+
+
+def _write_low_placement_artifact(path: Path) -> None:
+    """Create a fake artifact whose recorded Neural Engine placement is 0%."""
+    path.mkdir(parents=True)
+    path.with_suffix(".json").write_text(
+        json.dumps({"selfcheck": {"compute_plan": {"status": "measured", "ne_placement_pct": 0.0}}})
+    )
+
+
+def _placement_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Run start-up for the logged app and return its placement WARNING texts."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "eeane.server"
+        and record.levelname == "WARNING"
+        and "Neural Engine" in record.getMessage()
+    ]
+
+
+def _start_and_collect(config: EeaneConfig, caplog: pytest.LogCaptureFixture) -> list[str]:
+    app = create_app(config, engine=StubEngine(config))
+    with caplog.at_level(logging.INFO, logger="eeane.server"), TestClient(app):
+        pass
+    return _placement_warnings(caplog)
+
+
+def test_startup_warns_once_for_a_model_with_a_low_placement_artifact(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    low_a = tmp_path / "s128.mlmodelc"
+    low_b = tmp_path / "s512.mlmodelc"
+    _write_low_placement_artifact(low_a)
+    _write_low_placement_artifact(low_b)
+    entry = make_model_entry("org/model-a", buckets=(128, 512)).model_copy(
+        update={"artifacts": {512: low_b, 128: low_a}}
+    )
+    config = make_config(with_reranker=False, extra_models=[entry])
+
+    warnings = _start_and_collect(config, caplog)
+
+    assert len(warnings) == 1
+    message = warnings[0]
+    assert "org/model-a" in message
+    assert "[128, 512]" in message
+    assert "0.0%" in message
+    assert "eeane compile org/model-a" in message
+    assert "macOS 27 and the 1 GiB Neural Engine limit" in message
+
+
+def test_startup_does_not_warn_for_models_without_reasons(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = make_config()
+
+    assert _start_and_collect(config, caplog) == []
+    assert any("serving" in r.getMessage() for r in caplog.records)
+
+
+def test_startup_warns_only_for_the_affected_model(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    low = tmp_path / "s128.mlmodelc"
+    _write_low_placement_artifact(low)
+    bad = make_model_entry("org/model-a").model_copy(update={"artifacts": {128: low}})
+    good = make_model_entry("org/model-b")
+    config = make_config(with_reranker=False, extra_models=[bad, good])
+
+    warnings = _start_and_collect(config, caplog)
+
+    assert len(warnings) == 1
+    assert "org/model-a" in warnings[0]
+    assert "org/model-b" not in warnings[0]
+
+
+def test_startup_warns_when_only_a_batch_artifact_is_affected(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    low = tmp_path / "s128_b8.mlmodelc"
+    _write_low_placement_artifact(low)
+    entry = make_model_entry("org/model-a").model_copy(update={"batch_artifacts": {128: low}})
+    config = make_config(with_reranker=False, extra_models=[entry])
+
+    warnings = _start_and_collect(config, caplog)
+
+    assert len(warnings) == 1
+    assert "org/model-a" in warnings[0]
+    assert "batch" in warnings[0]
+
+
+def test_startup_tolerates_missing_artifacts_and_no_batch_artifacts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entry = make_model_entry("org/model-a").model_copy(update={"batch_artifacts": None})
+    config = make_config(with_reranker=False, extra_models=[entry])
+
+    assert _start_and_collect(config, caplog) == []

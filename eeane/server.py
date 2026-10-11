@@ -41,6 +41,7 @@ from eeane import __version__, runtime
 from eeane.cli import main as cli_main
 from eeane.config import EeaneConfig, ModelEntry
 from eeane.engine import CoreMLEngine, InferenceEngine, NonFiniteOutputError, QueueTimeoutError
+from eeane.placement_warnings import artifact_placement_reasons
 from eeane.schemas import (
     EmbeddingObject,
     EmbeddingsRequest,
@@ -229,6 +230,40 @@ def _log_startup_security(config: EeaneConfig) -> None:
         )
 
 
+def _warn_if_not_on_neural_engine(entry: ModelEntry) -> None:
+    """Log one WARNING if any of a model's artifacts will miss the Neural Engine.
+
+    Args:
+        entry: Model entry whose ``artifacts`` and ``batch_artifacts`` are
+            checked. At most one WARNING is logged for the whole entry,
+            naming the affected buckets and the distinct reasons.
+    """
+    affected: list[tuple[int, bool]] = []
+    reasons: list[str] = []
+    for is_batch, artifacts in ((False, entry.artifacts), (True, entry.batch_artifacts)):
+        for bucket, path in sorted((artifacts or {}).items()):
+            found = artifact_placement_reasons(path)
+            if found:
+                affected.append((bucket, is_batch))
+                reasons.extend(reason for reason in found if reason not in reasons)
+    if not affected:
+        return
+    labels = [
+        f"{bucket} (batch artifact)" if is_batch else str(bucket) for bucket, is_batch in affected
+    ]
+    logger.warning(
+        "model '%s': the compiled model for bucket(s) [%s] will not run on the Neural "
+        "Engine (%s); it will run on the CPU instead, which is slower and, for some "
+        "models, gives invalid results. Run `eeane compile %s` with this version of "
+        "eeANE to rebuild it; that does not fix every model. See the README section "
+        '"macOS 27 and the 1 GiB Neural Engine limit"',
+        entry.id,
+        ", ".join(labels),
+        "; ".join(reasons),
+        entry.id,
+    )
+
+
 def _log_served_models(config: EeaneConfig) -> None:
     """Report the served models at startup, one line each.
 
@@ -268,6 +303,7 @@ def _log_served_models(config: EeaneConfig) -> None:
                 entry.id,
                 list(entry.excluded_buckets),
             )
+        _warn_if_not_on_neural_engine(entry)
 
     if config.disabled_models:
         logger.info("configured but disabled: %s", ", ".join(config.disabled_models))
