@@ -351,19 +351,6 @@ class XlmRobertaBackend:
         """
         return SCORE_SPACE_PROBABILITY
 
-    def shrinkable_weight_elements(self, loaded: LoadedModel) -> int | None:
-        """Return the size of the weights that may be quantized to 8 bits.
-
-        Args:
-            loaded: Handle returned by :meth:`load`.
-
-        Returns:
-            Always ``None``: this backend declares no weight whose
-            quantization is known to preserve the model's accuracy, so an
-            oversized model of this architecture is left as it is.
-        """
-        return None
-
     def trace_example(self, kind: str) -> Any:
         """Return the fixed raw example input used for ``torch.jit.trace``.
 

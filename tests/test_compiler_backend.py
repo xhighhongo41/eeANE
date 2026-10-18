@@ -452,7 +452,6 @@ def test_the_protocol_declares_the_documented_members() -> None:
         "padding_input",
         "tokenize",
         "reference_outputs",
-        "shrinkable_weight_elements",
     }
 
 
@@ -1068,12 +1067,3 @@ def test_patched_forward_matches_fp32_reference(
 
     assert np.isfinite(smoke["patched"]).all()
     assert np.abs(smoke["patched"] - smoke["reference"]).max() < PATCH_ABS_TOLERANCE
-
-
-# --- weights a backend allows to be shrunk ------------------------------------
-
-
-@pytest.mark.parametrize("backend_class", _BACKEND_CLASSES, ids=lambda cls: cls.__name__)
-def test_every_encoder_backend_declares_no_shrinkable_weight(backend_class: type) -> None:
-    """These backends offer no weight to quantize, whatever model they are handed."""
-    assert backend_class().shrinkable_weight_elements(SimpleNamespace()) is None

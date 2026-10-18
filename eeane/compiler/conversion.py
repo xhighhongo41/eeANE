@@ -17,7 +17,6 @@ from the ``eeane serve`` code path (see :mod:`eeane.compiler`).
 
 from __future__ import annotations
 
-import gc
 import platform
 import shutil
 import subprocess
@@ -28,18 +27,12 @@ import coremltools as ct
 import numpy as np
 import torch
 import transformers
-from coremltools.optimize import coreml as cto_coreml
 
 from eeane import __version__
 
 # Minimum deployment targets / compute precisions selectable from the CLI.
 TARGETS = {"macos13": ct.target.macOS13, "macos15": ct.target.macOS15}
 PRECISIONS = {"fp16": ct.precision.FLOAT16, "fp32": ct.precision.FLOAT32}
-
-# Suffix of the sibling package a quantized model is written to before it
-# replaces the original. It has to end in ``.mlpackage``: an ML program
-# cannot be saved under any other extension.
-_QUANTIZE_STAGING_SUFFIX = ".quantize_tmp.mlpackage"
 
 
 def trace_model(wrapper: torch.nn.Module, example: dict[str, np.ndarray]) -> torch.jit.ScriptModule:
@@ -142,59 +135,6 @@ def compile_model(mlpackage_path: Path, mlmodelc_path: Path) -> None:
         if mlmodelc_path.exists():
             shutil.rmtree(mlmodelc_path)
         shutil.move(str(produced[0]), str(mlmodelc_path))
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-
-def quantize_weights_to_int8(mlpackage_path: Path, min_elements: int) -> None:
-    """Quantize the largest weights of a saved .mlpackage to 8-bit integers.
-
-    Only weight tensors of at least ``min_elements`` elements are touched;
-    every smaller one keeps the precision it was converted with. Each
-    selected tensor is quantized linearly and symmetrically with one scale
-    per output channel, and the package is rewritten in place.
-
-    The quantized model is first saved next to the original and only then
-    takes its place, so a failure part-way leaves the original package as
-    it was.
-
-    Args:
-        mlpackage_path: Existing .mlpackage path; replaced by its
-            quantized form on success.
-        min_elements: Smallest element count of a weight tensor that is
-            quantized.
-
-    Raises:
-        ValueError: If ``min_elements`` is smaller than 1, which would
-            select every weight of the model.
-    """
-    if min_elements < 1:
-        raise ValueError(f"min_elements must be at least 1, got {min_elements}")
-    config = cto_coreml.OptimizationConfig(
-        global_config=cto_coreml.OpLinearQuantizerConfig(
-            mode="linear_symmetric",
-            dtype="int8",
-            granularity="per_channel",
-            # coremltools selects the weights holding *more* elements than
-            # its threshold, hence the off-by-one against our inclusive
-            # bound.
-            weight_threshold=min_elements - 1,
-        )
-    )
-    staging = mlpackage_path.with_name(mlpackage_path.stem + _QUANTIZE_STAGING_SUFFIX)
-    shutil.rmtree(staging, ignore_errors=True)
-    try:
-        # Nothing here predicts, so the model is never loaded for
-        # execution (which would compile it once more for nothing).
-        mlmodel = ct.models.MLModel(str(mlpackage_path), skip_model_load=True)
-        quantized = cto_coreml.linear_quantize_weights(mlmodel, config)
-        quantized.save(str(staging))
-        # Both handles can still refer to weight files on disk; they are
-        # dropped before the package they were read from is removed.
-        del mlmodel, quantized
-        gc.collect()
-        shutil.rmtree(mlpackage_path)
-        shutil.move(str(staging), str(mlpackage_path))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
