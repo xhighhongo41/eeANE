@@ -8,6 +8,10 @@ Two layers, like the other compile-pipeline test modules:
   threshold constants and status-derivation logic. A tiny byte-level
   tokenizer stands in for a frozen model tokenizer so the tokenization
   path (:mod:`eeane.runtime`) is genuinely exercised, not mocked.
+* The same, for a variant split into parts: the loader is stubbed per
+  part, so the parts really are chained by
+  :class:`eeane.segmented.SegmentedModel` and the placement is really
+  added up across them.
 * One end-to-end run of the real ``run_selfcheck`` over the same
   synthetic ModernBERT that :mod:`tests.test_compiler_pipeline` uses,
   skipped unless that module's local-machine marker is present.
@@ -16,6 +20,7 @@ Two layers, like the other compile-pipeline test modules:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 from collections.abc import Iterator
@@ -31,7 +36,7 @@ from test_compiler_pipeline import _E2E_AVAILABLE, E2E_SEQ_LEN, _build_synthetic
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers.models.modernbert import modeling_modernbert
 
-from eeane import cli, runtime
+from eeane import cli, runtime, segmented
 from eeane.compiler import pipeline, selfcheck
 from eeane.compiler.backends import base
 
@@ -398,6 +403,19 @@ def test_compute_plan_report_degrades_to_unavailable_on_exception(
         "status": "unavailable",
         "reason": "MLComputePlan is not supported here",
     }
+
+
+def test_compute_plan_report_of_a_single_model_lists_no_parts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The report of an unsplit variant keeps exactly the keys it always had."""
+    _install_compute_plan(monkeypatch, _build_fake_plan(ne_count=3, cpu_count=1))
+    artifact = tmp_path / "model.mlmodelc"
+    artifact.mkdir()
+
+    report = selfcheck._compute_plan_report(artifact)
+
+    assert set(report) == {"status", "total_ops", "device_counts", "ne_placement_pct"}
 
 
 # --- _measure_latency ----------------------------------------------------------
@@ -1385,3 +1403,205 @@ def test_an_untemplated_reranker_is_still_measured_on_the_plain_pair_encoding(
     report, _, _ = _run_logit_reranker(monkeypatch, tmp_path, [6.0, -6.0], [6.0, -6.0])
 
     assert report["sanity"]["passed"] is True
+
+
+# --- a variant split into parts ---------------------------------------------------
+
+# Tensor the first part of a two-part stub model hands to the second.
+_BOUNDARY = "hidden1"
+
+
+def _write_parts_dir(directory: Path, count: int = 2) -> Path:
+    """Create the parts directory of a split embedding variant.
+
+    Part ``i`` reads the previous part's ``hidden<i-1>`` (the first part:
+    ``input_ids``) plus ``attention_mask``, and writes ``hidden<i>``; the
+    last part writes ``embedding``. The part directories are empty, since
+    every test here stubs what would load them.
+
+    Returns:
+        The ``.parts`` directory.
+    """
+    parts_dir = directory / "variant.parts"
+    segments = []
+    for index in range(1, count + 1):
+        name = f"part{index:02d}.mlmodelc"
+        (parts_dir / name).mkdir(parents=True)
+        source = "input_ids" if index == 1 else f"hidden{index - 1}"
+        target = "embedding" if index == count else f"hidden{index}"
+        segments.append(segmented.Segment(name, (source, "attention_mask"), (target,)))
+    segmented.write_segments(
+        parts_dir,
+        segmented.SegmentsManifest("embedding", ("input_ids", "attention_mask"), tuple(segments)),
+    )
+    return parts_dir
+
+
+def _install_plans_by_part(monkeypatch: pytest.MonkeyPatch, plans: dict[str, Any]) -> list[str]:
+    """Patch ``MLComputePlan.load_from_path`` to answer per compiled part.
+
+    Args:
+        monkeypatch: Test's monkeypatch fixture.
+        plans: Part directory name -> fake plan, or a message to raise
+            with, simulating a part the API cannot measure.
+
+    Returns:
+        The names of the parts a plan was loaded for, in call order.
+    """
+    loaded: list[str] = []
+
+    def _load(path: Any, compute_units: Any = None) -> Any:
+        name = Path(path).name
+        loaded.append(name)
+        plan = plans[name]
+        if isinstance(plan, str):
+            raise RuntimeError(plan)
+        return plan
+
+    monkeypatch.setattr(compute_plan_module.MLComputePlan, "load_from_path", staticmethod(_load))
+    return loaded
+
+
+def _plan_with_unspecified(ne_count: int, cpu_count: int, unspecified: int) -> _FakePlan:
+    """A fake plan that also has operations without a dispatch decision."""
+    plan = _build_fake_plan(ne_count, cpu_count)
+    devices = dict(plan._device_by_op)
+    devices.update({_FakeOp(): None for _ in range(unspecified)})
+    return _FakePlan(devices)
+
+
+def test_compute_plan_report_adds_up_the_parts_of_a_split_variant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The share is that of all parts' operations together, and each part is listed."""
+    parts_dir = _write_parts_dir(tmp_path)
+    loaded = _install_plans_by_part(
+        monkeypatch,
+        {
+            "part01.mlmodelc": _build_fake_plan(ne_count=9, cpu_count=1),
+            "part02.mlmodelc": _plan_with_unspecified(ne_count=5, cpu_count=5, unspecified=2),
+        },
+    )
+
+    report = selfcheck._compute_plan_report(parts_dir)
+
+    assert loaded == ["part01.mlmodelc", "part02.mlmodelc"]
+    assert report["status"] == "measured"
+    assert report["total_ops"] == 22
+    assert report["device_counts"] == {"NE": 14, "GPU": 0, "CPU": 6, "unspecified": 2}
+    # 14 of the 20 dispatched operations; the undispatched ones do not count.
+    assert report["ne_placement_pct"] == pytest.approx(70.0)
+    assert report["parts"] == [
+        {
+            "name": "part01.mlmodelc",
+            "total_ops": 10,
+            "device_counts": {"NE": 9, "GPU": 0, "CPU": 1, "unspecified": 0},
+            "ne_placement_pct": pytest.approx(90.0),
+        },
+        {
+            "name": "part02.mlmodelc",
+            "total_ops": 12,
+            "device_counts": {"NE": 5, "GPU": 0, "CPU": 5, "unspecified": 2},
+            "ne_placement_pct": pytest.approx(50.0),
+        },
+    ]
+    json.dumps(report)
+
+
+def test_compute_plan_report_of_a_split_variant_is_unavailable_if_one_part_is(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A share over some of the parts would describe a model that is not served."""
+    parts_dir = _write_parts_dir(tmp_path)
+    _install_plans_by_part(
+        monkeypatch,
+        {
+            "part01.mlmodelc": _build_fake_plan(ne_count=9, cpu_count=1),
+            "part02.mlmodelc": "MLComputePlan failed",
+        },
+    )
+
+    report = selfcheck._compute_plan_report(parts_dir)
+
+    assert report == {
+        "status": "unavailable",
+        "reason": "part part02.mlmodelc: MLComputePlan failed",
+    }
+
+
+class _ChainPart:
+    """Stand-in for one loaded part of a two-part split embedding model.
+
+    The first part hands ``input_ids`` on unchanged as the boundary tensor;
+    the second looks the row it receives up in a fixed table of outputs.
+    Both record the feeds they were given.
+    """
+
+    def __init__(self, position: int, row_outputs: dict[tuple[int, ...], np.ndarray]) -> None:
+        """Remember which part this is and the outputs the last one returns."""
+        self.position = position
+        self.row_outputs = row_outputs
+        self.feeds: list[dict[str, np.ndarray]] = []
+
+    def predict(self, feed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Answer like the first or the second part of the chain."""
+        self.feeds.append(feed)
+        if self.position == 1:
+            return {_BOUNDARY: feed["input_ids"]}
+        rows = feed[_BOUNDARY]
+        return {"embedding": np.stack([self.row_outputs[_row_key(row)] for row in rows])}
+
+
+def test_run_selfcheck_measures_a_split_variant_through_its_parts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Every part is loaded on CPU_AND_NE, and accuracy and latency run the whole chain."""
+    sanity_texts = ["alpha", "beta"]
+    reference = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    context, frozen = _make_context(tmp_path, "embedding", {"en": sanity_texts}, "", reference)
+    parts_dir = _write_parts_dir(tmp_path)
+    context = dataclasses.replace(context, mlmodelc_path=parts_dir)
+    rows = runtime.tokenize_texts(frozen, sanity_texts, context.seq_len)["input_ids"]
+    row_outputs = {_row_key(rows[i]): reference[i] for i in range(len(sanity_texts))}
+    loads: list[tuple[str, Any]] = []
+    parts: dict[str, _ChainPart] = {}
+
+    def _load(path: str, compute_units: Any = None) -> _ChainPart:
+        name = Path(path).name
+        loads.append((name, compute_units))
+        parts[name] = _ChainPart(len(parts) + 1, row_outputs)
+        return parts[name]
+
+    monkeypatch.setattr(selfcheck.ct.models, "CompiledMLModel", _load)
+    _install_plans_by_part(
+        monkeypatch,
+        {
+            "part01.mlmodelc": _build_fake_plan(ne_count=10, cpu_count=0),
+            "part02.mlmodelc": _build_fake_plan(ne_count=9, cpu_count=1),
+        },
+    )
+
+    report = selfcheck.run_selfcheck(context)
+
+    assert loads == [
+        ("part01.mlmodelc", selfcheck.ct.ComputeUnit.CPU_AND_NE),
+        ("part02.mlmodelc", selfcheck.ct.ComputeUnit.CPU_AND_NE),
+    ]
+    assert report["status"] == selfcheck.STATUS_PASSED
+    assert report["sanity"]["passed"] is True
+    assert report["sanity"]["cosine_min"] == pytest.approx(1.0)
+    assert report["sanity"]["embedding_dim"] == reference.shape[1]
+    assert report["compute_plan"]["ne_placement_pct"] == pytest.approx(95.0)
+    assert len(report["compute_plan"]["parts"]) == 2
+    assert report["latency"]["n"] == selfcheck.LATENCY_TIMED_PREDICTS
+    # Each part is handed exactly what its segment declares.
+    first, second = parts["part01.mlmodelc"], parts["part02.mlmodelc"]
+    assert {frozenset(feed) for feed in first.feeds} == {frozenset({"input_ids", "attention_mask"})}
+    assert {frozenset(feed) for feed in second.feeds} == {frozenset({_BOUNDARY, "attention_mask"})}
+    # Sanity rows, then the warm-up and timed latency calls, all through both parts.
+    expected_calls = len(sanity_texts) + selfcheck.LATENCY_WARMUP_PREDICTS
+    assert (
+        len(first.feeds) == len(second.feeds) == expected_calls + selfcheck.LATENCY_TIMED_PREDICTS
+    )
+    assert "(20 ops, 2 parts)" in capsys.readouterr().err
+    json.dumps(report)

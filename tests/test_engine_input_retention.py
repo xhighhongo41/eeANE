@@ -20,6 +20,7 @@ import time
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ from eeane import engine as engine_module
 from eeane import runtime
 from eeane.config import ModelEntry
 from eeane.engine import CoreMLEngine, ModelPolicy, _ServedModel
+from eeane.segmented import Segment, SegmentedModel, SegmentsManifest
 
 # Width of the row the stand-in artifacts answer with.
 _WIDTH = 8
@@ -141,24 +143,37 @@ class WatchingLoader:
             A served model backed by the entry's real frozen tokenizer.
         """
         self.calls.append(entry.id)
-        assert entry.tokenizer is not None
-        kind = str(entry.kind)
-        buckets = tuple(sorted(entry.artifacts or ()))
-        compiled: dict[int, WatchingModel] = {}
-        for bucket in buckets:
-            compiled[bucket] = WatchingModel()
-            self.models[entry.id, bucket] = compiled[bucket]
-        return _ServedModel(
-            id=entry.id,
-            kind=kind,
-            tokenizer=runtime.load_frozen_tokenizer(entry.tokenizer),
-            tokenizer_lock=threading.Lock(),
-            compiled=dict(compiled),
-            buckets=buckets,
-            output_name=str(entry.output_name),
-            normalize=entry.normalize,
-            embedding_dim=entry.embedding_dim if kind == "embedding" else None,
-        )
+        compiled: dict[int, Any] = {}
+        for bucket in sorted(entry.artifacts or ()):
+            model = WatchingModel()
+            compiled[bucket] = model
+            self.models[entry.id, bucket] = model
+        return _served_model(entry, compiled)
+
+
+def _served_model(entry: ModelEntry, compiled: dict[int, Any]) -> _ServedModel:
+    """Build the served model of ``entry`` around stand-in artifacts.
+
+    Args:
+        entry: Entry the engine asked for.
+        compiled: Stand-in artifact per bucket.
+
+    Returns:
+        A served model backed by the entry's real frozen tokenizer.
+    """
+    assert entry.tokenizer is not None
+    kind = str(entry.kind)
+    return _ServedModel(
+        id=entry.id,
+        kind=kind,
+        tokenizer=runtime.load_frozen_tokenizer(entry.tokenizer),
+        tokenizer_lock=threading.Lock(),
+        compiled=dict(compiled),
+        buckets=tuple(sorted(compiled)),
+        output_name=str(entry.output_name),
+        normalize=entry.normalize,
+        embedding_dim=entry.embedding_dim if kind == "embedding" else None,
+    )
 
 
 class FakeMonotonic:
@@ -554,3 +569,280 @@ def test_a_reload_after_an_unload_starts_from_a_clean_retention(
     # The reloaded artifacts start with no inputs of their own to replace,
     # so the quarantine still holds only what the unload put there.
     assert len(engine._retired_inputs) == 1
+
+
+# --- retention for a model stored as parts -------------------------------
+#
+# A model too large for the Neural Engine runs as several compiled parts,
+# one after another, and every part is handed arrays of its own: the
+# first one the request's inputs, a later one the intermediate arrays the
+# earlier parts produced. Core ML releases each of those as it releases a
+# single model's inputs, so every part's feed must be held the same way.
+
+# How the stand-in parts below are chained: the first reads the token ids
+# and produces an intermediate, the last reads that intermediate and the
+# model's own attention mask.
+_SPLIT_MANIFEST = SegmentsManifest(
+    output_name="embedding",
+    inputs=("input_ids", "attention_mask"),
+    segments=(
+        Segment(mlmodelc="part01.mlmodelc", inputs=("input_ids",), outputs=("hidden",)),
+        Segment(
+            mlmodelc="part02.mlmodelc",
+            inputs=("hidden", "attention_mask"),
+            outputs=("embedding",),
+        ),
+    ),
+)
+
+
+class WatchingFirstPart:
+    """Stand-in for the first compiled part of a model stored as parts.
+
+    Produces an intermediate array of its own, the way a real first part
+    hands its output on to the next one, and keeps weak references only.
+
+    Attributes:
+        seen: Weak reference to the ``input_ids`` array of every
+            prediction, in call order.
+        produced: Weak reference to the intermediate array of every
+            prediction, in call order.
+    """
+
+    def __init__(self) -> None:
+        """Register a part that has served no prediction yet."""
+        self.seen: list[weakref.ref[np.ndarray]] = []
+        self.produced: list[weakref.ref[np.ndarray]] = []
+
+    def predict(self, feed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Record the feed weakly and answer with a fresh intermediate."""
+        self.seen.append(weakref.ref(feed["input_ids"]))
+        hidden = feed["input_ids"].astype(np.float32)
+        self.produced.append(weakref.ref(hidden))
+        return {"hidden": hidden}
+
+
+class WatchingLastPart:
+    """Stand-in for the last compiled part of a model stored as parts.
+
+    Its answer holds no reference to what it was fed, so the
+    intermediate it reads stays alive only as long as someone else
+    holds it.
+
+    Attributes:
+        seen: Weak reference to the intermediate array of every
+            prediction, in call order.
+        raises: Whether ``predict`` fails instead of answering.
+    """
+
+    def __init__(self) -> None:
+        """Register a part that has served no prediction yet."""
+        self.seen: list[weakref.ref[np.ndarray]] = []
+        self.raises = False
+
+    def predict(self, feed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Record the intermediate weakly, then answer one row per input.
+
+        Raises:
+            RuntimeError: If :attr:`raises` is set.
+        """
+        self.seen.append(weakref.ref(feed["hidden"]))
+        if self.raises:
+            raise RuntimeError("the stand-in part refused its inputs")
+        used = feed["attention_mask"].sum(axis=1).astype(np.float32)
+        return {"embedding": np.arange(_WIDTH, dtype=np.float32)[None, :] + used[:, None]}
+
+
+class SplitWatchingLoader:
+    """Artifact loader serving every bucket as a model stored as two parts.
+
+    Attributes:
+        models: The split model built for each ``(model id, bucket)`` by
+            the most recent load of that model.
+    """
+
+    def __init__(self) -> None:
+        """Register a loader that has loaded nothing yet."""
+        self.models: dict[tuple[str, int], SegmentedModel] = {}
+
+    def __call__(self, entry: ModelEntry) -> _ServedModel:
+        """Build fresh split stand-ins for one entry.
+
+        Args:
+            entry: Entry the engine asked for.
+
+        Returns:
+            A served model backed by the entry's real frozen tokenizer.
+        """
+        compiled: dict[int, Any] = {}
+        for bucket in sorted(entry.artifacts or ()):
+            model = SegmentedModel([WatchingFirstPart(), WatchingLastPart()], _SPLIT_MANIFEST)
+            compiled[bucket] = model
+            self.models[entry.id, bucket] = model
+        return _served_model(entry, compiled)
+
+    def parts(self, model_id: str, bucket: int) -> tuple[WatchingFirstPart, WatchingLastPart]:
+        """Return the two stand-in parts of one bucket's split model."""
+        first, last = self.models[model_id, bucket].parts
+        assert isinstance(first, WatchingFirstPart)
+        assert isinstance(last, WatchingLastPart)
+        return first, last
+
+
+@pytest.fixture
+def split_loader() -> SplitWatchingLoader:
+    """Artifact loader handing out split stand-ins that watch their feeds."""
+    return SplitWatchingLoader()
+
+
+def test_every_parts_feed_outlives_the_request(
+    entries: list[ModelEntry],
+    split_loader: SplitWatchingLoader,
+    build_engine: Callable[..., CoreMLEngine],
+) -> None:
+    """The intermediate handed to a later part is as exposed as the request's inputs."""
+    engine = build_engine(entries, loader=split_loader)
+
+    engine.embed([_SHORT_TEXTS[0]], "emb-a")
+
+    first, last = split_loader.parts("emb-a", 8)
+    assert _alive(first.seen[0]), "the engine dropped the first part's inputs"
+    assert _alive(last.seen[0]), "the engine dropped the intermediate handed to the last part"
+    # The intermediate is the very array the first part produced.
+    assert last.seen[0]() is first.produced[0]()
+    # Every part keeps its own feed; the split model itself is handed
+    # nothing Core ML could hold, so it has no entry of its own.
+    split = split_loader.models["emb-a", 8]
+    assert set(engine._retained_inputs) == {id(first), id(last)}
+    assert id(split) not in engine._retained_inputs
+
+
+def test_replaced_feeds_of_every_part_are_quarantined(
+    entries: list[ModelEntry],
+    split_loader: SplitWatchingLoader,
+    build_engine: Callable[..., CoreMLEngine],
+) -> None:
+    """Each part's previous feed may still be wrapped by Core ML."""
+    engine = build_engine(entries, loader=split_loader)
+
+    engine.embed([_SHORT_TEXTS[0]], "emb-a")
+    engine.embed([_SHORT_TEXTS[1]], "emb-a")
+
+    first, last = split_loader.parts("emb-a", 8)
+    assert _alive(first.seen[0]), "the first part's replaced inputs were released straight away"
+    assert _alive(last.seen[0]), "the replaced intermediate was released straight away"
+    assert _alive(first.seen[1])
+    assert _alive(last.seen[1])
+    assert len(engine._retired_inputs) == 2
+
+
+def test_every_parts_feed_is_retained_when_a_later_part_fails(
+    entries: list[ModelEntry],
+    split_loader: SplitWatchingLoader,
+    build_engine: Callable[..., CoreMLEngine],
+) -> None:
+    """A failing part may have bound its feed, and the parts before it did."""
+    engine = build_engine(entries, loader=split_loader)
+    first, last = split_loader.parts("emb-a", 8)
+    last.raises = True
+
+    with pytest.raises(RuntimeError, match="refused its inputs"):
+        engine.embed([_SHORT_TEXTS[0]], "emb-a")
+
+    # Compared by identity: the retained arrays are alive, so no other
+    # object can have been given their ids meanwhile.
+    handed_ids = first.seen[0]()
+    handed_hidden = last.seen[0]()
+    assert handed_ids is not None
+    assert handed_hidden is not None
+    assert engine._retained_inputs[id(first)]["input_ids"] is handed_ids
+    assert engine._retained_inputs[id(last)]["hidden"] is handed_hidden
+    # The failure released the prediction lock as usual.
+    assert not engine._lock.locked()
+
+
+def test_an_idle_unload_quarantines_every_parts_last_feed(
+    entries: list[ModelEntry],
+    split_loader: SplitWatchingLoader,
+    clock: FakeClock,
+    build_engine: Callable[..., CoreMLEngine],
+) -> None:
+    """Every part of an unloaded split model leaves its last feed in quarantine."""
+    engine = build_engine(
+        entries, policies=_on_demand("emb-a", keep_alive=0), loader=split_loader, clock=clock
+    )
+    engine.embed([_SHORT_TEXTS[0]], "emb-a")
+    first, last = split_loader.parts("emb-a", 8)
+
+    assert engine._sweep_idle(clock.now) == 1
+
+    assert engine.loaded("emb-a") is False
+    assert _alive(first.seen[0]), "the unload released inputs Core ML may still hold"
+    assert _alive(last.seen[0]), "the unload released an intermediate Core ML may still hold"
+    assert len(engine._retired_inputs) == 2
+    assert id(first) not in engine._retained_inputs
+    assert id(last) not in engine._retained_inputs
+
+    _purge_after_grace(engine)
+
+    assert not _alive(first.seen[0])
+    assert not _alive(last.seen[0])
+
+
+def test_an_eviction_quarantines_every_parts_last_feed(
+    entries: list[ModelEntry],
+    split_loader: SplitWatchingLoader,
+    clock: FakeClock,
+    build_engine: Callable[..., CoreMLEngine],
+) -> None:
+    """A split model evicted to make room is unloaded just as carefully."""
+    engine = build_engine(
+        entries,
+        policies=_on_demand("emb-a", "emb-b"),
+        loader=split_loader,
+        clock=clock,
+        max_loaded_models=1,
+    )
+    engine.embed([_SHORT_TEXTS[0]], "emb-a")
+    first, last = split_loader.parts("emb-a", 8)
+
+    engine.embed([_SHORT_TEXTS[1]], "emb-b")
+
+    assert engine.loaded("emb-a") is False
+    assert _alive(first.seen[0])
+    assert _alive(last.seen[0])
+    assert len(engine._retired_inputs) == 2
+
+    _purge_after_grace(engine)
+
+    assert not _alive(first.seen[0])
+    assert not _alive(last.seen[0])
+    # The split model that took its place keeps its own feeds, as always.
+    new_first, new_last = split_loader.parts("emb-b", 8)
+    assert _alive(new_first.seen[0])
+    assert _alive(new_last.seen[0])
+
+
+def test_the_grace_period_releases_a_split_models_replaced_feeds(
+    entries: list[ModelEntry],
+    split_loader: SplitWatchingLoader,
+    build_engine: Callable[..., CoreMLEngine],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retaining every part's feed is a grace period too, not a leak."""
+    fake_monotonic = FakeMonotonic()
+    monkeypatch.setattr(engine_module.time, "monotonic", fake_monotonic)
+    engine = build_engine(entries, loader=split_loader)
+    engine.embed([_SHORT_TEXTS[0]], "emb-a")
+    engine.embed([_SHORT_TEXTS[1]], "emb-a")
+
+    fake_monotonic.advance(engine_module._INPUT_RETENTION_SECONDS + 1.0)
+    engine.embed([_SHORT_TEXTS[2]], "emb-a")
+
+    first, last = split_loader.parts("emb-a", 8)
+    assert not _alive(first.seen[0]), "the quarantine never released the oldest inputs"
+    assert not _alive(last.seen[0]), "the quarantine never released the oldest intermediate"
+    assert _alive(first.seen[1])
+    assert _alive(last.seen[1])
+    assert _alive(first.seen[2])
+    assert _alive(last.seen[2])

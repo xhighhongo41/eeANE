@@ -19,17 +19,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from eeane import ne_limits, segmented
 from eeane.compiler import sources
 
 # Schema versions of the JSON files written next to the artifacts. Bumped
 # whenever a consumer (the cache auto-resolution in eeane.config) would
 # need to tell old and new layouts apart. model_info.json is at 3 since it
-# can now also record how a reranker wants a (query, document) pair
-# spelled out, which a reader that does not know about it would serve
-# without -- asking the model a different question than it was compiled
-# for.
+# can also record how a reranker wants a (query, document) pair spelled
+# out, which a reader that does not know about it would serve without --
+# asking the model a different question than it was compiled for. From 4
+# on, an artifact entry may name a directory of parts (``<stem>.parts``)
+# that are run one after another; a reader that does not know about that
+# would try to load the directory as a single compiled model, so it must
+# refuse the record instead.
 METADATA_FORMAT_VERSION = 1
-MODEL_INFO_FORMAT_VERSION = 3
+MODEL_INFO_FORMAT_VERSION = 4
 
 # Default sequence-length buckets per model kind; they reproduce the
 # v0.4/v0.5 deployed configuration.
@@ -42,6 +46,10 @@ DEFAULT_BUCKETS: dict[str, tuple[int, ...]] = {
 CACHE_SUBDIR = "compiled"
 TOKENIZER_FILENAME = "tokenizer.json"
 MODEL_INFO_FILENAME = "model_info.json"
+
+# Suffix of the directory a variant is stored in instead of a single
+# ``<stem>.mlmodelc`` when it was split into parts (see eeane.segmented).
+PARTS_SUFFIX = ".parts"
 
 # Version keys compared against the recorded metadata when deciding
 # whether an existing variant can be reused.
@@ -213,21 +221,54 @@ def variant_stem(seq_len: int, batch_size: int, attn: str, target: str, precisio
     return stem
 
 
+def parts_path_for(mlmodelc_path: Path) -> Path:
+    """Return where the parts of a split variant are stored.
+
+    Args:
+        mlmodelc_path: The variant's single compiled artifact,
+            ``<stem>.mlmodelc``.
+
+    Returns:
+        ``<stem>.parts`` in the same directory.
+    """
+    return mlmodelc_path.with_suffix(PARTS_SUFFIX)
+
+
+def served_artifact_path(model_root: Path, stem: str) -> Path:
+    """Return the artifact a variant is served from.
+
+    Args:
+        model_root: The model's cache directory.
+        stem: The variant's base name (see :func:`variant_stem`).
+
+    Returns:
+        ``<stem>.parts`` when it holds a parts manifest (the variant was
+        split), else ``<stem>.mlmodelc`` -- whether or not that exists.
+        The manifest is not read here.
+    """
+    parts = model_root / f"{stem}{PARTS_SUFFIX}"
+    if segmented.is_segmented(parts):
+        return parts
+    return model_root / f"{stem}.mlmodelc"
+
+
 def needs_conversion(
-    mlmodelc_path: Path,
+    artifact_path: Path,
     metadata_path: Path,
     versions: Mapping[str, str],
     *,
     force: bool = False,
     pooling: str | None = None,
     dense: Sequence[Mapping[str, Any]] | None = None,
+    size_limit_bytes: int | None = None,
 ) -> bool:
     """Tell whether a variant must be (re)converted.
 
     A variant is reusable only when the compiled artifact and its
     metadata both exist, every :data:`SKIP_VERSION_KEYS` entry matches the
     current environment, and the recorded self-check did not fail (a
-    failed variant must never be silently reused).
+    failed variant must never be silently reused). A parts directory is
+    reusable only when its manifest is valid and lists parts that exist.
 
     The sentence-transformers declarations of a model are compared too.
     They can change on the Hub between two compiles that otherwise use the
@@ -237,7 +278,9 @@ def needs_conversion(
     new declared identity.
 
     Args:
-        mlmodelc_path: Compiled artifact directory.
+        artifact_path: The artifact the variant is served from
+            (:func:`served_artifact_path`): a ``.mlmodelc`` directory, or
+            the ``.parts`` directory of a split variant.
         metadata_path: Variant metadata JSON path.
         versions: Version block of the current environment.
         force: ``--force``; short-circuits to ``True``.
@@ -252,11 +295,28 @@ def needs_conversion(
             never knew about projections reads as ``None`` too, which is
             what a model without one declares -- so an existing cache
             stays reusable.
+        size_limit_bytes: The Neural Engine size limit this run splits
+            models for, or ``None`` for none. A single artifact, or any
+            part of a split one, larger than it was built under a larger
+            limit -- on another macOS version, or with an earlier
+            ``--ne-size-limit`` -- and would not run on the Neural Engine
+            here, so it is rebuilt (and split to fit) rather than reused.
 
     Returns:
         ``True`` when the variant must be converted.
     """
-    if force or not mlmodelc_path.is_dir():
+    if force or not artifact_path.is_dir():
+        return True
+    compiled_models = [artifact_path]
+    if artifact_path.suffix == PARTS_SUFFIX or segmented.is_segmented(artifact_path):
+        try:
+            manifest = segmented.load_segments(artifact_path)
+        except segmented.SegmentsError:
+            return True
+        compiled_models = segmented.part_paths(artifact_path, manifest)
+    if size_limit_bytes is not None and any(
+        ne_limits.compiled_model_size_bytes(path) > size_limit_bytes for path in compiled_models
+    ):
         return True
     try:
         recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -317,7 +377,9 @@ def discover_variants(
     silently drop the buckets compiled by earlier runs. A variant belongs
     to the family when its recorded batch size, attention implementation,
     deployment target, and precision all match the current invocation and
-    its ``.mlmodelc`` still exists on disk.
+    its served artifact (:func:`served_artifact_path`) still exists on
+    disk -- for a split variant, as a parts directory whose manifest is
+    valid.
 
     Args:
         model_root: The model's cache directory (holding ``s*.json``
@@ -328,9 +390,11 @@ def discover_variants(
         precision: Compute precision of the current invocation.
 
     Returns:
-        Mapping of bucket length to the existing ``.mlmodelc`` path.
-        Unreadable or incomplete metadata simply leaves its variant
-        unlisted (fail toward "not present", never an error).
+        Mapping of bucket length to the existing served artifact: a
+        ``.mlmodelc`` path, or a ``.parts`` path for a split variant.
+        Unreadable or incomplete metadata, or an unusable parts
+        directory, simply leaves its variant unlisted (fail toward "not
+        present", never an error).
     """
     found: dict[int, Path] = {}
     if not model_root.is_dir():
@@ -352,9 +416,15 @@ def discover_variants(
             continue
         if not matches:
             continue
-        mlmodelc_path = model_root / f"{stem}.mlmodelc"
-        if mlmodelc_path.is_dir():
-            found[seq_len] = mlmodelc_path
+        artifact_path = served_artifact_path(model_root, stem)
+        if not artifact_path.is_dir():
+            continue
+        if artifact_path.suffix == PARTS_SUFFIX:
+            try:
+                segmented.load_segments(artifact_path)
+            except segmented.SegmentsError:
+                continue
+        found[seq_len] = artifact_path
     return found
 
 
@@ -374,8 +444,9 @@ def aggregate_calibration(
     Args:
         kind: Resolved model kind (``embedding_dim`` is only ever derived
             for ``"embedding"``).
-        cache_artifacts: Bucket -> ``.mlmodelc`` path of every same-family
-            variant now present in the cache.
+        cache_artifacts: Bucket -> served artifact (``.mlmodelc``, or
+            ``.parts`` for a split variant) of every same-family variant
+            now present in the cache.
         run_reports: Self-check reports this invocation itself produced,
             keyed by bucket. A bucket this run reused or skipped is not
             in here and is read back from disk instead.
@@ -392,8 +463,8 @@ def aggregate_calibration(
             ``embedding_dim`` -- a corrupt or hand-edited cache.
     """
     reports: dict[int, Mapping[str, Any] | None] = {
-        seq_len: run_reports[seq_len] if seq_len in run_reports else _read_selfcheck(mlmodelc_path)
-        for seq_len, mlmodelc_path in cache_artifacts.items()
+        seq_len: run_reports[seq_len] if seq_len in run_reports else _read_selfcheck(artifact_path)
+        for seq_len, artifact_path in cache_artifacts.items()
     }
     buckets = {
         str(seq_len): _calibration_bucket_entry(reports[seq_len]) for seq_len in sorted(reports)
@@ -406,18 +477,19 @@ def aggregate_calibration(
     return calibration, recommended_buckets, embedding_dim
 
 
-def _read_selfcheck(mlmodelc_path: Path) -> Mapping[str, Any] | None:
+def _read_selfcheck(artifact_path: Path) -> Mapping[str, Any] | None:
     """Read back the ``selfcheck`` block of a variant from its metadata file.
 
     Args:
-        mlmodelc_path: Compiled ``.mlmodelc`` path; its metadata JSON is
-            the same stem with a ``.json`` extension.
+        artifact_path: Served artifact path (``<stem>.mlmodelc`` or
+            ``<stem>.parts``); its metadata JSON is the same stem with a
+            ``.json`` extension.
 
     Returns:
         The ``selfcheck`` dict, or ``None`` when the metadata is missing,
         unreadable, or carries no usable ``selfcheck`` block.
     """
-    metadata_path = mlmodelc_path.with_suffix(".json")
+    metadata_path = artifact_path.with_suffix(".json")
     try:
         recorded = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
@@ -558,8 +630,9 @@ def build_config_snippet(
         model_id: Value of the ``id`` key.
         kind: ``"embedding"`` or ``"reranker"``.
         tokenizer_path: Frozen ``tokenizer.json``.
-        artifacts: Bucket length -> compiled ``.mlmodelc`` path.
-        batch_artifacts: Bucket length -> batched ``.mlmodelc`` path, for
+        artifacts: Bucket length -> served artifact: a compiled
+            ``.mlmodelc``, or the ``.parts`` directory of a split variant.
+        batch_artifacts: Bucket length -> batched served artifact, for
             the buckets one was compiled for. Listed in the explicit
             block only, and only for an embedding model: the config
             schema accepts the table on an embedding entry that pins its

@@ -32,6 +32,7 @@ def test_build_parser_compile_defaults() -> None:
     assert args.attn == "eager"
     assert args.keep_mlpackage is False
     assert args.skip_selfcheck is False
+    assert args.ne_size_limit is None
     assert args.allow_pickle is False
 
 
@@ -109,6 +110,74 @@ def test_build_parser_compile_parses_all_other_options(tmp_path: Path) -> None:
     assert args.keep_mlpackage is True
     assert args.skip_selfcheck is True
     assert args.allow_pickle is True
+
+
+# --- --ne-size-limit --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("1GiB", "1GiB"),
+        ("2GiB", "2GiB"),
+        ("800MiB", "800MiB"),
+        ("1073741824", "1073741824"),
+        ("1.5 GiB", "1.5 GiB"),
+        ("  2gib ", "2gib"),
+        ("none", "none"),
+        ("NONE", "NONE"),
+    ],
+)
+def test_build_parser_compile_keeps_the_size_limit_as_typed(given: str, expected: str) -> None:
+    """A valid --ne-size-limit must reach args verbatim (stripped), not as a number."""
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["compile", "some/path", "--ne-size-limit", given])
+
+    assert args.ne_size_limit == expected
+
+
+@pytest.mark.parametrize(
+    "bad_value", ["", "0", "0GiB", "-1", "1GB", "1G", "500MB", "1.5", "abc", "1GiB2"]
+)
+def test_build_parser_compile_rejects_invalid_size_limit(
+    bad_value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A size the compiler could not use must exit 2 at parse time, saying what is accepted."""
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["compile", "some/path", f"--ne-size-limit={bad_value}"])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--ne-size-limit" in err
+    assert f"invalid Neural Engine size limit {bad_value.strip()!r}" in err
+    assert "1GiB, 800MiB or 1073741824 (bytes), or 'none'" in err
+
+
+def test_build_parser_compile_size_limit_needs_a_value() -> None:
+    """--ne-size-limit with nothing after it must exit 2."""
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["compile", "some/path", "--ne-size-limit"])
+
+    assert excinfo.value.code == 2
+
+
+def test_compile_help_describes_the_size_limit(capsys: pytest.CaptureFixture[str]) -> None:
+    """The option must be documented with its accepted forms and the OS-dependent default."""
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["compile", "--help"])
+
+    assert excinfo.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--ne-size-limit SIZE" in help_text
+    assert "'none' disables splitting" in help_text
+    assert "2 GiB up to macOS 26, 1 GiB from macOS 27" in help_text
 
 
 # --- dependency guard --------------------------------------------------------

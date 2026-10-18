@@ -6,6 +6,15 @@ Layout of the cache (one directory per compiled model)::
         tokenizer.json
         model_info.json
         s512_b1_eager_macos13.mlmodelc/
+        s1024_b1_eager_macos13.parts/
+            segments.json
+            part01.mlmodelc/
+            part02.mlmodelc/
+
+A variant whose compiled model is above the Neural Engine size limit is
+stored as a ``<stem>.parts`` directory instead of a single ``.mlmodelc``:
+compiled parts that each fit, run one after another as the manifest
+``segments.json`` describes (see :mod:`eeane.segmented`).
 
 This module implements the *runtime* half of that convention -- where the
 cache root is, which directory a model id maps to, and how to read a

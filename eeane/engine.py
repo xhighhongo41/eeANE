@@ -39,7 +39,7 @@ from typing import Any, TypeVar
 import coremltools as ct
 import numpy as np
 
-from eeane import runtime
+from eeane import runtime, segmented
 from eeane.config import EeaneConfig, ModelEntry
 from eeane.engine_pipeline import (
     _TOKENIZE_THREAD_PREFIX,
@@ -99,10 +99,34 @@ _INPUT_RETENTION_SECONDS = 30.0
 
 
 def _load_compiled(path: Path) -> Any:
+    """Load one bucket's artifact, whether it is one compiled model or several.
+
+    Args:
+        path: Path to a ``.mlmodelc`` directory, or to a parts directory
+            holding a model stored as several compiled parts (see
+            :mod:`eeane.segmented`).
+
+    Returns:
+        The loaded ``ct.models.CompiledMLModel``, or, for a parts
+        directory, a :class:`~eeane.segmented.SegmentedModel` running its
+        loaded parts in order. Both are predicted with the same
+        ``predict(inputs)`` call.
+
+    Raises:
+        SegmentsError: If a parts directory's manifest is not usable. No
+            part is loaded then.
+    """
+    if segmented.is_segmented(path):
+        return segmented.SegmentedModel.load(path, _load_compiled_part)
+    return _load_compiled_part(path)
+
+
+def _load_compiled_part(path: Path) -> Any:
     """Load a compiled Core ML model on the CPU+ANE compute units.
 
     Args:
-        path: Path to a ``.mlmodelc`` directory.
+        path: Path to a ``.mlmodelc`` directory: a whole model, or one
+            part of a model stored as several.
 
     Returns:
         The loaded ``ct.models.CompiledMLModel``.
@@ -275,7 +299,11 @@ class CoreMLEngine:
     * ``_retention_lock`` (one per engine) guards the inputs kept
       referenced for Core ML (see :meth:`_retain_inputs`). It is a leaf
       lock too: it is held for a handful of dict and deque operations and
-      for nothing else, so it also needs no place in the order above.
+      for nothing else, so it also needs no place in the order above. A
+      model stored as parts retains each part's inputs as that part
+      returns, i.e. with the prediction lock held; since nothing is ever
+      taken while holding the retention lock, that nesting cannot
+      deadlock.
 
     Tokenizer calls take one lock per model instead, since the mutable
     state they protect belongs to a single tokenizer. That holds for the
@@ -1489,7 +1517,8 @@ class CoreMLEngine:
         """Run one batch-of-one prediction under the process-wide lock.
 
         Args:
-            model: Loaded ``CompiledMLModel`` for the selected bucket.
+            model: Loaded model for the selected bucket (see
+                :meth:`_predict_output`).
             inputs: ``input_ids``/``attention_mask`` arrays of shape
                 ``(1, S)``, dtype int32.
             output_name: Output name requested at conversion time.
@@ -1521,8 +1550,9 @@ class CoreMLEngine:
         """Run one prediction over ``rows`` inputs under the process-wide lock.
 
         Args:
-            model: Loaded ``CompiledMLModel`` for the selected bucket,
-                compiled for exactly ``rows`` inputs.
+            model: Loaded model for the selected bucket (see
+                :meth:`_predict_output`), compiled for exactly ``rows``
+                inputs.
             inputs: ``input_ids``/``attention_mask`` arrays of shape
                 ``(rows, S)``, dtype int32.
             output_name: Output name requested at conversion time.
@@ -1554,7 +1584,10 @@ class CoreMLEngine:
         """Take the prediction lock, predict once and pick the output tensor.
 
         Args:
-            model: Loaded ``CompiledMLModel`` for the selected bucket.
+            model: Loaded model for the selected bucket: a
+                ``CompiledMLModel``, or a
+                :class:`~eeane.segmented.SegmentedModel` for a model
+                stored as parts, which is predicted with the same call.
             inputs: Model inputs, already shaped for that artifact.
             output_name: Output name requested at conversion time.
             lock_timeout: Bounded wait for the prediction lock; see
@@ -1576,13 +1609,23 @@ class CoreMLEngine:
                 "request timed out before inference started: the engine was still busy "
                 "with earlier requests when the deadline passed"
             )
+        split = isinstance(model, segmented.SegmentedModel)
         try:
-            prediction = model.predict(inputs)
+            if split:
+                # Every part is handed arrays of its own, the outputs of
+                # earlier parts included, so each part's feed is retained
+                # as that part returns (also when it fails) rather than
+                # the model's inputs alone. That happens under the
+                # prediction lock, which the retention lock may nest in.
+                prediction = model.predict(inputs, retain=self._retain_inputs)
+            else:
+                prediction = model.predict(inputs)
         finally:
             self._lock.release()
-            # Also after a failed prediction: Core ML may already have
-            # wrapped the inputs before whatever went wrong.
-            self._retain_inputs(model, inputs)
+            if not split:
+                # Also after a failed prediction: Core ML may already have
+                # wrapped the inputs before whatever went wrong.
+                self._retain_inputs(model, inputs)
         key = _resolve_output_key(prediction, output_name)
         return prediction[key], key
 
@@ -1603,8 +1646,9 @@ class CoreMLEngine:
 
         Args:
             model: Compiled model the inputs were handed to. Its identity
-                keys the retention, so every bucket -- and every batch
-                size within a bucket -- keeps its own last inputs.
+                keys the retention, so every bucket -- every batch size
+                within a bucket, and every part of a model stored as
+                parts -- keeps its own last inputs.
             inputs: The arrays handed to that model's ``predict``.
         """
         now = time.monotonic()
@@ -1633,12 +1677,16 @@ class CoreMLEngine:
         now = time.monotonic()
         with self._retention_lock:
             for model in (*served.compiled.values(), *served.compiled_batch.values()):
-                retired = self._retained_inputs.pop(id(model), None)
-                # None once the artifact has served no prediction -- and
-                # once it has already been retired, which is what an
-                # artifact serving several buckets at once looks like.
-                if retired is not None:
-                    self._retired_inputs.append((now, retired))
+                # A model stored as parts retains one feed per part, under
+                # that part's identity (see _predict_output).
+                handed = model.parts if isinstance(model, segmented.SegmentedModel) else (model,)
+                for part in handed:
+                    retired = self._retained_inputs.pop(id(part), None)
+                    # None once the artifact has served no prediction --
+                    # and once it has already been retired, which is what
+                    # an artifact serving several buckets looks like.
+                    if retired is not None:
+                        self._retired_inputs.append((now, retired))
 
     def _purge_retired_locked(self, now: float) -> None:
         """Let go of every quarantined input whose grace period has passed.

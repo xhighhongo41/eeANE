@@ -4,8 +4,10 @@ One invocation compiles one model into one or more sequence-length
 buckets: the source is resolved (local directory or Hub id), a backend and
 model kind are dispatched from ``config.json``, the tokenizer is frozen and
 verified, and then -- with the PyTorch model loaded and patched exactly
-once -- every bucket is traced, converted, compiled to ``.mlmodelc`` and
-described by a metadata JSON file. Once every bucket is done, the
+once -- every bucket is traced, converted, compiled to ``.mlmodelc`` (or,
+when that is above the Neural Engine size limit, split into compiled parts
+that each fit, stored as ``<stem>.parts``) and described by a metadata
+JSON file. Once every bucket is done, the
 per-bucket self-checks are aggregated into the model-level
 ``model_info.json`` (``recommended_buckets``, ``calibration``,
 ``embedding_dim``), which is what :mod:`eeane.config` reads back to
@@ -21,7 +23,9 @@ Everything is written under the cache root (``--out-dir``, default
 The decisions *about* the outputs (cache layout, artifact naming, bucket
 defaults, reuse of existing artifacts, the self-check aggregation, the
 generated ``[[models]]`` snippet) live in :mod:`eeane.compiler.artifacts`;
-the Core ML steps themselves live in :mod:`eeane.compiler.conversion`.
+the Core ML steps themselves live in :mod:`eeane.compiler.conversion`, and
+the splitting of a model too large for the Neural Engine in
+:mod:`eeane.compiler.splitting`.
 
 The self-check (accuracy sanity, ANE placement, latency) is not part of
 this module either: :data:`SelfcheckFn` is the hook
@@ -46,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from eeane import __version__, ne_limits
-from eeane.compiler import conversion, sources
+from eeane.compiler import conversion, sources, splitting
 from eeane.compiler.artifacts import (
     CACHE_SUBDIR,
     METADATA_FORMAT_VERSION,
@@ -64,8 +68,10 @@ from eeane.compiler.artifacts import (
     model_cache_name,
     model_identifier,
     needs_conversion,
+    parts_path_for,
     resolve_buckets,
     resolve_out_root,
+    served_artifact_path,
     variant_stem,
     write_config_snippet,
     write_json_record,
@@ -108,17 +114,10 @@ BATCH_ARTIFACTS_RECORD_KEY = "batch_artifacts"
 # own pair encoding, as every record written before templates existed.
 PAIR_TEMPLATE_RECORD_KEY = "pair_template"
 
-# Key a variant's metadata records a size reduction under. Only a variant
-# that was actually reduced carries it, so the record of every other one
-# reads exactly as it did before reductions existed.
-SIZE_REDUCTION_RECORD_KEY = "size_reduction"
-
-# Name recorded for the one reduction method there is: weights quantized
-# linearly to 8-bit integers, with one scale per output channel.
-SIZE_REDUCTION_METHOD = "linear_int8_per_channel"
-
-# Bytes per GiB, for the sizes quoted in progress messages.
-_BYTES_PER_GIB = 1 << 30
+# Key a variant's metadata records how it was split into parts under.
+# Only a variant that was actually split carries it, so the record of
+# every other one reads exactly as it did before splitting existed.
+SPLIT_RECORD_KEY = "split"
 
 # Building block of the long tokenizer-verification input. The gate inputs
 # must be self-contained (a user's machine has no repository test data),
@@ -159,7 +158,10 @@ class SelfcheckContext:
         seq_len: Fixed sequence length S of this variant.
         batch_size: Fixed batch size B of this variant.
         output_name: Core ML graph output name requested at conversion.
-        mlmodelc_path: Compiled artifact to measure.
+        mlmodelc_path: Compiled artifact to measure: a ``.mlmodelc``, or
+            the ``.parts`` directory of a variant split to fit the Neural
+            Engine, whose parts run one after another (see
+            :mod:`eeane.segmented`).
         tokenizer_path: Frozen ``tokenizer.json`` of the model.
     """
 
@@ -212,6 +214,13 @@ class _CompileContext:
         recorded_args: Resolved argument block recorded in metadata.
         backend: Loaded compile backend instance.
         selfcheck_fn: Self-check hook, or ``None`` when unavailable.
+        size_limit_bytes: Neural Engine size limit a compiled variant is
+            split to fit, resolved once per run; ``None`` when no limit
+            applies, so nothing is split.
+        size_limit_source: Where that limit came from:
+            :data:`~eeane.compiler.splitting.LIMIT_SOURCE_OVERRIDE` for
+            ``--ne-size-limit``, else
+            :data:`~eeane.compiler.splitting.LIMIT_SOURCE_OS`.
     """
 
     args: argparse.Namespace
@@ -229,6 +238,8 @@ class _CompileContext:
     backend: Any
     selfcheck_fn: SelfcheckFn | None
     pair_template: PairTemplate | None = None
+    size_limit_bytes: int | None = None
+    size_limit_source: str = splitting.LIMIT_SOURCE_OS
 
 
 def run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None = None) -> int:
@@ -321,6 +332,11 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
         CompileError: On any reported failure; :func:`run` renders it.
     """
     batch_size = _validate_batch(args.batch)
+    # Resolved before anything is loaded, so a bad override fails at once.
+    size_limit_bytes = ne_limits.ne_size_limit_bytes(override=args.ne_size_limit)
+    size_limit_source = (
+        splitting.LIMIT_SOURCE_OS if args.ne_size_limit is None else splitting.LIMIT_SOURCE_OVERRIDE
+    )
 
     _progress(f"[1/6] Resolving source '{args.source}'")
     model_dir = sources.resolve_source(args.source, allow_pickle=args.allow_pickle)
@@ -339,6 +355,7 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     dense = _declared_dense(kind, model_dir)
     if dense is not None:
         _progress(f"      dense           : {_dense_summary(dense)}")
+    _progress(f"      NE size limit   : {_size_limit_summary(size_limit_bytes, size_limit_source)}")
 
     out_root = resolve_out_root(args.out_dir)
     model_root = out_root / CACHE_SUBDIR / model_cache_name(args.source, model_dir)
@@ -379,6 +396,8 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
         backend=backend,
         selfcheck_fn=selfcheck_fn,
         pair_template=backend.pair_template(model_dir, kind),
+        size_limit_bytes=size_limit_bytes,
+        size_limit_source=size_limit_source,
     )
 
     # The tokenizer is frozen and verified on every run: it costs seconds
@@ -391,8 +410,12 @@ def _run(args: argparse.Namespace, selfcheck_fn: SelfcheckFn | None) -> int:
     plans = _plan_variants(context, buckets)
     run_reports = _convert_variants(context, plans)
 
+    # A variant split into parts is served from its parts directory, so
+    # that is what the record and the snippet have to name.
     cache_artifacts = dict(existing)
-    cache_artifacts.update({plan.seq_len: plan.mlmodelc_path for plan in plans})
+    cache_artifacts.update(
+        {plan.seq_len: served_artifact_path(model_root, plan.stem) for plan in plans}
+    )
 
     # model_info.json describes every batch size the cache holds, whatever
     # this run compiled, so runs of different batch sizes complete the
@@ -471,7 +494,8 @@ def _artifact_families(
             present in the cache.
 
     Returns:
-        Bucket -> ``.mlmodelc`` path for :data:`SERVING_BATCH_SIZE` and
+        Bucket -> served artifact (a ``.mlmodelc``, or the ``.parts``
+        directory of a split variant) for :data:`SERVING_BATCH_SIZE` and
         :data:`BATCHED_BATCH_SIZE` (empty for a batch size the cache holds
         nothing for), plus this run's own family when it compiled neither.
     """
@@ -629,6 +653,24 @@ def _declared_dense(kind: str, model_dir: Path) -> tuple[dict[str, Any], ...] | 
         return dense_record(read_dense_modules(model_dir))
     except ValueError:
         return None
+
+
+def _size_limit_summary(limit_bytes: int | None, source: str) -> str:
+    """Describe the Neural Engine size limit of a run for the progress log.
+
+    Args:
+        limit_bytes: The resolved limit, or ``None`` for none.
+        source: Where it came from (see :class:`_CompileContext`).
+
+    Returns:
+        A text like ``"1 GiB (from the macOS version)"``.
+    """
+    if limit_bytes is None:
+        return "none (models are not split)"
+    origin = (
+        "--ne-size-limit" if source == splitting.LIMIT_SOURCE_OVERRIDE else "from the macOS version"
+    )
+    return f"{ne_limits.describe_size_limit(limit_bytes)} ({origin})"
 
 
 def _dense_summary(dense: Sequence[Mapping[str, Any]]) -> str:
@@ -789,126 +831,50 @@ def _convert_variant(
         timings["compile"] = time.perf_counter() - step
 
         # Needs the package, so it runs before the package is dropped.
-        size_reduction = _reduce_oversized_model(context, plan, loaded, timings)
-    except CompileError:
-        raise
+        step = time.perf_counter()
+        split = splitting.split_oversized_variant(
+            plan.mlpackage_path,
+            plan.mlmodelc_path,
+            output_name=context.output_name,
+            limit_bytes=context.size_limit_bytes,
+            limit_source=context.size_limit_source,
+            keep_part_packages=bool(context.args.keep_mlpackage),
+            progress=lambda message: _progress(f"      s{plan.seq_len}: {message}"),
+        )
+        if split is not None:
+            timings["split"] = time.perf_counter() - step
     except Exception as exc:
         # A half-written intermediate would only confuse the next run (and
-        # waste hundreds of MB); the previous .mlmodelc, if any, is left
-        # untouched because compile_model replaces it only on success.
+        # waste hundreds of MB). The previous .mlmodelc, if any, is left
+        # untouched by a failed conversion or compilation, because
+        # compile_model replaces it only on success; a failed split has
+        # already removed the artifact it could not make fit.
         shutil.rmtree(plan.mlpackage_path, ignore_errors=True)
         raise CompileError(
             f"failed to convert bucket {plan.seq_len} of '{context.model_dir}': {exc}"
         ) from exc
 
-    artifacts = {"mlmodelc": str(plan.mlmodelc_path)}
+    served_path = plan.mlmodelc_path if split is None else parts_path_for(plan.mlmodelc_path)
+    artifacts = {"mlmodelc": str(served_path)}
     if context.args.keep_mlpackage:
         artifacts["mlpackage"] = str(plan.mlpackage_path)
     else:
-        # Hundreds of MB per bucket; the .mlmodelc is what gets served.
+        # Hundreds of MB per bucket; the compiled artifact is what gets served.
         shutil.rmtree(plan.mlpackage_path, ignore_errors=True)
 
-    selfcheck = _run_selfcheck(context, plan)
+    selfcheck = _run_selfcheck(context, plan, served_path)
     timings["total"] = time.perf_counter() - started + load_seconds
     write_json_record(
         plan.metadata_path,
-        _build_metadata(
-            context, plan, timings, artifacts, patches, selfcheck, size_reduction=size_reduction
-        ),
+        _build_metadata(context, plan, timings, artifacts, patches, selfcheck, split=split),
     )
-    _progress(
-        f"      s{plan.seq_len}: done in {timings['total']:.1f}s -> {plan.mlmodelc_path.name}"
-    )
+    _progress(f"      s{plan.seq_len}: done in {timings['total']:.1f}s -> {served_path.name}")
 
     if selfcheck.get("status") == SELFCHECK_STATUS_FAILED:
         raise SelfcheckFailedError(
             f"the self-check of bucket {plan.seq_len} failed; see {plan.metadata_path}"
         )
     return selfcheck
-
-
-def _reduce_oversized_model(
-    context: _CompileContext,
-    plan: VariantPlan,
-    loaded: Any,
-    timings: dict[str, float],
-) -> dict[str, Any] | None:
-    """Shrink a compiled variant the Neural Engine would otherwise refuse.
-
-    A compiled model above the Neural Engine's size limit is not an error
-    anywhere: it silently runs on the CPU instead. So when the system
-    converting the model enforces that limit, the freshly compiled
-    variant exceeds it, and the backend declares a weight that may be
-    quantized, that weight is stored as 8-bit integers and the variant is
-    compiled again. If any of the three does not hold, nothing is touched
-    and the variant stays byte-for-byte what it would have been.
-
-    Args:
-        context: Per-invocation state.
-        plan: The variant just compiled; its package must still exist.
-        loaded: Handle of the loaded and patched model, which the backend
-            reads the size of its shrinkable weight from.
-        timings: Per-step durations of this variant. A ``"shrink"`` entry
-            (quantization plus the second compilation) is added only when
-            the variant was reduced.
-
-    Returns:
-        A JSON-serializable record of the reduction -- method, element
-        threshold, the limit, the compiled size before and after, and
-        whether the result fits -- or ``None`` when nothing was done.
-    """
-    if not ne_limits.ne_size_limit_applies():
-        return None
-    limit = ne_limits.NE_MODEL_SIZE_LIMIT_BYTES
-    size_before = ne_limits.compiled_model_size_bytes(plan.mlmodelc_path)
-    if size_before <= limit:
-        return None
-
-    # Asked only now, so a backend is never consulted about a model that
-    # fits anyway.
-    min_elements = context.backend.shrinkable_weight_elements(loaded)
-    if min_elements is None:
-        _progress(
-            f"      s{plan.seq_len}: the compiled model ({_gib(size_before)}) exceeds the "
-            f"Neural Engine size limit ({_gib(limit)}) and this kind of model has no weight "
-            "that can be shrunk; it will not run on the Neural Engine"
-        )
-        return None
-
-    _progress(
-        f"      s{plan.seq_len}: the compiled model ({_gib(size_before)}) exceeds the "
-        f"Neural Engine size limit ({_gib(limit)}); quantizing weights of {min_elements} "
-        "or more elements to 8 bits and compiling again"
-    )
-    step = time.perf_counter()
-    conversion.quantize_weights_to_int8(plan.mlpackage_path, min_elements)
-    conversion.compile_model(plan.mlpackage_path, plan.mlmodelc_path)
-    timings["shrink"] = time.perf_counter() - step
-
-    size_after = ne_limits.compiled_model_size_bytes(plan.mlmodelc_path)
-    within_limit = size_after <= limit
-    if within_limit:
-        _progress(f"      s{plan.seq_len}: reduced to {_gib(size_after)}, within the limit")
-    else:
-        # Recorded rather than refused: the artifact is correct and
-        # usable, it merely runs on the CPU.
-        _progress(
-            f"      s{plan.seq_len}: still {_gib(size_after)} after quantization, above the "
-            "Neural Engine size limit; it will not run on the Neural Engine"
-        )
-    return {
-        "method": SIZE_REDUCTION_METHOD,
-        "min_elements": min_elements,
-        "limit_bytes": limit,
-        "size_before_bytes": size_before,
-        "size_after_bytes": size_after,
-        "within_limit": within_limit,
-    }
-
-
-def _gib(size_bytes: int) -> str:
-    """Format a byte count as GiB for a progress message."""
-    return f"{size_bytes / _BYTES_PER_GIB:.3f} GiB"
 
 
 def _plan_variants(context: _CompileContext, buckets: Sequence[int]) -> list[VariantPlan]:
@@ -931,22 +897,22 @@ def _plan_variants(context: _CompileContext, buckets: Sequence[int]) -> list[Var
             context.args.target,
             context.args.precision,
         )
-        mlmodelc_path = context.model_root / f"{stem}.mlmodelc"
         metadata_path = context.model_root / f"{stem}.json"
         plans.append(
             VariantPlan(
                 seq_len=seq_len,
                 stem=stem,
                 mlpackage_path=context.model_root / f"{stem}.mlpackage",
-                mlmodelc_path=mlmodelc_path,
+                mlmodelc_path=context.model_root / f"{stem}.mlmodelc",
                 metadata_path=metadata_path,
                 convert=needs_conversion(
-                    mlmodelc_path,
+                    served_artifact_path(context.model_root, stem),
                     metadata_path,
                     context.versions,
                     force=bool(context.args.force),
                     pooling=context.pooling,
                     dense=context.dense,
+                    size_limit_bytes=context.size_limit_bytes,
                 ),
             )
         )
@@ -1029,12 +995,16 @@ def _pair_template_summary(context: _CompileContext, freeze_report: Mapping[str,
     )
 
 
-def _run_selfcheck(context: _CompileContext, plan: VariantPlan) -> dict[str, Any]:
+def _run_selfcheck(
+    context: _CompileContext, plan: VariantPlan, artifact_path: Path
+) -> dict[str, Any]:
     """Run the self-check hook for one variant, or record why it was skipped.
 
     Args:
         context: Per-invocation state.
         plan: The variant that was just compiled.
+        artifact_path: What it is served from: its ``.mlmodelc``, or its
+            ``.parts`` directory when it was split.
 
     Returns:
         The self-check report to store in the variant metadata.
@@ -1060,7 +1030,7 @@ def _run_selfcheck(context: _CompileContext, plan: VariantPlan) -> dict[str, Any
                 seq_len=plan.seq_len,
                 batch_size=context.batch_size,
                 output_name=context.output_name,
-                mlmodelc_path=plan.mlmodelc_path,
+                mlmodelc_path=artifact_path,
                 tokenizer_path=context.tokenizer_path,
             )
         )
@@ -1143,7 +1113,7 @@ def _build_metadata(
     artifacts: Mapping[str, str],
     patches: Mapping[str, Any],
     selfcheck: Mapping[str, Any],
-    size_reduction: Mapping[str, Any] | None = None,
+    split: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble one variant's metadata record.
 
@@ -1157,16 +1127,18 @@ def _build_metadata(
             records what was actually applied rather than an assumption
             tied to one architecture.
         selfcheck: Self-check report (possibly ``status="skipped"``).
-        size_reduction: Record of how the variant was shrunk to fit the
-            Neural Engine, or ``None`` when it was not.
+        split: Record of how the variant was split into parts that fit
+            the Neural Engine (see
+            :func:`eeane.compiler.splitting.split_oversized_variant`), or
+            ``None`` when it was not.
 
     Returns:
         A JSON-serializable metadata record. Its ``variant.pooling`` and
         ``variant.dense`` are ``None`` (JSON ``null``) for a reranker, or
         when the embedding model's declaration could not be read; see
         :attr:`_CompileContext.pooling` and :attr:`_CompileContext.dense`.
-        It carries a ``size_reduction`` entry only when one is given, so
-        the record of a variant that was not shrunk is unchanged.
+        It carries a :data:`SPLIT_RECORD_KEY` entry only when one is
+        given, so the record of a variant that was not split is unchanged.
     """
     metadata: dict[str, Any] = {
         "format_version": METADATA_FORMAT_VERSION,
@@ -1187,8 +1159,8 @@ def _build_metadata(
         "artifacts": dict(artifacts),
         "selfcheck": dict(selfcheck),
     }
-    if size_reduction is not None:
-        metadata[SIZE_REDUCTION_RECORD_KEY] = dict(size_reduction)
+    if split is not None:
+        metadata[SPLIT_RECORD_KEY] = dict(split)
     return metadata
 
 
@@ -1206,7 +1178,8 @@ def _build_model_info(
 
     Args:
         context: Per-invocation state.
-        artifacts: Bucket -> ``.mlmodelc`` path of every
+        artifacts: Bucket -> served artifact (``.mlmodelc``, or ``.parts``
+            for a split variant) of every
             :data:`SERVING_BATCH_SIZE` variant now present in the cache
             (this run's, when it compiled that family, plus the ones kept
             from earlier runs). This is the table serving is built on.
@@ -1219,7 +1192,7 @@ def _build_model_info(
             buckets ``eeane.config`` should load by default.
         embedding_dim: That call's third element: the shared embedding
             width, or ``None`` for a reranker or an unmeasured cache.
-        batch_artifacts: Bucket -> ``.mlmodelc`` path of every
+        batch_artifacts: Bucket -> served artifact of every
             :data:`BATCHED_BATCH_SIZE` variant in the cache. Recorded
             under :data:`BATCH_ARTIFACTS_RECORD_KEY` when there is any,
             and left out of the record entirely otherwise, so a cache
@@ -1310,6 +1283,7 @@ def _recorded_args(
         "attn": args.attn,
         "keep_mlpackage": bool(args.keep_mlpackage),
         "skip_selfcheck": bool(args.skip_selfcheck),
+        "ne_size_limit": args.ne_size_limit,
         "force": bool(args.force),
     }
 
