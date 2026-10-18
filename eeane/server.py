@@ -255,8 +255,9 @@ def _warn_if_not_on_neural_engine(entry: ModelEntry) -> None:
         "model '%s': the compiled model for bucket(s) [%s] will not run on the Neural "
         "Engine (%s); it will run on the CPU instead, which is slower and, for some "
         "models, gives invalid results. Run `eeane compile %s` with this version of "
-        "eeANE to rebuild it; that does not fix every model. See the README section "
-        '"macOS 27 and the 1 GiB Neural Engine limit"',
+        "eeANE to rebuild it: a model above the size limit is split into parts that "
+        "each fit, but a rebuild does not raise a low placement for every model. See "
+        'the README section "Large models and the Neural Engine size limit"',
         entry.id,
         ", ".join(labels),
         "; ".join(reasons),

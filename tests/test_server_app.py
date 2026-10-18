@@ -28,9 +28,10 @@ from conftest import (
 )
 from fastapi.testclient import TestClient
 
-from eeane import runtime
+from eeane import ne_limits, runtime
 from eeane.config import EeaneConfig
 from eeane.engine import EmbeddingBatch, NonFiniteOutputError, QueueTimeoutError, RerankBatch
+from eeane.segmented import Segment, SegmentsManifest, write_segments
 from eeane.server import AdmissionController, HealthRateLimiter, create_app
 
 # API key used by the authenticated fixtures below (test-only value).
@@ -1634,7 +1635,49 @@ def test_startup_warns_once_for_a_model_with_a_low_placement_artifact(
     assert "[128, 512]" in message
     assert "0.0%" in message
     assert "eeane compile org/model-a" in message
-    assert "macOS 27 and the 1 GiB Neural Engine limit" in message
+    assert "split into parts that each fit" in message
+    assert "a rebuild does not raise a low placement for every model" in message
+    assert message.endswith(
+        'See the README section "Large models and the Neural Engine size limit"'
+    )
+
+
+def test_startup_warns_about_a_split_model_whose_part_is_above_the_limit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parts_dir = tmp_path / "s128.parts"
+    parts_dir.mkdir()
+    for name in ("part01.mlmodelc", "part02.mlmodelc"):
+        (parts_dir / name).mkdir()
+    write_segments(
+        parts_dir,
+        SegmentsManifest(
+            output_name="embedding",
+            inputs=("input_ids",),
+            segments=(
+                Segment(mlmodelc="part01.mlmodelc", inputs=("input_ids",), outputs=("hidden",)),
+                Segment(mlmodelc="part02.mlmodelc", inputs=("hidden",), outputs=("embedding",)),
+            ),
+        ),
+    )
+    # Judged as on macOS 27, with a second part too large for it.
+    monkeypatch.setattr(ne_limits, "macos_major_version", lambda _mac_version=None: 27)
+    monkeypatch.setattr(
+        ne_limits,
+        "compiled_model_size_bytes",
+        lambda path: int(1.5 * (1 << 30)) if Path(path).name == "part02.mlmodelc" else 0,
+    )
+    entry = make_model_entry("org/model-a").model_copy(update={"artifacts": {128: parts_dir}})
+    config = make_config(with_reranker=False, extra_models=[entry])
+
+    warnings = _start_and_collect(config, caplog)
+
+    assert len(warnings) == 1
+    assert "[128]" in warnings[0]
+    assert (
+        "1 of its 2 compiled parts are above the 1 GiB the Neural Engine accepts on macOS 27 "
+        "and later (the largest is 1.50 GiB)" in warnings[0]
+    )
 
 
 def test_startup_does_not_warn_for_models_without_reasons(

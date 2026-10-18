@@ -223,13 +223,17 @@ class _ServedModel:
             model needs its own lock; sharing one across models would
             serialize unrelated requests for nothing.
         compiled: Loaded ``CompiledMLModel`` per sequence-length bucket.
+            A bucket whose model is stored as several compiled parts is
+            served as a :class:`~eeane.segmented.SegmentedModel` instead,
+            which is predicted with the same ``predict(inputs)`` call.
         buckets: Ascending sequence-length buckets, i.e. the keys of
             :attr:`compiled`.
         compiled_batch: Loaded batched ``CompiledMLModel`` per bucket, for
             the buckets one is configured for; empty when none is, which
             is what an entry without batched artifacts is served with.
             Inputs of one request that share such a bucket are predicted
-            together instead of one at a time.
+            together instead of one at a time. A batched model stored as
+            parts is a ``SegmentedModel`` here too.
         pair_template: How a rerank pair is spelled out for this model,
             with the template's fixed parts already tokenized, or
             ``None`` for a model scored through the tokenizer's own pair
