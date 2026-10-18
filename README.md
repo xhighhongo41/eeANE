@@ -12,13 +12,15 @@ Hugging Face distribution form and compiled locally into Core ML
 artifacts that load in seconds and run on the ANE — keeping your GPU
 and most of your unified memory free for other work.
 
-> **On macOS 27 or later? Recompile large models.** macOS 27 lowered the
-> size of model the Neural Engine accepts from 2 GiB to 1 GiB, without
-> any error or warning: a larger model silently runs on the CPU. The
-> Qwen3 models are affected, and artifacts compiled by eeANE 1.6.0 or
-> earlier, or on macOS 26 or earlier, must be recompiled with eeANE
-> 1.6.1 or later on macOS 27. See
-> [macOS 27 and the 1 GiB Neural Engine limit](#macos-27-and-the-1-gib-neural-engine-limit).
+> **On macOS 27 or later? Recompile large models with eeANE 1.7.0 or
+> later.** macOS 27 lowered the size of model the Neural Engine accepts
+> from 2 GiB to 1 GiB, without any error or warning: a larger model
+> silently runs on the CPU. The Qwen3 0.6B models and the XLM-RoBERTa
+> large-class models are above 1 GiB (the XLM-RoBERTa ones then give NaN
+> output). Upgrade eeANE to 1.7.0 or later and recompile them on macOS 27
+> with `eeane compile <id>`: they are now split automatically into parts
+> that fit. See
+> [Large models and the Neural Engine size limit](#large-models-and-the-neural-engine-size-limit).
 
 ## Highlights
 
@@ -64,95 +66,146 @@ supported (see Known limitations). Docker is not supported either —
 containers on macOS run inside a Linux VM, and the ANE is not passed
 through to it.
 
-## macOS 27 and the 1 GiB Neural Engine limit
+## Large models and the Neural Engine size limit
 
-**What changed.** Up to macOS 26, the Neural Engine accepted a compiled
-model of up to about 2 GiB. From macOS 27 on, that limit is 1 GiB
-(1,073,741,824 bytes). A compiled model above it is not rejected:
-conversion, loading and inference all succeed, and nothing is logged by
-the system. Every operation of the model simply runs on the CPU instead.
-This was measured on an M2 Mac mini with macOS 27.0.1; Apple has not
-documented the change, so the limit may differ on other hardware or
-change again.
+**The limit.** The Neural Engine accepts a compiled Core ML model only up
+to a certain size, judged for each compiled model on its own: about
+2 GiB up to macOS 26, and 1 GiB (1,073,741,824 bytes) from macOS 27 on.
+A larger model is not rejected: conversion, loading and inference all
+succeed and the system logs nothing, but every operation runs on the CPU
+instead. The 1 GiB figure was measured on an M2 Mac mini with macOS
+27.0.1; Apple has not documented the limit, so it may differ on other
+hardware or change again.
 
-**What you see.**
+**What eeANE does.** Since 1.7.0, when a compiled model is above the
+limit of the macOS version `eeane compile` runs on, `eeane compile`
+splits the converted model into parts that each fit (with coremltools'
+`bisect_model`; a part that is still too large is split again, up to 16
+parts). It stores them as a directory `<stem>.parts/`, holding
+`segments.json` and `part01.mlmodelc`, `part02.mlmodelc`, ..., instead
+of a single `<stem>.mlmodelc`. `eeane serve` loads the parts together
+and runs them one after another; the API, the configuration and the
+results are the same as for an unsplit model. Every weight keeps its
+FP16 precision, and splitting does not change the numbers: the same
+weights run split and unsplit on the Neural Engine give bit-identical
+outputs.
 
-| Model | Compiled size | On macOS 27 without the fix |
-|---|---|---|
-| `Qwen/Qwen3-Embedding-0.6B`, `Qwen/Qwen3-Reranker-0.6B` | 1.11 GiB | Correct results, but on the CPU: about 3.5x slower at 128 tokens (67 ms instead of 19 ms) |
-| XLM-RoBERTa large-class models (see below) | 1.04 GiB and up | Not usable: the output is not a number (NaN), and `eeane compile` reports a failed self-check |
-| Every other verified model, including the default ruri-v3 pair | under 1 GiB | Unaffected |
+| Model | Compiled size | Unsplit, on macOS 27 | eeANE 1.7.0 on macOS 27 |
+|---|---|---|---|
+| `Qwen/Qwen3-Embedding-0.6B`, `Qwen/Qwen3-Reranker-0.6B` | 1.11 GiB | Runs on the CPU: correct results, but about 3.5x slower at 128 tokens | Split into 2 parts |
+| The seven XLM-RoBERTa large-class models (listed below) | 1.04–1.06 GiB | Runs on the CPU: the output is NaN, and the self-check fails | Split into 2 parts |
+| Every other verified model, including the default ruri-v3 pair | under 1 GiB | Unaffected | Compiled exactly as before |
 
-**What to do: recompile on macOS 27 with eeANE 1.6.1 or later.** Run
-`eeane compile` again for each affected model, on the Mac that serves
-it:
+**What to do: upgrade to eeANE 1.7.0 or later and recompile.** Run
+`eeane compile` again for each model above 1 GiB, on the Mac that
+serves it:
 
 ```
 eeane compile Qwen/Qwen3-Embedding-0.6B
-eeane compile Qwen/Qwen3-Reranker-0.6B
+eeane compile intfloat/multilingual-e5-large
 ```
 
 No option is needed, and neither is `--force`: artifacts made by an
-older eeANE are rebuilt automatically. When a model of a supported kind
-would exceed the limit, `eeane compile` now stores its vocabulary
-embedding table as 8-bit integers (every other weight stays FP16), which
-brings the compiled model back under 1 GiB. The output of `eeane
-compile` says so:
+older eeANE are rebuilt automatically, and so is any artifact (or any
+part of a split one) larger than the limit of the current system. So
+**after upgrading a Mac from macOS 26 to 27, run `eeane compile <id>`
+again** for each model compiled there earlier. (An artifact split on
+macOS 27 also runs on macOS 26, since its parts are below both limits.)
+The output of `eeane compile` names the limit it uses and reports the
+split:
 
 ```
-s128: the compiled model (1.111 GiB) exceeds the Neural Engine size limit (1.000 GiB); quantizing weights of 155309056 or more elements to 8 bits and compiling again
-s128: reduced to 0.966 GiB, within the limit
+NE size limit   : 1 GiB (from the macOS version)
+...
+s128: the compiled model (1.111 GiB) is above the Neural Engine size limit (1 GiB); splitting it into parts that each fit
+s128: split into 2 parts (0.557 GiB, 0.553 GiB) in 7.5 s
 ```
 
-Measured on macOS 27.0.1 after recompiling (M2 Mac mini, 16 GB):
+**Measured results.** On macOS 27.0.1 with eeANE 1.7.0 (M2 Mac mini,
+16 GB). Placement is the share of operations placed on the Neural Engine
+over all parts; "vs CPU-only" compares with the same artifact run on the
+CPU only.
 
 | Model | Bucket | Neural Engine placement | Warm latency | vs CPU-only |
 |---|---|---|---|---|
-| Qwen/Qwen3-Embedding-0.6B | 128 | 99.4% | 19.3 ms | 3.5x |
-| Qwen/Qwen3-Embedding-0.6B | 512 | 99.4% | 104.2 ms | 2.5x |
-| Qwen/Qwen3-Embedding-0.6B | 1024 | 99.4% | 287.6 ms | 2.3x |
-| Qwen/Qwen3-Reranker-0.6B | 512 | 99.3% | 105.5 ms | 2.4x |
-| Qwen/Qwen3-Reranker-0.6B | 1024 | 99.3% | 288.0 ms | 2.3x |
+| Qwen/Qwen3-Embedding-0.6B | 128 | 99.4% | 20.1 ms | 3.5x |
+| Qwen/Qwen3-Embedding-0.6B | 512 | 99.4% | 104.4 ms | 2.6x |
+| Qwen/Qwen3-Embedding-0.6B | 1024 | 99.4% | 292.9 ms | 2.4x |
+| Qwen/Qwen3-Reranker-0.6B | 512 | 99.3% | 104.2 ms | 2.5x |
+| Qwen/Qwen3-Reranker-0.6B | 1024 | 99.3% | 292.0 ms | 2.3x |
 
-Placement and speed are back to what these models showed on macOS 26
-(99.3 to 99.4%, 18.76 ms at 128 tokens). Accuracy is unchanged in the
-built-in self-check (cosine 0.99994 for the embedding model, the same
-value as before). Against the reference implementations, the embedding
-model's row-wise cosine stays at 0.9996 or higher and the reranker's
-score differs by at most 0.23 in logit space (the acceptance threshold is
-0.3); among 567 document pairs whose reference scores differ by more
-than 0.2, one pair of clearly irrelevant documents (relevance around
-0.0001) changed order.
+Placement and speed are close to what these models showed unsplit on
+macOS 26 (99.3–99.4%, 18.76 ms at 128 tokens); each part boundary costs
+well under 1 ms (a 4-part split of the same model measured 20.9 ms at
+128 tokens, against 20.1 ms for 2 parts). The built-in self-check gives
+cosine 0.99994 for the embedding model. Against the reference
+implementations, the embedding model's row-wise cosine is 0.9998 or
+higher and the reranker's score differs by at most 0.21 in logit space
+(the acceptance threshold is 0.3); the top document is the same for all
+9 queries, and none of the 567 document pairs whose reference scores
+differ by more than 0.2 changes order.
 
-**The operating system you compile on decides.** The reduction is
-applied only when `eeane compile` runs on macOS 27 or later. On macOS 26
-or earlier a model is compiled exactly as before, because it fits the
-2 GiB limit there. So **if you upgrade a Mac to macOS 27, recompile the
-affected models afterwards**: artifacts made on the older system are
-above the new limit and will run on the CPU. This path could not be
-tested on macOS 26 or earlier.
+The XLM-RoBERTa large-class models are all split into 2 parts. Warm
+latency per bucket; "—" means the model has no such bucket:
+
+| Model | Neural Engine placement | 128 | 512 | 1024 |
+|---|---|---|---|---|
+| intfloat/multilingual-e5-large | 96.7% | 12.2 ms | 70.3 ms | — |
+| intfloat/multilingual-e5-large-instruct | 96.7% | 11.6 ms | 70.0 ms | — |
+| BAAI/bge-m3 | 97.8% | 11.6 ms | 73.9 ms | 220.8 ms |
+| Snowflake/snowflake-arctic-embed-l-v2.0 | 97.8% | 11.6 ms | 74.1 ms | 222.0 ms |
+| BAAI/bge-reranker-v2-m3 | 97.8% | — | 73.8 ms | 220.9 ms |
+| BAAI/bge-reranker-large | 97.8% | — | 70.4 ms | — |
+| hotchpotch/japanese-bge-reranker-v2-m3-v1 | 97.8% | — | 74.1 ms | 220.8 ms |
+
+Every bucket passes the self-check and the output is finite; placement
+and speed match what these models showed on macOS 26 (96.7–97.8%, about
+11.6 / 71.5 ms at 128 / 512 tokens). Against the reference
+implementations on short sentences in eight languages and on short
+pairs, the embedding cosine is 0.99998 or higher, the reranker
+probability differs by 0.0014 or less, and the top document is the same
+everywhere. On long Japanese passages, multilingual-e5-large-instruct's
+cosine goes down to 0.9987 and bge-reranker-large's probability differs
+by up to 0.024. That is the precision of these models in FP16 on the
+Neural Engine, not an effect of the split: the same weights give
+bit-identical outputs split and unsplit.
+
+**Overriding the limit.** `eeane compile --ne-size-limit SIZE` replaces
+the limit derived from the macOS version. SIZE is `1GiB`, `2GiB`,
+`800MiB` or a number of bytes; decimal units such as `1GB` are refused
+on purpose. Use it to compile for a Mac that serves on another macOS
+version — for example on macOS 26 for a Mac running macOS 27:
+
+```
+eeane compile Qwen/Qwen3-Embedding-0.6B --ne-size-limit 1GiB
+```
+
+`--ne-size-limit none` disables splitting: a model above the limit of
+the serving Mac then stays a single compiled model and runs on the CPU.
 
 **The server tells you.** At start-up, `eeane serve` checks every
 configured model and logs a warning for one that will not run on the
-Neural Engine, either because that was already recorded when it was
-compiled, or because it is above 1 GiB on macOS 27 or later:
+Neural Engine, either because only a low share of its operations was
+placed there when it was compiled, or because it is above the limit of
+the running macOS. A split model is judged part by part:
 
 ```
-WARNING eeane.server: model 'Qwen/Qwen3-Embedding-0.6B': the compiled model for bucket(s) [128, 512, 1024] will not run on the Neural Engine (it is 1.11 GiB, above the 1 GiB the Neural Engine accepts on macOS 27 and later); it will run on the CPU instead, which is slower and, for some models, gives invalid results. Run `eeane compile Qwen/Qwen3-Embedding-0.6B` with this version of eeANE to rebuild it; that does not fix every model. See the README section "macOS 27 and the 1 GiB Neural Engine limit"
+WARNING eeane.server: model 'Qwen/Qwen3-Embedding-0.6B': the compiled model for bucket(s) [128] will not run on the Neural Engine (only 0.0% of its operations were placed on the Neural Engine when it was compiled; it is 1.11 GiB, above the 1 GiB the Neural Engine accepts on macOS 27 and later); it will run on the CPU instead, which is slower and, for some models, gives invalid results. Run `eeane compile Qwen/Qwen3-Embedding-0.6B` with this version of eeANE to rebuild it: a model above the size limit is split into parts that each fit, but a rebuild does not raise a low placement for every model. See the README section "Large models and the Neural Engine size limit"
 ```
 
-The server still starts; the warning is the only sign.
+This example is from a model compiled with `--ne-size-limit none` on
+macOS 27. For a split model with a part that is too large, the reason
+reads `N of its M compiled parts are above the 1 GiB the Neural Engine
+accepts on macOS 27 and later (the largest is X GiB)`. The server still
+starts; the warning is the only sign. Recompiling fixes a model that is
+above the limit; it does not raise a low placement for every model.
 
-**Models this does not fix yet.** The size reduction is applied to the
-Qwen3 family only. The XLM-RoBERTa large-class models in the verified
-list are above 1 GiB as well and **cannot currently be used on macOS 27
-or later**: `intfloat/multilingual-e5-large` was measured (0% placement,
-NaN output), and `BAAI/bge-m3`, `Snowflake/snowflake-arctic-embed-l-v2.0`,
-`intfloat/multilingual-e5-large-instruct`, `BAAI/bge-reranker-v2-m3`,
-`BAAI/bge-reranker-large` and `hotchpotch/japanese-bge-reranker-v2-m3-v1`
-share its size and are expected to behave the same (not measured). They
-keep working on macOS 26 and earlier. Support is planned for a later
-release.
+**Compatibility.** Caches written by eeANE 1.7.0 use `model_info.json`
+format 4. eeANE 1.6.1 and earlier refuse such a record with an error
+asking to upgrade eeANE, since they cannot serve a split model. eeANE
+1.7.0 still reads caches written by earlier versions. The macOS 26
+(2 GiB) behaviour of 1.7.0 was checked by tests only, not on a macOS 26
+machine.
 
 ## Installation
 
@@ -413,22 +466,31 @@ than BERT's.
 
 | Model | Type | Buckets |
 |---|---|---|
-| BAAI/bge-m3 <sup>1</sup> <sup>3</sup> | embedding | 128/512/1024 |
-| Snowflake/snowflake-arctic-embed-l-v2.0 <sup>3</sup> | embedding | 128/512/1024 |
+| BAAI/bge-m3 <sup>1</sup> | embedding | 128/512/1024 |
+| Snowflake/snowflake-arctic-embed-l-v2.0 | embedding | 128/512/1024 |
 | ibm-granite/granite-embedding-107m-multilingual | embedding | 128/512 |
 | ibm-granite/granite-embedding-278m-multilingual | embedding | 128/512 |
 | ibm-granite/granite-embedding-30m-english | embedding | 128/512 |
 | ibm-granite/granite-embedding-125m-english | embedding | 128/512 |
 | intfloat/multilingual-e5-base | embedding | 128/512 |
-| intfloat/multilingual-e5-large <sup>3</sup> | embedding | 128/512 |
-| intfloat/multilingual-e5-large-instruct <sup>3</sup> | embedding | 128/512 |
+| intfloat/multilingual-e5-large | embedding | 128/512 |
+| intfloat/multilingual-e5-large-instruct | embedding | 128/512 |
 | sentence-transformers/paraphrase-multilingual-mpnet-base-v2 | embedding | 128/512 |
-| BAAI/bge-reranker-v2-m3 <sup>3</sup> | reranker | 512/1024 |
+| BAAI/bge-reranker-v2-m3 | reranker | 512/1024 |
 | BAAI/bge-reranker-base | reranker | 512 |
-| BAAI/bge-reranker-large <sup>3</sup> | reranker | 512 |
+| BAAI/bge-reranker-large | reranker | 512 |
 | hotchpotch/japanese-reranker-cross-encoder-xsmall-v1 | reranker | 512 |
 | hotchpotch/japanese-reranker-cross-encoder-small-v1 | reranker | 512 |
-| hotchpotch/japanese-bge-reranker-v2-m3-v1 <sup>3</sup> | reranker | 512/1024 |
+| hotchpotch/japanese-bge-reranker-v2-m3-v1 | reranker | 512/1024 |
+
+The seven large-class models in this table (bge-m3,
+snowflake-arctic-embed-l-v2.0, multilingual-e5-large,
+multilingual-e5-large-instruct, bge-reranker-v2-m3, bge-reranker-large
+and japanese-bge-reranker-v2-m3-v1) are above 1 GiB once compiled, so on
+macOS 27 and later `eeane compile` splits each of them into two parts;
+they were verified that way on macOS 27.0.1 with eeANE 1.7.0, and on
+macOS 26 before. See
+[Large models and the Neural Engine size limit](#large-models-and-the-neural-engine-size-limit).
 
 **BERT** (embedding models only)
 
@@ -465,11 +527,6 @@ than BERT's.
 <sup>1</sup> Ships `pytorch_model.bin` only, so compiling it needs
 `--allow-pickle` (see [Checkpoint formats](#checkpoint-formats)).
 
-<sup>3</sup> Above 1 GiB once compiled, so it cannot currently be used on
-macOS 27 or later; see
-[macOS 27 and the 1 GiB Neural Engine limit](#macos-27-and-the-1-gib-neural-engine-limit).
-It works on macOS 26 and earlier.
-
 **Qwen3 (decoder-only)**
 
 A generative reranker's score carries the same meaning as any other
@@ -482,9 +539,9 @@ differently once compiled.
 | Qwen/Qwen3-Reranker-0.6B | reranker | 512/1024 |
 
 These two models were verified on macOS 26.6.2 and, compiled with eeANE
-1.6.1, on macOS 27.0.1. On macOS 27 or later they must be compiled with
-eeANE 1.6.1 or later; see
-[macOS 27 and the 1 GiB Neural Engine limit](#macos-27-and-the-1-gib-neural-engine-limit).
+1.7.0 (split into two parts), on macOS 27.0.1. On macOS 27 or later,
+compile them with eeANE 1.7.0 or later; see
+[Large models and the Neural Engine size limit](#large-models-and-the-neural-engine-size-limit).
 
 **Gemma 3 (bidirectional embedding models only)**
 
@@ -821,15 +878,18 @@ exactly (`tools/verify_server.py` in a repository checkout).
 - **`500 ... produced a non-finite output ...`**: see Known
   limitations below. This means the model ran off the Neural Engine;
   verify Neural Engine availability on the machine serving the
-  request. On macOS 27 or later, a model above 1 GiB is the usual
-  cause; see
-  [macOS 27 and the 1 GiB Neural Engine limit](#macos-27-and-the-1-gib-neural-engine-limit).
+  request. On macOS 27 or later, a model above 1 GiB that was not
+  split (compiled by an eeANE older than 1.7.0, on an older macOS, or
+  with `--ne-size-limit none`) is the usual cause: recompile it with
+  `eeane compile <id>`; see
+  [Large models and the Neural Engine size limit](#large-models-and-the-neural-engine-size-limit).
 - **A start-up warning says a model "will not run on the Neural
   Engine"**, or a model became several times slower after a macOS
   upgrade: recompile it with `eeane compile <id>` on the current
-  system. See
-  [macOS 27 and the 1 GiB Neural Engine limit](#macos-27-and-the-1-gib-neural-engine-limit)
-  for which models that fixes.
+  system. Since 1.7.0, a model above the size limit is split into parts
+  that each fit; a model compiled with `--ne-size-limit none` is not
+  split and, above the limit, runs on the CPU. See
+  [Large models and the Neural Engine size limit](#large-models-and-the-neural-engine-size-limit).
 - **A request occasionally takes much longer than usual**: the first
   request after a model was idle past `keep_alive` pays the on-demand
   reload (typically well under a second), and the very first request
@@ -923,12 +983,15 @@ exactly (`tools/verify_server.py` in a repository checkout).
   size is not placed on the Neural Engine at all and everything falls
   back to the CPU — conversion, loading and inference all still succeed.
   The ceiling is about 2 GiB up to macOS 26 and **1 GiB from macOS 27
-  on**. The 4B and 8B models in the Qwen3 family are far above either
-  and are not supported. On macOS 27 or later the ceiling also catches
-  the 0.6B Qwen3 models (handled by `eeane compile` since 1.6.1) and the
-  XLM-RoBERTa large-class models (not handled yet, and unusable there);
-  see
-  [macOS 27 and the 1 GiB Neural Engine limit](#macos-27-and-the-1-gib-neural-engine-limit).
+  on**. Since 1.7.0, `eeane compile` splits a model above it into parts
+  that each fit; a model compiled by an older eeANE or on an older macOS
+  must be recompiled, and with `--ne-size-limit none` a model above the
+  ceiling is not split and runs on the CPU. See
+  [Large models and the Neural Engine size limit](#large-models-and-the-neural-engine-size-limit).
+  The 4B and 8B models in the Qwen3 family are far above even 2 GiB and
+  remain unsupported: they have not been tried with splitting, and the
+  memory converting and serving them needs on a 16 GB machine is
+  untested.
 - **EmbeddingGemma at bucket 2048**: the model's maximum length is 2048,
   and `--buckets 2048` compiles, but in measurements here that bucket is
   not placed on the Neural Engine and runs on the CPU (0% placement,
@@ -1050,6 +1113,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 1.7.0 | A compiled model above the Neural Engine size limit is split automatically into parts that each fit, which `eeane serve` runs one after another (same API, configuration and results; every weight stays FP16); the limit is decided by the macOS version `eeane compile` runs on (2 GiB up to macOS 26, 1 GiB from macOS 27) and can be overridden with `--ne-size-limit`; the seven XLM-RoBERTa large-class models become usable on macOS 27; Qwen3 models no longer need their embedding table stored as 8-bit integers (that workaround is removed); the start-up warning judges a split model part by part; `model_info.json` format 4, which eeANE 1.6.1 and earlier cannot read |
 | 1.6.1 | Qwen3 models run on the Neural Engine again on macOS 27, where the size of model it accepts dropped from 2 GiB to 1 GiB: when a Qwen3 model compiled on macOS 27 or later exceeds the limit, `eeane compile` stores its vocabulary embedding table as 8-bit integers and the compiled model fits again (placement, speed and accuracy match macOS 26); `eeane serve` warns at start-up about a model that will not run on the Neural Engine; XLM-RoBERTa large-class models are documented as not usable on macOS 27 for now |
 | 1.6.0 | Gemma 3 (bidirectional embedding models) becomes eeANE's fifth supported architecture family, compiled through the regular `eeane compile` path and served as-is; generative, multimodal and Gemma 3n variants are rejected with a reason; function-preserving rewrites keep the model within the FP16 range; one more verified model (google/embeddinggemma-300m; 62 -> 63); fetch failures for models that require accepting terms now say what to do |
 | 1.5.0 | Qwen3 (decoder-only) becomes eeANE's fourth supported architecture family, compiled and served through the regular `eeane compile`/`eeane serve` path: last-token pooling for embedding models, and a generative reranker scored from a yes/no logit pair instead of a classification head; model-kind detection for `ForCausalLM` architectures now reads the model's sentence-transformers module declaration instead of the architecture name alone; two verified models (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B) |
