@@ -29,7 +29,7 @@ from pathlib import Path
 
 import uvicorn
 
-from eeane import __version__
+from eeane import __version__, ne_limits
 from eeane.config import CliOverrides, ConfigError, LoadedConfig, load_config
 
 logger = logging.getLogger("eeane.cli")
@@ -175,6 +175,16 @@ def _add_compile_subparser(
         help="Skip the post-conversion self-check (development use; default: run it).",
     )
     compile_parser.add_argument(
+        "--ne-size-limit",
+        metavar="SIZE",
+        type=_parse_size_limit,
+        default=None,
+        help="Override the largest compiled model the Neural Engine is assumed to accept, "
+        "e.g. 1GiB, 2GiB, 800MiB or a number of bytes. A model above it is split into parts "
+        "that each fit; 'none' disables splitting. Default: decided by the macOS version "
+        "(2 GiB up to macOS 26, 1 GiB from macOS 27).",
+    )
+    compile_parser.add_argument(
         "--allow-pickle",
         action="store_true",
         help="Allow loading pickle-based checkpoints (pytorch_model.bin) when no "
@@ -219,6 +229,30 @@ def _parse_buckets(value: str) -> list[int]:
             )
         buckets.append(bucket)
     return buckets
+
+
+def _parse_size_limit(value: str) -> str:
+    """Validate a ``--ne-size-limit`` value and keep it as the user typed it.
+
+    The text is kept rather than the parsed byte count so the metadata of
+    a compiled model records the limit in the words it was given in.
+
+    Args:
+        value: Raw option value, e.g. ``"1GiB"`` or ``"none"``.
+
+    Returns:
+        ``value`` without surrounding whitespace.
+
+    Raises:
+        argparse.ArgumentTypeError: If :func:`eeane.ne_limits.parse_size_limit`
+            refuses it. Used as an argparse ``type=`` callback, so this
+            becomes a clean ``parse_args`` exit code 2.
+    """
+    try:
+        ne_limits.parse_size_limit(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value.strip()
 
 
 def _add_config_option(subparser: argparse.ArgumentParser) -> None:

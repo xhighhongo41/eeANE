@@ -50,8 +50,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Highest ``model_info.json`` schema version this release knows how to
 # read. A newer record may assign different meanings to the keys below,
-# so it is rejected instead of guessed at.
-MAX_MODEL_INFO_FORMAT_VERSION = 3
+# so it is rejected instead of guessed at. Version 4 is the first whose
+# artifact entries may name a directory of parts run one after another
+# (see ``eeane.segmented``) instead of a single compiled model.
+MAX_MODEL_INFO_FORMAT_VERSION = 4
 
 # Optional table of batched artifacts in a cache record, keyed by batch
 # size (as a string, since JSON object keys are strings) so one record

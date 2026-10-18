@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from eeane.config import (
+    MAX_MODEL_INFO_FORMAT_VERSION,
     CliOverrides,
     ConfigError,
     EeaneConfig,
@@ -870,13 +871,49 @@ def test_format_version_3_record_is_read(tmp_path: Path) -> None:
     assert loaded.config.embedding_model.buckets == (128, 512)
 
 
-def test_format_version_4_record_is_rejected(tmp_path: Path) -> None:
+def test_format_version_4_record_is_read(tmp_path: Path) -> None:
+    """The release must accept the record version that may name a directory of parts."""
+    _write_cached_model(tmp_path / "cache", "org/emb", format_version=4)
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    assert loaded.config.embedding_model.buckets == (128, 512)
+
+
+def test_format_version_5_record_is_rejected(tmp_path: Path) -> None:
     """The next record version may mean other things by these keys, so it must be refused."""
-    _write_cached_model(tmp_path / "cache", "org/emb", overrides={"format_version": 4})
+    _write_cached_model(tmp_path / "cache", "org/emb", overrides={"format_version": 5})
     config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
 
     with pytest.raises(ConfigError, match="format_version"):
         load_config(explicit_path=config_path, env={})
+
+
+def test_the_newest_readable_record_version_is_4() -> None:
+    """The limit the two tests above probe must be the one the code states."""
+    assert MAX_MODEL_INFO_FORMAT_VERSION == 4
+
+
+def test_an_artifact_naming_a_directory_of_parts_resolves_like_any_other(tmp_path: Path) -> None:
+    """A split model is recorded under the name of its parts directory, which is just a name."""
+    parts_name = "s128_b1_eager_macos13.parts"
+    model_dir = _write_cached_model(
+        tmp_path / "cache",
+        "org/emb",
+        format_version=4,
+        overrides={
+            "artifacts": {"128": parts_name, "512": "s512_b1_eager_macos13.mlmodelc"},
+        },
+    )
+    (model_dir / parts_name).mkdir()
+    config_path = _write_toml(tmp_path / "eeane.toml", _CACHE_ROOT_TOML)
+
+    loaded = load_config(explicit_path=config_path, env={})
+
+    artifacts = loaded.config.embedding_model.artifacts
+    assert artifacts[128] == model_dir / parts_name
+    assert artifacts[512] == model_dir / "s512_b1_eager_macos13.mlmodelc"
 
 
 # --- negative: TOML syntax / missing explicit path ----------------------

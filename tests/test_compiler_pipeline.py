@@ -38,7 +38,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 from transformers.models.modernbert import modeling_modernbert
 
-from eeane import __version__, cli, runtime
+from eeane import __version__, cli, config, runtime
 from eeane.compiler import artifacts, pipeline, selfcheck
 from eeane.compiler.backends import base
 from eeane.compiler.backends import modernbert as mb
@@ -1153,6 +1153,7 @@ def test_convert_variants_records_the_backends_own_patches(
             target="macos13",
             keep_mlpackage=False,
             skip_selfcheck=False,
+            ne_size_limit=None,
         ),
         model_dir=tmp_path,
         model_id="stub-model",
@@ -1333,7 +1334,7 @@ def test_run_selfcheck_prints_the_sanity_language_sets(
         True, "en", "cosine_min", {"en": 0.999612, "ja": 0.989234, "zh": 0.991201}
     )
     context = pipeline._CompileContext(
-        args=argparse.Namespace(source="stub-source", skip_selfcheck=False),
+        args=argparse.Namespace(source="stub-source", skip_selfcheck=False, ne_size_limit=None),
         model_dir=tmp_path,
         model_id="stub-model",
         kind="embedding",
@@ -2538,8 +2539,50 @@ def test_a_stub_run_without_a_dense_logs_no_such_line(
 
 
 def test_the_record_format_version_is_the_one_the_server_reads() -> None:
-    """The pair template is a new key, so a record carrying it announces itself."""
-    assert artifacts.MODEL_INFO_FORMAT_VERSION == 3
+    """An entry may now name a directory of parts, so a record announces itself as 4."""
+    assert artifacts.MODEL_INFO_FORMAT_VERSION == 4
+    assert artifacts.MODEL_INFO_FORMAT_VERSION == config.MAX_MODEL_INFO_FORMAT_VERSION
+
+
+def test_a_run_records_the_size_limit_exactly_as_it_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compile arguments in the metadata keep the text typed after --ne-size-limit."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    _install_family_stubs(monkeypatch)
+
+    exit_code = pipeline.run(
+        _compile_args(
+            str(source),
+            "--buckets",
+            str(_FAMILY_SEQ_LEN),
+            "--out-dir",
+            str(out_dir),
+            "--ne-size-limit",
+            " 1.5 GiB ",
+        )
+    )
+
+    assert exit_code == 0
+    metadata_path = out_dir / "compiled" / source.name / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["args"]["ne_size_limit"] == "1.5 GiB"
+
+
+def test_a_run_without_a_size_limit_records_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving the limit to the operating system is recorded as no override."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_stub_compile(monkeypatch, source, out_dir) == 0
+
+    metadata_path = out_dir / "compiled" / source.name / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert "ne_size_limit" in metadata["args"]
+    assert metadata["args"]["ne_size_limit"] is None
 
 
 def test_a_run_records_the_template_the_backend_publishes(
@@ -2730,8 +2773,8 @@ def _install_size_stubs(
 
     Args:
         monkeypatch: Fixture the stubs are installed with.
-        limit_applies: Whether the running system is reported as one
-            that enforces the size limit.
+        limit_applies: Whether the running system is reported as having a
+            Neural Engine size limit at all.
         size_before: Size of the artifact compiled from an untouched
             package, in bytes.
         size_after: Size of the artifact compiled from a quantized
@@ -2758,8 +2801,11 @@ def _install_size_stubs(
 
     monkeypatch.setattr(pipeline.conversion, "compile_model", _fake_compile_model)
     monkeypatch.setattr(pipeline.conversion, "quantize_weights_to_int8", _fake_quantize)
-    monkeypatch.setattr(pipeline.ne_limits, "ne_size_limit_applies", lambda: limit_applies)
-    monkeypatch.setattr(pipeline.ne_limits, "NE_MODEL_SIZE_LIMIT_BYTES", _STUB_SIZE_LIMIT)
+    monkeypatch.setattr(
+        pipeline.ne_limits,
+        "ne_size_limit_bytes",
+        lambda *_args, **_kwargs: _STUB_SIZE_LIMIT if limit_applies else None,
+    )
     return calls
 
 

@@ -96,43 +96,118 @@ def test_non_object_metadata_is_not_reported(tmp_path: Path) -> None:
     assert artifact_placement_reasons(artifact, mac_version="26.0") == []
 
 
-def test_oversized_model_is_reported_only_where_the_limit_applies(
+_GIB = 1 << 30
+
+
+def _fake_size(monkeypatch: pytest.MonkeyPatch, size: int) -> None:
+    """Make every compiled model look ``size`` bytes large without writing them."""
+    monkeypatch.setattr(ne_limits, "compiled_model_size_bytes", lambda _path: size)
+
+
+def test_oversized_model_is_reported_with_the_limit_of_macos_27(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ne_limits, "NE_MODEL_SIZE_LIMIT_BYTES", 10)
-    artifact = _make_artifact(tmp_path, size=11)
+    _fake_size(monkeypatch, int(1.5 * _GIB))
 
-    reasons = artifact_placement_reasons(artifact, mac_version="27.0.1")
-    assert len(reasons) == 1
-    assert "above the 1 GiB the Neural Engine accepts on macOS 27 and later" in reasons[0]
-    assert reasons[0].startswith("it is ")
+    reasons = artifact_placement_reasons(_make_artifact(tmp_path), mac_version="27.0.1")
+
+    assert reasons == [
+        "it is 1.50 GiB, above the 1 GiB the Neural Engine accepts on macOS 27 and later"
+    ]
+
+
+def test_model_between_the_two_limits_is_reported_only_from_macos_27(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_size(monkeypatch, int(1.5 * _GIB))
+    artifact = _make_artifact(tmp_path)
+
+    assert len(artifact_placement_reasons(artifact, mac_version="27.0")) == 1
     assert artifact_placement_reasons(artifact, mac_version="26.6.2") == []
 
 
-def test_model_exactly_at_the_limit_is_not_reported(
+def test_model_above_the_legacy_limit_is_reported_up_to_macos_26(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ne_limits, "NE_MODEL_SIZE_LIMIT_BYTES", 10)
-    artifact = _make_artifact(tmp_path, size=10)
+    _fake_size(monkeypatch, int(2.5 * _GIB))
 
-    assert artifact_placement_reasons(artifact, mac_version="27.0.1") == []
+    reasons = artifact_placement_reasons(_make_artifact(tmp_path), mac_version="26.6.2")
+
+    assert reasons == ["it is 2.50 GiB, above the 2 GiB the Neural Engine accepts up to macOS 26"]
+
+
+def test_the_os_phrase_follows_the_first_limited_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ne_limits, "NE_SIZE_LIMIT_FIRST_MACOS_MAJOR", 30)
+    _fake_size(monkeypatch, 3 * _GIB)
+    artifact = _make_artifact(tmp_path)
+
+    assert artifact_placement_reasons(artifact, mac_version="30.1")[0].endswith(
+        "the Neural Engine accepts on macOS 30 and later"
+    )
+    assert artifact_placement_reasons(artifact, mac_version="29.9")[0].endswith(
+        "the Neural Engine accepts up to macOS 29"
+    )
+
+
+@pytest.mark.parametrize("mac_version", ["", "unknown"])
+def test_size_is_never_reported_when_the_os_version_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mac_version: str
+) -> None:
+    _fake_size(monkeypatch, 100 * _GIB)
+
+    assert artifact_placement_reasons(_make_artifact(tmp_path), mac_version=mac_version) == []
+
+
+@pytest.mark.parametrize(
+    ("mac_version", "size"), [("27.0.1", _GIB), ("26.6.2", 2 * _GIB), ("27.0.1", 0)]
+)
+def test_model_up_to_the_limit_is_not_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mac_version: str, size: int
+) -> None:
+    _fake_size(monkeypatch, size)
+
+    assert artifact_placement_reasons(_make_artifact(tmp_path), mac_version=mac_version) == []
+
+
+def test_model_one_byte_over_the_limit_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_size(monkeypatch, _GIB + 1)
+
+    reasons = artifact_placement_reasons(_make_artifact(tmp_path), mac_version="27.0.1")
+
+    assert len(reasons) == 1
+    assert reasons[0].startswith("it is 1.00 GiB,")
 
 
 def test_size_is_reported_in_gibibytes_with_two_decimals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ne_limits, "NE_MODEL_SIZE_LIMIT_BYTES", 10)
-    monkeypatch.setattr(ne_limits, "compiled_model_size_bytes", lambda _path: int(1.11 * 2**30))
-    artifact = _make_artifact(tmp_path)
+    _fake_size(monkeypatch, int(1.11 * _GIB))
 
-    assert artifact_placement_reasons(artifact, mac_version="27.0")[0].startswith("it is 1.11 GiB,")
+    reasons = artifact_placement_reasons(_make_artifact(tmp_path), mac_version="27.0")
+
+    assert reasons[0].startswith("it is 1.11 GiB,")
+
+
+def test_unreadable_artifact_size_is_not_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fail(_path: Path) -> int:
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(ne_limits, "compiled_model_size_bytes", _fail)
+
+    assert artifact_placement_reasons(_make_artifact(tmp_path), mac_version="27.0") == []
 
 
 def test_both_reasons_are_returned_with_placement_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ne_limits, "NE_MODEL_SIZE_LIMIT_BYTES", 10)
-    artifact = _make_artifact(tmp_path, size=11)
+    _fake_size(monkeypatch, 2 * _GIB)
+    artifact = _make_artifact(tmp_path)
     _write_metadata(artifact, _measured(0.0))
 
     reasons = artifact_placement_reasons(artifact, mac_version="27.0")

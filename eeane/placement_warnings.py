@@ -44,13 +44,35 @@ def _recorded_placement_pct(artifact_path: Path) -> float | None:
     return float(pct)
 
 
+def _size_limit_scope(mac_version: str | None) -> str:
+    """Name the macOS versions the size limit of ``mac_version`` holds for.
+
+    Args:
+        mac_version: macOS version the limit was derived from; ``None``
+            means the running system. It must carry a major version, as
+            it does whenever :func:`eeane.ne_limits.ne_size_limit_bytes`
+            returned a limit for it.
+
+    Returns:
+        ``"on macOS 27 and later"`` for the versions that enforce the
+        lower limit, ``"up to macOS 26"`` for the earlier ones.
+    """
+    first_limited = ne_limits.NE_SIZE_LIMIT_FIRST_MACOS_MAJOR
+    major = ne_limits.macos_major_version(mac_version)
+    if major is not None and major >= first_limited:
+        return f"on macOS {first_limited} and later"
+    return f"up to macOS {first_limited - 1}"
+
+
 def artifact_placement_reasons(artifact_path: Path, *, mac_version: str | None = None) -> list[str]:
     """Explain why a compiled model will not run on the Neural Engine.
 
     Args:
         artifact_path: ``.mlmodelc`` directory of one compiled model.
         mac_version: macOS version to judge the size limit by; ``None``
-            means the running system.
+            means the running system. The limit differs by version (see
+            :func:`eeane.ne_limits.ne_size_limit_bytes`), and an unknown
+            version has none, so no size is reported for it.
 
     Returns:
         Short English phrases, empty when nothing is wrong. The recorded
@@ -65,14 +87,16 @@ def artifact_placement_reasons(artifact_path: Path, *, mac_version: str | None =
             "when it was compiled"
         )
 
-    if ne_limits.ne_size_limit_applies(mac_version):
+    limit = ne_limits.ne_size_limit_bytes(mac_version)
+    if limit is not None:
         try:
             size = ne_limits.compiled_model_size_bytes(artifact_path)
         except OSError:
             size = 0
-        if size > ne_limits.NE_MODEL_SIZE_LIMIT_BYTES:
+        if size > limit:
             reasons.append(
-                f"it is {size / _BYTES_PER_GIB:.2f} GiB, above the 1 GiB "
-                "the Neural Engine accepts on macOS 27 and later"
+                f"it is {size / _BYTES_PER_GIB:.2f} GiB, above the "
+                f"{ne_limits.describe_size_limit(limit)} the Neural Engine accepts "
+                f"{_size_limit_scope(mac_version)}"
             )
     return reasons

@@ -24,12 +24,15 @@ from eeane.compiler import sources
 # Schema versions of the JSON files written next to the artifacts. Bumped
 # whenever a consumer (the cache auto-resolution in eeane.config) would
 # need to tell old and new layouts apart. model_info.json is at 3 since it
-# can now also record how a reranker wants a (query, document) pair
-# spelled out, which a reader that does not know about it would serve
-# without -- asking the model a different question than it was compiled
-# for.
+# can also record how a reranker wants a (query, document) pair spelled
+# out, which a reader that does not know about it would serve without --
+# asking the model a different question than it was compiled for. From 4
+# on, an artifact entry may name a directory of parts (``<stem>.parts``)
+# that are run one after another; a reader that does not know about that
+# would try to load the directory as a single compiled model, so it must
+# refuse the record instead.
 METADATA_FORMAT_VERSION = 1
-MODEL_INFO_FORMAT_VERSION = 3
+MODEL_INFO_FORMAT_VERSION = 4
 
 # Default sequence-length buckets per model kind; they reproduce the
 # v0.4/v0.5 deployed configuration.

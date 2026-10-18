@@ -857,9 +857,9 @@ def _reduce_oversized_model(
         threshold, the limit, the compiled size before and after, and
         whether the result fits -- or ``None`` when nothing was done.
     """
-    if not ne_limits.ne_size_limit_applies():
+    limit = ne_limits.ne_size_limit_bytes()
+    if limit is None:
         return None
-    limit = ne_limits.NE_MODEL_SIZE_LIMIT_BYTES
     size_before = ne_limits.compiled_model_size_bytes(plan.mlmodelc_path)
     if size_before <= limit:
         return None
@@ -1310,6 +1310,7 @@ def _recorded_args(
         "attn": args.attn,
         "keep_mlpackage": bool(args.keep_mlpackage),
         "skip_selfcheck": bool(args.skip_selfcheck),
+        "ne_size_limit": args.ne_size_limit,
         "force": bool(args.force),
     }
 
