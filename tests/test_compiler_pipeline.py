@@ -34,12 +34,13 @@ import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
+from test_compiler_splitting import _SplitStubs
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 from transformers.models.modernbert import modeling_modernbert
 
-from eeane import __version__, cli, config, runtime
-from eeane.compiler import artifacts, pipeline, selfcheck
+from eeane import __version__, cli, config, runtime, segmented
+from eeane.compiler import artifacts, pipeline, selfcheck, splitting
 from eeane.compiler.backends import base
 from eeane.compiler.backends import modernbert as mb
 from eeane.config import ModelEntry, load_config
@@ -731,6 +732,117 @@ def test_needs_conversion_of_a_record_that_never_knew_about_dense(tmp_path: Path
 # --- declared pooling and dense -----------------------------------------------
 
 
+# --- split variants: served path, reuse, discovery ---------------------------
+
+
+def _write_parts(directory: Path, part_sizes: list[int], *, stem: str = E2E_STEM) -> Path:
+    """Create the parts directory of a split variant, with a valid manifest.
+
+    Args:
+        directory: Directory to create it in.
+        part_sizes: Compiled size of every part, in running order.
+        stem: Base name of the variant.
+
+    Returns:
+        The ``<stem>.parts`` directory.
+    """
+    parts_dir = directory / f"{stem}{artifacts.PARTS_SUFFIX}"
+    segments = []
+    for index, size in enumerate(part_sizes, start=1):
+        name = f"part{index:02d}.mlmodelc"
+        (parts_dir / name).mkdir(parents=True)
+        (parts_dir / name / "weight.bin").write_bytes(b"\0" * size)
+        reads = "input_ids" if index == 1 else f"hidden{index - 1}"
+        writes = "embedding" if index == len(part_sizes) else f"hidden{index}"
+        segments.append(segmented.Segment(name, (reads,), (writes,)))
+    segmented.write_segments(
+        parts_dir,
+        segmented.SegmentsManifest("embedding", ("input_ids", "attention_mask"), tuple(segments)),
+    )
+    return parts_dir
+
+
+def test_parts_path_for_names_the_directory_next_to_the_artifact(tmp_path: Path) -> None:
+    """The parts of ``<stem>.mlmodelc`` live in ``<stem>.parts`` beside it."""
+    assert artifacts.parts_path_for(tmp_path / f"{E2E_STEM}.mlmodelc") == (
+        tmp_path / f"{E2E_STEM}.parts"
+    )
+
+
+def test_served_artifact_path_prefers_a_parts_directory_with_a_manifest(tmp_path: Path) -> None:
+    """A split variant is served from its parts, even next to a leftover single artifact."""
+    (tmp_path / f"{E2E_STEM}.mlmodelc").mkdir()
+    parts_dir = _write_parts(tmp_path, [10, 10])
+
+    assert artifacts.served_artifact_path(tmp_path, E2E_STEM) == parts_dir
+
+
+def test_served_artifact_path_is_the_single_artifact_otherwise(tmp_path: Path) -> None:
+    """Without a manifest the directory is not a parts directory; nothing need exist."""
+    expected = tmp_path / f"{E2E_STEM}.mlmodelc"
+
+    assert artifacts.served_artifact_path(tmp_path, E2E_STEM) == expected
+    (tmp_path / f"{E2E_STEM}.parts").mkdir()
+    assert artifacts.served_artifact_path(tmp_path, E2E_STEM) == expected
+
+
+def test_needs_conversion_reuses_an_intact_parts_directory(tmp_path: Path) -> None:
+    """A split variant is reusable on the same terms as a single one."""
+    versions = _versions()
+    _, metadata_path = _write_variant(tmp_path, versions)
+    parts_dir = _write_parts(tmp_path, [10, 10])
+
+    assert artifacts.needs_conversion(parts_dir, metadata_path, versions) is False
+
+
+@pytest.mark.parametrize("damage", ["corrupt manifest", "missing part", "no manifest"])
+def test_needs_conversion_when_the_parts_directory_is_unusable(tmp_path: Path, damage: str) -> None:
+    """Parts that cannot be loaded must be rebuilt, never served."""
+    versions = _versions()
+    _, metadata_path = _write_variant(tmp_path, versions)
+    parts_dir = _write_parts(tmp_path, [10, 10])
+    if damage == "corrupt manifest":
+        (parts_dir / segmented.SEGMENTS_FILENAME).write_text("{not json", encoding="utf-8")
+    elif damage == "missing part":
+        shutil.rmtree(parts_dir / "part02.mlmodelc")
+    else:
+        (parts_dir / segmented.SEGMENTS_FILENAME).unlink()
+
+    assert artifacts.needs_conversion(parts_dir, metadata_path, versions) is True
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected"), [(None, False), (150, False), (151, False), (149, True)]
+)
+def test_needs_conversion_of_a_single_artifact_above_the_size_limit(
+    tmp_path: Path, limit: int | None, expected: bool
+) -> None:
+    """An artifact larger than this run's limit would not run on the Neural Engine here."""
+    versions = _versions()
+    mlmodelc_path, metadata_path = _write_variant(tmp_path, versions)
+    (mlmodelc_path / "weight.bin").write_bytes(b"\0" * 150)
+
+    assert (
+        artifacts.needs_conversion(mlmodelc_path, metadata_path, versions, size_limit_bytes=limit)
+        is expected
+    )
+
+
+@pytest.mark.parametrize(("limit", "expected"), [(None, False), (60, False), (59, True)])
+def test_needs_conversion_of_a_part_above_the_size_limit(
+    tmp_path: Path, limit: int | None, expected: bool
+) -> None:
+    """Parts are judged one by one: a single part above the limit rebuilds the variant."""
+    versions = _versions()
+    _, metadata_path = _write_variant(tmp_path, versions)
+    parts_dir = _write_parts(tmp_path, [40, 60, 40])
+
+    assert (
+        artifacts.needs_conversion(parts_dir, metadata_path, versions, size_limit_bytes=limit)
+        is expected
+    )
+
+
 def _write_pooling_declaration(model_dir: Path, pooling_flag: str) -> None:
     """Write a minimal sentence-transformers pooling declaration.
 
@@ -1358,7 +1470,7 @@ def test_run_selfcheck_prints_the_sanity_language_sets(
         convert=True,
     )
 
-    assert pipeline._run_selfcheck(context, plan) == report
+    assert pipeline._run_selfcheck(context, plan, plan.mlmodelc_path) == report
     stderr = capsys.readouterr().err
     assert "s128: sanity" in stderr
     assert "pass (best=en 0.99961; ja 0.98923, zh 0.99120)" in stderr
@@ -1946,6 +2058,42 @@ def test_discover_variants_of_a_missing_directory_is_empty(tmp_path: Path) -> No
     )
 
     assert found == {}
+
+
+def test_discover_variants_lists_a_split_variant_by_its_parts_directory(tmp_path: Path) -> None:
+    """A split variant is found as its parts directory; unusable parts are not found."""
+    _write_family_metadata(tmp_path, 128, with_mlmodelc=False)
+    parts_128 = _write_parts(
+        tmp_path, [10, 10], stem=artifacts.variant_stem(128, 1, "eager", "macos13", "fp16")
+    )
+    _write_family_metadata(tmp_path, 512, with_mlmodelc=False)
+    broken = _write_parts(
+        tmp_path, [10, 10], stem=artifacts.variant_stem(512, 1, "eager", "macos13", "fp16")
+    )
+    shutil.rmtree(broken / "part01.mlmodelc")
+
+    found = artifacts.discover_variants(
+        tmp_path, batch_size=1, attn="eager", target="macos13", precision="fp16"
+    )
+
+    assert found == {128: parts_128}
+
+
+def test_aggregate_calibration_reads_the_selfcheck_of_a_split_variant(tmp_path: Path) -> None:
+    """The metadata of ``<stem>.parts`` is ``<stem>.json``, as for a single artifact."""
+    parts_dir = _write_parts(tmp_path, [10, 10])
+    _write_selfcheck(
+        tmp_path / f"{E2E_STEM}.mlmodelc",
+        {"status": "warned", "compute_plan": {"ne_placement_pct": 88.0}},
+    )
+
+    calibration, recommended, _ = artifacts.aggregate_calibration(
+        "embedding", {E2E_SEQ_LEN: parts_dir}, {}
+    )
+
+    assert recommended == [E2E_SEQ_LEN]
+    assert calibration["buckets"][str(E2E_SEQ_LEN)]["status"] == "warned"
+    assert calibration["buckets"][str(E2E_SEQ_LEN)]["ne_placement_pct"] == 88.0
 
 
 def test_e2e_incremental_bucket_keeps_earlier_buckets(
@@ -2728,268 +2876,346 @@ def test_an_untemplated_run_reports_no_template_line(
     assert "pair template" not in capsys.readouterr().err
 
 
-# --- shrinking a model the Neural Engine would refuse -------------------------
+# --- splitting a model the Neural Engine would refuse --------------------------
 
 # Stand-in for the Neural Engine size limit, small enough for a stub
 # artifact of a few bytes to cross it.
 _STUB_SIZE_LIMIT = 100
 
-# Size of the stub artifact as first compiled, and after its weights were
-# quantized.
-_STUB_SIZE_BEFORE = 150
-_STUB_SIZE_AFTER = 60
+# Compiled size of the stub model as converted. Every half compiles to half
+# the size of what it was cut from, so a smaller limit needs more parts.
+_STUB_MODEL_SIZE = 150
 
-# Element count the shrinking stub backend declares.
-_STUB_SHRINKABLE_ELEMENTS = 4096
-
-
-class _ShrinkableBackend(_FamilyBackend):
-    """Stub backend declaring a weight that may be quantized."""
-
-    def shrinkable_weight_elements(self, loaded: Any) -> int | None:
-        """Declare the fixed element count."""
-        return _STUB_SHRINKABLE_ELEMENTS
+# Base name of the variant a stub-driven run produces.
+_SPLIT_STEM = f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13"
 
 
-class _UnshrinkableBackend(_FamilyBackend):
-    """Stub backend with no weight to quantize."""
-
-    def shrinkable_weight_elements(self, loaded: Any) -> int | None:
-        """Declare that nothing can be shrunk."""
-        return None
+def _halving_sizes(label: str) -> int:
+    """Compiled size of a chunk: halved by every cut on its way from the model."""
+    return _STUB_MODEL_SIZE >> len(label)
 
 
-def _install_size_stubs(
+def _run_split_compile(
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    limit_applies: bool = True,
-    size_before: int = _STUB_SIZE_BEFORE,
-    size_after: int = _STUB_SIZE_AFTER,
-) -> dict[str, list[Any]]:
-    """Make the stubbed conversion produce artifacts of a chosen size.
-
-    Must be called after the conversion stubs are installed, since it
-    replaces the stubbed compile step with one that writes real bytes.
+    source: Path,
+    out_dir: Path,
+    *options: str,
+    batch: int = 1,
+    os_limit: int | None = _STUB_SIZE_LIMIT,
+    size_of: Any = _halving_sizes,
+    selfcheck_fn: pipeline.SelfcheckFn | None = None,
+) -> tuple[int, _SplitStubs]:
+    """Run the whole stubbed pipeline over a model that may cross the size limit.
 
     Args:
         monkeypatch: Fixture the stubs are installed with.
-        limit_applies: Whether the running system is reported as having a
-            Neural Engine size limit at all.
-        size_before: Size of the artifact compiled from an untouched
-            package, in bytes.
-        size_after: Size of the artifact compiled from a quantized
-            package, in bytes.
+        source: Stub model directory.
+        out_dir: Cache root.
+        *options: Further command-line options.
+        batch: Batch size to compile.
+        os_limit: Size limit the operating system is reported to enforce
+            (``None`` for none); an explicit ``--ne-size-limit`` still
+            takes precedence, as in a real run.
+        size_of: Compiled size of the model and of every chunk, by label
+            (see :class:`test_compiler_splitting._SplitStubs`).
+        selfcheck_fn: Self-check hook handed to the run.
 
     Returns:
-        The recorded calls: ``"quantize"`` holds one ``(package name,
-        min_elements)`` tuple per quantization, ``"compile"`` one artifact
-        size per compilation.
+        The exit code and the stubs, which recorded what was bisected and
+        compiled.
     """
-    calls: dict[str, list[Any]] = {"quantize": [], "compile": []}
-    quantized: set[Path] = set()
+    _install_family_stubs(monkeypatch)
+    stubs = _SplitStubs(size_of).install(monkeypatch)
+    from_text = pipeline.ne_limits.parse_size_limit
 
-    def _fake_compile_model(mlpackage_path: Path, mlmodelc_path: Path) -> None:
-        size = size_after if mlpackage_path in quantized else size_before
-        mlmodelc_path.mkdir(parents=True, exist_ok=True)
-        (mlmodelc_path / "weight.bin").write_bytes(b"\0" * size)
-        calls["compile"].append(size)
+    def _limit(mac_version: str | None = None, override: str | None = None) -> int | None:
+        return os_limit if override is None else from_text(override)
 
-    def _fake_quantize(mlpackage_path: Path, min_elements: int) -> None:
-        assert mlpackage_path.is_dir(), "the package must still exist when it is quantized"
-        quantized.add(mlpackage_path)
-        calls["quantize"].append((mlpackage_path.name, min_elements))
-
-    monkeypatch.setattr(pipeline.conversion, "compile_model", _fake_compile_model)
-    monkeypatch.setattr(pipeline.conversion, "quantize_weights_to_int8", _fake_quantize)
-    monkeypatch.setattr(
-        pipeline.ne_limits,
-        "ne_size_limit_bytes",
-        lambda *_args, **_kwargs: _STUB_SIZE_LIMIT if limit_applies else None,
+    monkeypatch.setattr(pipeline.ne_limits, "ne_size_limit_bytes", _limit)
+    exit_code = pipeline.run(
+        _compile_args(
+            str(source),
+            "--buckets",
+            str(_FAMILY_SEQ_LEN),
+            "--batch",
+            str(batch),
+            "--out-dir",
+            str(out_dir),
+            *options,
+        ),
+        selfcheck_fn=selfcheck_fn,
     )
-    return calls
+    return exit_code, stubs
 
 
-def _run_sized_compile(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    backend_class: type,
-    **size_options: Any,
-) -> tuple[dict[str, list[Any]], dict[str, Any]]:
-    """Run the whole stubbed pipeline over artifacts of a chosen size.
+def _split_metadata(out_dir: Path, source: Path, stem: str = _SPLIT_STEM) -> dict[str, Any]:
+    """Read back the variant metadata a stub-driven run wrote."""
+    path = out_dir / "compiled" / source.name / f"{stem}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
-    Args:
-        monkeypatch: Fixture the stubs are installed with.
-        tmp_path: Directory the source and the cache are created under.
-        backend_class: Stub backend the dispatch hands back.
-        **size_options: Passed on to :func:`_install_size_stubs`.
 
-    Returns:
-        The recorded calls and the variant's metadata record.
-    """
+def test_an_oversized_model_is_served_from_its_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Split, recorded, measured and named everywhere by its parts directory."""
     source = _stub_source(tmp_path)
     out_dir = tmp_path / "cache"
-    _install_family_stubs(monkeypatch, backend_class=backend_class)
-    calls = _install_size_stubs(monkeypatch, **size_options)
+    contexts: list[pipeline.SelfcheckContext] = []
 
-    exit_code = pipeline.run(
-        _compile_args(str(source), "--buckets", str(_FAMILY_SEQ_LEN), "--out-dir", str(out_dir))
+    def _selfcheck(context: pipeline.SelfcheckContext) -> dict[str, Any]:
+        contexts.append(context)
+        return {"status": "passed"}
+
+    exit_code, stubs = _run_split_compile(monkeypatch, source, out_dir, selfcheck_fn=_selfcheck)
+
+    assert exit_code == 0
+    model_root = out_dir / "compiled" / source.name
+    parts_dir = model_root / f"{_SPLIT_STEM}.parts"
+    assert segmented.is_segmented(parts_dir)
+    assert len(segmented.load_segments(parts_dir).segments) == 2
+    assert not (model_root / f"{_SPLIT_STEM}.mlmodelc").exists()
+    assert not (model_root / f"{_SPLIT_STEM}.mlpackage").exists()
+    assert not (model_root / f"{_SPLIT_STEM}.split_tmp").exists()
+    assert stubs.bisected == [""]
+
+    metadata = _split_metadata(out_dir, source)
+    assert metadata["split"] == {
+        "method": splitting.SPLIT_METHOD,
+        "limit_bytes": _STUB_SIZE_LIMIT,
+        "limit_source": splitting.LIMIT_SOURCE_OS,
+        "size_before_bytes": _STUB_MODEL_SIZE,
+        "parts": [
+            {
+                "name": "part01.mlmodelc",
+                "size_bytes": _STUB_MODEL_SIZE // 2,
+                "inputs": ["input_ids", "attention_mask"],
+                "outputs": ["hidden_root"],
+            },
+            {
+                "name": "part02.mlmodelc",
+                "size_bytes": _STUB_MODEL_SIZE // 2,
+                "inputs": ["hidden_root", "attention_mask"],
+                "outputs": ["embedding"],
+            },
+        ],
+    }
+    assert "split" in metadata["timings_sec"]
+    assert metadata["artifacts"] == {"mlmodelc": str(parts_dir)}
+    assert [context.mlmodelc_path for context in contexts] == [parts_dir]
+
+    info = _stub_model_info(out_dir, source)
+    assert info["artifacts"] == {str(_FAMILY_SEQ_LEN): f"{_SPLIT_STEM}.parts"}
+    assert info["calibration"]["buckets"][str(_FAMILY_SEQ_LEN)]["status"] == "passed"
+    assert info["recommended_buckets"] == [_FAMILY_SEQ_LEN]
+
+    log = capsys.readouterr()
+    assert "NE size limit   : 100 bytes (from the macOS version)" in log.err
+    assert "above the Neural Engine size limit (100 bytes)" in log.err
+    assert f"s{_FAMILY_SEQ_LEN}: split into 2 parts" in log.err
+    assert f"-> {_SPLIT_STEM}.parts" in log.err
+    assert str(parts_dir) in log.out
+
+
+@pytest.mark.parametrize("os_limit", [_STUB_MODEL_SIZE, _STUB_MODEL_SIZE * 10])
+def test_a_model_within_the_limit_keeps_its_record_exactly_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, os_limit: int
+) -> None:
+    """A model of exactly the limit is still accepted: one artifact, the old record."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    exit_code, stubs = _run_split_compile(monkeypatch, source, out_dir, os_limit=os_limit)
+
+    assert exit_code == 0
+    model_root = out_dir / "compiled" / source.name
+    assert (model_root / f"{_SPLIT_STEM}.mlmodelc").is_dir()
+    assert not (model_root / f"{_SPLIT_STEM}.parts").exists()
+    assert stubs.bisected == []
+    metadata = _split_metadata(out_dir, source)
+    assert set(metadata) == {
+        "format_version",
+        "source",
+        "variant",
+        "args",
+        "versions",
+        "patches",
+        "timings_sec",
+        "artifacts",
+        "selfcheck",
+    }
+    assert set(metadata["timings_sec"]) == {"load", "trace", "convert", "compile", "total"}
+    assert metadata["artifacts"] == {"mlmodelc": str(model_root / f"{_SPLIT_STEM}.mlmodelc")}
+    assert _stub_model_info(out_dir, source)["artifacts"] == {
+        str(_FAMILY_SEQ_LEN): f"{_SPLIT_STEM}.mlmodelc"
+    }
+    assert "splitting" not in capsys.readouterr().err
+
+
+def test_no_size_limit_never_splits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """``--ne-size-limit none`` keeps even an oversized model in one piece."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    exit_code, stubs = _run_split_compile(monkeypatch, source, out_dir, "--ne-size-limit", "none")
+
+    assert exit_code == 0
+    model_root = out_dir / "compiled" / source.name
+    artifact = model_root / f"{_SPLIT_STEM}.mlmodelc"
+    assert (artifact / "weight.bin").stat().st_size == _STUB_MODEL_SIZE
+    assert not (model_root / f"{_SPLIT_STEM}.parts").exists()
+    assert stubs.bisected == []
+    assert "split" not in _split_metadata(out_dir, source)
+    log = capsys.readouterr().err
+    assert "NE size limit   : none (models are not split)" in log
+    assert "splitting" not in log
+
+
+def test_an_explicit_size_limit_is_recorded_as_an_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """``--ne-size-limit`` splits even where the system enforces no limit."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    exit_code, _ = _run_split_compile(
+        monkeypatch, source, out_dir, "--ne-size-limit", "100", os_limit=None
     )
 
     assert exit_code == 0
-    metadata_path = out_dir / "compiled" / source.name / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json"
-    return calls, json.loads(metadata_path.read_text(encoding="utf-8"))
+    split = _split_metadata(out_dir, source)["split"]
+    assert split["limit_source"] == splitting.LIMIT_SOURCE_OVERRIDE
+    assert split["limit_bytes"] == 100
+    assert "NE size limit   : 100 bytes (--ne-size-limit)" in capsys.readouterr().err
 
 
-def test_an_oversized_model_is_quantized_and_compiled_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Over the limit, with a declared weight: quantize once, compile twice, record it."""
-    calls, metadata = _run_sized_compile(monkeypatch, tmp_path, _ShrinkableBackend)
-
-    assert calls["quantize"] == [
-        (f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlpackage", _STUB_SHRINKABLE_ELEMENTS)
-    ]
-    assert calls["compile"] == [_STUB_SIZE_BEFORE, _STUB_SIZE_AFTER]
-    assert metadata["size_reduction"] == {
-        "method": "linear_int8_per_channel",
-        "min_elements": _STUB_SHRINKABLE_ELEMENTS,
-        "limit_bytes": _STUB_SIZE_LIMIT,
-        "size_before_bytes": _STUB_SIZE_BEFORE,
-        "size_after_bytes": _STUB_SIZE_AFTER,
-        "within_limit": True,
-    }
-    assert "shrink" in metadata["timings_sec"]
-
-
-def test_a_shrunk_model_leaves_the_served_artifact_and_no_package(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """What ends up in the cache is the artifact compiled from the quantized package."""
-    _run_sized_compile(monkeypatch, tmp_path, _ShrinkableBackend)
-
-    model_root = tmp_path / "cache" / "compiled" / "stub-model"
-    artifact = model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlmodelc"
-    assert (artifact / "weight.bin").stat().st_size == _STUB_SIZE_AFTER
-    assert not (model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlpackage").exists()
-
-
-def test_a_shrunk_model_reports_what_was_done(
+def test_a_second_run_reuses_a_split_variant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """The progress log must say that the model was quantized, and why."""
-    _run_sized_compile(monkeypatch, tmp_path, _ShrinkableBackend)
-
-    log = capsys.readouterr().err
-    assert "Neural Engine size limit" in log
-    assert "quantizing" in log
-    assert "still" not in log
-
-
-def test_a_system_without_the_limit_never_shrinks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
-) -> None:
-    """Where the limit is not enforced, the artifact and its record stay as they were."""
-    calls, metadata = _run_sized_compile(
-        monkeypatch, tmp_path, _ShrinkableBackend, limit_applies=False
-    )
-
-    assert calls["quantize"] == []
-    assert calls["compile"] == [_STUB_SIZE_BEFORE]
-    assert "size_reduction" not in metadata
-    assert "shrink" not in metadata["timings_sec"]
-    assert "Neural Engine size limit" not in capsys.readouterr().err
-
-
-def test_a_backend_without_a_shrinkable_weight_is_reported_and_left_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
-) -> None:
-    """Over the limit with nothing to shrink: say so, and change nothing."""
-    calls, metadata = _run_sized_compile(monkeypatch, tmp_path, _UnshrinkableBackend)
-
-    assert calls["quantize"] == []
-    assert calls["compile"] == [_STUB_SIZE_BEFORE]
-    assert "size_reduction" not in metadata
-    assert "shrink" not in metadata["timings_sec"]
-    log = capsys.readouterr().err
-    assert "Neural Engine size limit" in log
-    assert "will not run on the Neural Engine" in log
-
-
-@pytest.mark.parametrize("size_before", [_STUB_SIZE_LIMIT, _STUB_SIZE_LIMIT - 1, 0])
-def test_a_model_within_the_limit_is_never_shrunk(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture,
-    size_before: int,
-) -> None:
-    """A model of exactly the limit is still accepted, so it is left alone."""
-    calls, metadata = _run_sized_compile(
-        monkeypatch, tmp_path, _ShrinkableBackend, size_before=size_before
-    )
-
-    assert calls["quantize"] == []
-    assert calls["compile"] == [size_before]
-    assert "size_reduction" not in metadata
-    assert "shrink" not in metadata["timings_sec"]
-    assert "Neural Engine size limit" not in capsys.readouterr().err
-
-
-def test_a_model_within_the_limit_never_asks_the_backend(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A backend that predates the declaration keeps working for a small model."""
-    calls, metadata = _run_sized_compile(
-        monkeypatch, tmp_path, _FamilyBackend, size_before=_STUB_SIZE_LIMIT
-    )
-
-    assert not hasattr(_FamilyBackend, "shrinkable_weight_elements")
-    assert calls["quantize"] == []
-    assert "size_reduction" not in metadata
-
-
-def test_a_model_still_oversized_after_quantization_is_recorded_not_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
-) -> None:
-    """Quantization that does not get under the limit is a fact to record, not an error."""
-    calls, metadata = _run_sized_compile(
-        monkeypatch, tmp_path, _ShrinkableBackend, size_after=_STUB_SIZE_LIMIT + 1
-    )
-
-    assert calls["compile"] == [_STUB_SIZE_BEFORE, _STUB_SIZE_LIMIT + 1]
-    assert metadata["size_reduction"]["within_limit"] is False
-    assert metadata["size_reduction"]["size_after_bytes"] == _STUB_SIZE_LIMIT + 1
-    log = capsys.readouterr().err
-    assert "still" in log
-    assert "will not run on the Neural Engine" in log
-
-
-def test_a_failed_quantization_fails_the_compile_and_drops_the_package(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
-) -> None:
-    """A quantization error is a conversion error like any other step's."""
+    """Up-to-date parts are reused like any artifact: nothing is converted again."""
     source = _stub_source(tmp_path)
     out_dir = tmp_path / "cache"
-    _install_family_stubs(monkeypatch, backend_class=_ShrinkableBackend)
-    _install_size_stubs(monkeypatch)
+    assert _run_split_compile(monkeypatch, source, out_dir)[0] == 0
+    parts_dir = out_dir / "compiled" / source.name / f"{_SPLIT_STEM}.parts"
+    before = _mtimes(parts_dir)
+    capsys.readouterr()
 
-    def _failing_quantize(mlpackage_path: Path, min_elements: int) -> None:
-        raise RuntimeError("quantization failed")
+    exit_code, stubs = _run_split_compile(monkeypatch, source, out_dir)
 
-    monkeypatch.setattr(pipeline.conversion, "quantize_weights_to_int8", _failing_quantize)
+    assert exit_code == 0
+    assert stubs.compiled == [] and stubs.bisected == []
+    assert _mtimes(parts_dir) == before
+    assert "up-to-date artifact found" in capsys.readouterr().err
+    assert _stub_model_info(out_dir, source)["artifacts"] == {
+        str(_FAMILY_SEQ_LEN): f"{_SPLIT_STEM}.parts"
+    }
 
-    exit_code = pipeline.run(
-        _compile_args(str(source), "--buckets", str(_FAMILY_SEQ_LEN), "--out-dir", str(out_dir))
+
+def test_a_smaller_limit_than_an_existing_part_splits_the_model_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parts made for a larger limit would not run on the Neural Engine under this one."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    assert _run_split_compile(monkeypatch, source, out_dir)[0] == 0
+    assert len(_split_metadata(out_dir, source)["split"]["parts"]) == 2
+
+    exit_code, stubs = _run_split_compile(monkeypatch, source, out_dir, "--ne-size-limit", "50")
+
+    assert exit_code == 0
+    assert stubs.compiled[0] == ""
+    split = _split_metadata(out_dir, source)["split"]
+    assert split["limit_bytes"] == 50
+    assert [part["size_bytes"] for part in split["parts"]] == [_STUB_MODEL_SIZE // 4] * 4
+    parts_dir = out_dir / "compiled" / source.name / f"{_SPLIT_STEM}.parts"
+    assert len(segmented.load_segments(parts_dir).segments) == 4
+
+
+def test_recompiling_a_split_model_in_one_piece_drops_its_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parts left from an earlier run must not shadow the fresh single artifact."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    assert _run_split_compile(monkeypatch, source, out_dir)[0] == 0
+
+    exit_code, _ = _run_split_compile(
+        monkeypatch, source, out_dir, "--force", "--ne-size-limit", "none"
     )
 
-    assert exit_code != 0
-    assert "quantization failed" in capsys.readouterr().err
+    assert exit_code == 0
     model_root = out_dir / "compiled" / source.name
-    assert not (model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.mlpackage").exists()
-    assert not (model_root / f"s{_FAMILY_SEQ_LEN}_b1_eager_macos13.json").exists()
+    assert not (model_root / f"{_SPLIT_STEM}.parts").exists()
+    assert (model_root / f"{_SPLIT_STEM}.mlmodelc").is_dir()
+    assert "split" not in _split_metadata(out_dir, source)
+    assert _stub_model_info(out_dir, source)["artifacts"] == {
+        str(_FAMILY_SEQ_LEN): f"{_SPLIT_STEM}.mlmodelc"
+    }
 
 
-def test_build_metadata_without_a_size_reduction_has_no_such_key(tmp_path: Path) -> None:
-    """A record of a model that was never shrunk must read exactly as it always did."""
+def test_a_split_batched_variant_is_recorded_by_its_parts_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both families of a split model name their parts directories in the record."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    assert _run_split_compile(monkeypatch, source, out_dir, batch=1)[0] == 0
+    assert _run_split_compile(monkeypatch, source, out_dir, batch=2)[0] == 0
+
+    info = _stub_model_info(out_dir, source)
+    bucket = str(_FAMILY_SEQ_LEN)
+    assert info["artifacts"] == {bucket: f"{_SPLIT_STEM}.parts"}
+    assert info["batch_artifacts"] == {"2": {bucket: f"s{_FAMILY_SEQ_LEN}_b2_eager_macos13.parts"}}
+
+
+def test_keep_mlpackage_keeps_the_packages_of_the_parts_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The converted package stays, and every part's package sits next to it."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+
+    exit_code, _ = _run_split_compile(monkeypatch, source, out_dir, "--keep-mlpackage")
+
+    assert exit_code == 0
+    model_root = out_dir / "compiled" / source.name
+    package = model_root / f"{_SPLIT_STEM}.mlpackage"
+    assert package.is_dir()
+    parts_dir = model_root / f"{_SPLIT_STEM}.parts"
+    assert (parts_dir / "part01.mlpackage").is_dir()
+    assert (parts_dir / "part02.mlpackage").is_dir()
+    assert _split_metadata(out_dir, source)["artifacts"] == {
+        "mlmodelc": str(parts_dir),
+        "mlpackage": str(package),
+    }
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_a_failed_split_fails_the_compile_and_leaves_nothing_to_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, keep: bool
+) -> None:
+    """A model that cannot be made to fit is a conversion failure like any other."""
+    source = _stub_source(tmp_path)
+    out_dir = tmp_path / "cache"
+    options = ("--keep-mlpackage",) if keep else ()
+
+    exit_code, _ = _run_split_compile(
+        monkeypatch, source, out_dir, *options, size_of=lambda label: _STUB_MODEL_SIZE
+    )
+
+    assert exit_code == 1
+    log = capsys.readouterr().err
+    assert f"failed to convert bucket {_FAMILY_SEQ_LEN}" in log
+    assert "16 parts" in log
+    model_root = out_dir / "compiled" / source.name
+    for suffix in (".mlmodelc", ".parts", ".split_tmp", ".mlpackage", ".json"):
+        assert not (model_root / f"{_SPLIT_STEM}{suffix}").exists(), suffix
+
+
+def test_build_metadata_records_a_split_only_when_given(tmp_path: Path) -> None:
+    """A record of a model that was never split must read exactly as it always did."""
     context = _stub_compile_context(tmp_path)
     plan = artifacts.VariantPlan(
         seq_len=128,
@@ -3002,12 +3228,12 @@ def test_build_metadata_without_a_size_reduction_has_no_such_key(tmp_path: Path)
     arguments = (context, plan, {"load": 0.0}, {"mlmodelc": "x"}, {}, {"status": "skipped"})
 
     plain = pipeline._build_metadata(*arguments)
-    explicit = pipeline._build_metadata(*arguments, size_reduction=None)
-    reduced = pipeline._build_metadata(*arguments, size_reduction={"method": "m"})
+    explicit = pipeline._build_metadata(*arguments, split=None)
+    split = pipeline._build_metadata(*arguments, split={"method": "m"})
 
-    assert "size_reduction" not in plain
+    assert "split" not in plain
     assert explicit == plain
-    assert reduced == {**plain, "size_reduction": {"method": "m"}}
+    assert split == {**plain, "split": {"method": "m"}}
     assert plain["format_version"] == artifacts.METADATA_FORMAT_VERSION
 
 

@@ -6,6 +6,14 @@ SelfcheckContext`) and returns a JSON-serializable report. It never raises
 -- every failure mode, expected or not, is turned into the report's
 ``status``/``error`` keys instead, per the pipeline's hook contract.
 
+A variant split into parts to fit the Neural Engine is handed over as its
+``.parts`` directory instead. Its parts are loaded together and run one
+after another (:class:`eeane.segmented.SegmentedModel`), which takes the
+same inputs and yields the same output as the single model would, so the
+accuracy sanity and the latency measure the chain as a whole -- the model
+that will be served -- while the NE placement is measured part by part
+and summed up.
+
 Three checks run in order, in the same process that just compiled the
 variant (the model stays warm on disk, no reload of anything but the
 compiled artifact itself):
@@ -48,12 +56,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import coremltools as ct
 import numpy as np
 
-from eeane import runtime
+from eeane import runtime, segmented
 from eeane.compiler import conversion
 from eeane.compiler.backends.base import (
     SCORE_SPACE_LOGIT,
@@ -139,9 +148,7 @@ def run_selfcheck(context: SelfcheckContext) -> dict[str, Any]:
     """
     machine = _machine_info()
     try:
-        compiled = ct.models.CompiledMLModel(
-            str(context.mlmodelc_path), compute_units=ct.ComputeUnit.CPU_AND_NE
-        )
+        compiled = _load_artifact(context.mlmodelc_path)
         frozen_tokenizer = runtime.load_frozen_tokenizer(context.tokenizer_path)
         sanity, latency_batch = _run_sanity(context, compiled, frozen_tokenizer)
         compute_plan = _compute_plan_report(context.mlmodelc_path)
@@ -160,6 +167,28 @@ def run_selfcheck(context: SelfcheckContext) -> dict[str, Any]:
     }
     _print_summary(context, report)
     return report
+
+
+def _load_artifact(path: Path) -> Any:
+    """Load the artifact to measure on ``CPU_AND_NE``, whole or as its parts.
+
+    Args:
+        path: A ``.mlmodelc``, or the ``.parts`` directory of a split
+            variant.
+
+    Returns:
+        The loaded compiled model, or a
+        :class:`eeane.segmented.SegmentedModel` running every loaded part
+        in order. Either is called as ``predict(inputs) -> dict``.
+    """
+    if segmented.is_segmented(path):
+        return segmented.SegmentedModel.load(path, _load_compiled_model)
+    return _load_compiled_model(path)
+
+
+def _load_compiled_model(path: Path) -> Any:
+    """Load one compiled model on ``CPU_AND_NE``, the units it is served on."""
+    return ct.models.CompiledMLModel(str(path), compute_units=ct.ComputeUnit.CPU_AND_NE)
 
 
 def _derive_status(sanity: dict[str, Any], compute_plan: dict[str, Any]) -> str:
@@ -187,13 +216,14 @@ def _derive_status(sanity: dict[str, Any], compute_plan: dict[str, Any]) -> str:
 
 
 def _run_sanity(
-    context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
+    context: SelfcheckContext, compiled: Any, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Dispatch the accuracy sanity check to the embedding/reranker variant.
 
     Args:
         context: Self-check context.
-        compiled: The just-loaded compiled model (``CPU_AND_NE``).
+        compiled: The just-loaded model (``CPU_AND_NE``): a compiled
+            model, or the parts of a split one run in order.
         frozen_tokenizer: Tokenizer loaded via
             :func:`eeane.runtime.load_frozen_tokenizer`.
 
@@ -209,7 +239,7 @@ def _run_sanity(
 
 
 def _sanity_embedding(
-    context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
+    context: SelfcheckContext, compiled: Any, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Accuracy sanity check for an embedding variant (ported from poc/convert_embedding.py).
 
@@ -287,7 +317,7 @@ def _sanity_embedding(
 
 
 def _sanity_reranker(
-    context: SelfcheckContext, compiled: ct.models.CompiledMLModel, frozen_tokenizer: Any
+    context: SelfcheckContext, compiled: Any, frozen_tokenizer: Any
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Accuracy sanity check for a reranker variant (ported from poc/convert_reranker.py).
 
@@ -642,7 +672,7 @@ def _first_predict_batch(
 
 
 def _predict_rows(
-    compiled: ct.models.CompiledMLModel,
+    compiled: Any,
     tokens: dict[str, np.ndarray],
     padding: dict[str, np.ndarray],
     batch_size: int,
@@ -660,7 +690,7 @@ def _predict_rows(
     stacked result themselves (see :func:`_sanity_reranker`).
 
     Args:
-        compiled: Loaded compiled model.
+        compiled: Loaded model (see :func:`_load_artifact`).
         tokens: Tokenized rows, each value of shape (N, S).
         padding: Tokenized filler row, each value of shape (1, S).
         batch_size: Fixed batch size B of the model.
@@ -693,7 +723,7 @@ def _predict_rows(
 
 
 def _check_batch_consistency_embedding(
-    compiled: ct.models.CompiledMLModel,
+    compiled: Any,
     frozen_tokenizer: Any,
     text: str,
     seq_len: int,
@@ -705,7 +735,7 @@ def _check_batch_consistency_embedding(
     Ported from ``poc/convert_embedding.py``'s ``check_batch_consistency``.
 
     Args:
-        compiled: Loaded compiled model.
+        compiled: Loaded model (see :func:`_load_artifact`).
         frozen_tokenizer: Tokenizer used to encode ``text``.
         text: Sanity text replicated to every row of the batch.
         seq_len: Fixed sequence length S.
@@ -735,7 +765,7 @@ def _check_batch_consistency_embedding(
 
 
 def _check_batch_consistency_reranker(
-    compiled: ct.models.CompiledMLModel,
+    compiled: Any,
     frozen_tokenizer: Any,
     pair: tuple[str, str],
     seq_len: int,
@@ -748,7 +778,7 @@ def _check_batch_consistency_reranker(
     Ported from ``poc/convert_reranker.py``'s ``check_batch_consistency``.
 
     Args:
-        compiled: Loaded compiled model.
+        compiled: Loaded model (see :func:`_load_artifact`).
         frozen_tokenizer: Tokenizer used to encode ``pair``.
         pair: Sanity (query, document) pair replicated to every row.
         seq_len: Fixed sequence length S.
@@ -814,6 +844,72 @@ def _compute_plan_report(mlmodelc_path: Any) -> dict[str, Any]:
     raises at runtime, the failure is recorded rather than propagated so
     that a self-check never fails because of this best-effort report.
 
+    A split variant's parts are placed by Core ML one by one, so each is
+    measured on its own and the counts are summed: the share of the whole
+    model's operations that run on the Neural Engine is what a reader of
+    ``ne_placement_pct`` needs, whatever the model is stored as.
+
+    Args:
+        mlmodelc_path: Compiled model directory, or the ``.parts``
+            directory of a split variant.
+
+    Returns:
+        Dict describing op counts per device and the NE placement
+        percentage, or ``{"status": "unavailable", "reason": ...}``. For a
+        split variant the counts and the percentage are those of all
+        parts together, and a ``parts`` list adds each part's own; it is
+        unavailable as soon as one part cannot be measured.
+    """
+    if segmented.is_segmented(Path(mlmodelc_path)):
+        return _segmented_compute_plan_report(Path(mlmodelc_path))
+    return _single_compute_plan_report(mlmodelc_path)
+
+
+def _segmented_compute_plan_report(parts_dir: Path) -> dict[str, Any]:
+    """Measure every part of a split variant and add the counts up.
+
+    Args:
+        parts_dir: The variant's ``.parts`` directory.
+
+    Returns:
+        The aggregate report described in :func:`_compute_plan_report`.
+    """
+    try:
+        part_paths = segmented.part_paths(parts_dir, segmented.load_segments(parts_dir))
+    except segmented.SegmentsError as exc:
+        return {"status": "unavailable", "reason": str(exc)}
+
+    device_counts = {"NE": 0, "GPU": 0, "CPU": 0, "unspecified": 0}
+    total_ops = 0
+    parts: list[dict[str, Any]] = []
+    for path in part_paths:
+        report = _single_compute_plan_report(path)
+        if report.get("status") != "measured":
+            return {"status": "unavailable", "reason": f"part {path.name}: {report.get('reason')}"}
+        total_ops += report["total_ops"]
+        for device, count in report["device_counts"].items():
+            device_counts[device] = device_counts.get(device, 0) + count
+        parts.append(
+            {
+                "name": path.name,
+                "total_ops": report["total_ops"],
+                "device_counts": report["device_counts"],
+                "ne_placement_pct": report["ne_placement_pct"],
+            }
+        )
+
+    return {
+        "status": "measured",
+        "total_ops": total_ops,
+        "device_counts": device_counts,
+        "ne_placement_pct": _ne_placement_pct(device_counts),
+        "parts": parts,
+    }
+
+
+def _single_compute_plan_report(mlmodelc_path: Any) -> dict[str, Any]:
+    """Measure the placement of one compiled model (see :func:`_compute_plan_report`).
+
     Args:
         mlmodelc_path: Compiled model directory.
 
@@ -854,16 +950,29 @@ def _compute_plan_report(mlmodelc_path: Any) -> dict[str, Any]:
             else:
                 device_counts["unspecified"] += 1
 
-        dispatched = device_counts["NE"] + device_counts["GPU"] + device_counts["CPU"]
-        ne_placement_pct = 100.0 * device_counts["NE"] / dispatched if dispatched > 0 else 0.0
         return {
             "status": "measured",
             "total_ops": len(operations),
             "device_counts": device_counts,
-            "ne_placement_pct": ne_placement_pct,
+            "ne_placement_pct": _ne_placement_pct(device_counts),
         }
     except Exception as exc:  # noqa: BLE001 - degrade to a recorded skip, never raise
         return {"status": "unavailable", "reason": str(exc)}
+
+
+def _ne_placement_pct(device_counts: dict[str, int]) -> float:
+    """Share of the dispatched operations placed on the Neural Engine, in percent.
+
+    Args:
+        device_counts: Operation count per device; ``"unspecified"``
+            (operations without a dispatch decision, such as constants)
+            is left out of the share.
+
+    Returns:
+        The percentage, or ``0.0`` when no operation was dispatched.
+    """
+    dispatched = device_counts["NE"] + device_counts["GPU"] + device_counts["CPU"]
+    return 100.0 * device_counts["NE"] / dispatched if dispatched > 0 else 0.0
 
 
 def _collect_program_operations(block: Any) -> list[Any]:
@@ -889,9 +998,7 @@ def _collect_program_operations(block: Any) -> list[Any]:
 # --- warm latency -----------------------------------------------------------------
 
 
-def _measure_latency(
-    compiled: ct.models.CompiledMLModel, batch: dict[str, np.ndarray]
-) -> dict[str, Any]:
+def _measure_latency(compiled: Any, batch: dict[str, np.ndarray]) -> dict[str, Any]:
     """Measure warm predict() latency on one fixed batch (informational only).
 
     A simplified measurement compared to ``poc/benchmark_latency.py``
@@ -899,7 +1006,7 @@ def _measure_latency(
     timing, no round-robin input pool.
 
     Args:
-        compiled: Loaded compiled model.
+        compiled: Loaded model (see :func:`_load_artifact`).
         batch: Predict() input, already sized to the model's fixed batch B
             (see :func:`_first_predict_batch`).
 
@@ -985,9 +1092,11 @@ def _print_summary(context: SelfcheckContext, report: dict[str, Any]) -> None:
         if compute_plan.get("status") == "unavailable":
             lines.append(f"        NE placement  : unavailable ({compute_plan.get('reason')})")
         else:
+            parts = compute_plan.get("parts")
+            in_parts = f", {len(parts)} parts" if isinstance(parts, list) else ""
             lines.append(
                 f"        NE placement  : {compute_plan.get('ne_placement_pct', 0.0):.1f}% "
-                f"({compute_plan.get('total_ops', 0)} ops)"
+                f"({compute_plan.get('total_ops', 0)} ops{in_parts})"
             )
     latency = report.get("latency")
     if isinstance(latency, dict):
