@@ -10,8 +10,10 @@ Three layers:
 * The architecture assumptions this backend encodes, checked against a
   tiny randomly initialised model: that pinning ``token_type_ids`` and
   ``position_ids`` equals omitting them (in eager mode and through
-  ``torch.jit.trace``), that the traced graph really converts to Core ML,
-  and that the full configured position budget is addressable.
+  ``torch.jit.trace``), that handing the model its padding mask already
+  built in 4-D computes what the framework's own mask path computes, that
+  the traced graph really converts to Core ML, and that the full
+  configured position budget is addressable.
 * Conformance to the backend interface, driven by the protocol in
   ``eeane.compiler.backends.base``.
 
@@ -31,7 +33,7 @@ import pytest
 import torch
 
 from eeane.compiler import conversion
-from eeane.compiler.backends import bert, common
+from eeane.compiler.backends import bert, common, masks
 
 # Ids the stand-in tokenizer below uses for the special/padding tokens.
 _CLS_ID = 101
@@ -81,6 +83,7 @@ class _RecordingModel(torch.nn.Module):
         super().__init__()
         self.output = output
         self.config = SimpleNamespace(hidden_size=hidden_size)
+        self.seen_attention_mask: torch.Tensor | None = None
         self.seen_token_type_ids: torch.Tensor | None = None
         self.seen_position_ids: torch.Tensor | None = None
 
@@ -91,7 +94,8 @@ class _RecordingModel(torch.nn.Module):
         token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        """Record the segment/position ids and return the stored output as a tuple."""
+        """Record the mask, segment and position ids and return the stored output as a tuple."""
+        self.seen_attention_mask = attention_mask
         self.seen_token_type_ids = token_type_ids
         self.seen_position_ids = position_ids
         return (self.output,)
@@ -402,11 +406,21 @@ def test_reference_outputs_rejects_empty_inputs(tmp_path: Path) -> None:
         bert.BertBackend().reference_outputs(tmp_path, "embedding", [], 8)
 
 
-# --- patches (this architecture needs none) ----------------------------------
+# --- patches (nothing is rebound; the record states how the mask is built) --
 
 
-def test_apply_patches_is_a_no_op() -> None:
-    """A model that needs no rewrite must come back untouched and unrewritten."""
+def test_apply_patches_records_how_the_mask_is_built() -> None:
+    """The record names the mask the graph is traced with, as a JSON-serializable dict."""
+    backend = bert.BertBackend()
+
+    applied = backend.apply_patches(_loaded(torch.nn.Identity()))
+
+    assert applied == {"mask_4d_static": True, "mask_fill_value": masks.MASK_FILL_VALUE}
+    assert json.loads(json.dumps(applied)) == applied
+
+
+def test_apply_patches_leaves_the_model_untouched() -> None:
+    """Nothing is rebound or rewritten: the model computes the same before and after."""
     backend = bert.BertBackend()
     model = _RecordingModel(torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]))
     input_ids = torch.tensor([[7, 9]])
@@ -414,7 +428,7 @@ def test_apply_patches_is_a_no_op() -> None:
     with torch.no_grad():
         before = model(input_ids=input_ids, attention_mask=attention_mask)[0]
 
-    assert backend.apply_patches(_loaded(model)) == {}
+    backend.apply_patches(_loaded(model))
 
     with torch.no_grad():
         after = model(input_ids=input_ids, attention_mask=attention_mask)[0]
@@ -422,11 +436,22 @@ def test_apply_patches_is_a_no_op() -> None:
 
 
 def test_apply_patches_rejects_a_mask_fill_value() -> None:
-    """An unimplemented remedy must be refused loudly, not accepted and ignored."""
+    """A fill value other than the one the graph uses must be refused, not claimed."""
     backend = bert.BertBackend()
 
     with pytest.raises(ValueError, match="mask fill"):
         backend.apply_patches(_loaded(torch.nn.Identity()), mask_fill_value=-30000.0)
+
+
+def test_apply_patches_accepts_the_fill_value_the_graph_uses() -> None:
+    """Asking for exactly the value the graph already uses is a no-op, not an error."""
+    backend = bert.BertBackend()
+
+    applied = backend.apply_patches(
+        _loaded(torch.nn.Identity()), mask_fill_value=masks.MASK_FILL_VALUE
+    )
+
+    assert applied == backend.apply_patches(_loaded(torch.nn.Identity()))
 
 
 # --- wrappers and the zero-segment adapter -----------------------------------
@@ -515,6 +540,28 @@ def test_adapter_passes_the_positions_of_this_sequence_length(input_ids: torch.T
     assert seen.shape == (1, input_ids.shape[1])  # broadcast over the batch
     assert seen.dtype == input_ids.dtype
     assert torch.equal(seen[0], torch.arange(input_ids.shape[1], dtype=input_ids.dtype))
+
+
+@pytest.mark.parametrize(
+    "mask_2d",
+    [torch.tensor([[1, 1, 1]]), torch.tensor([[1, 1, 0], [1, 0, 0]])],
+    ids=["unpadded", "padded"],
+)
+def test_adapter_passes_the_4d_padding_mask(mask_2d: torch.Tensor) -> None:
+    """The model must receive the built additive 4-D mask, never the 2-D one."""
+    input_ids = torch.tensor([[5, 6, 0], [7, 0, 0]])[: mask_2d.shape[0]]
+    model = _RecordingModel(torch.zeros(input_ids.shape[0], input_ids.shape[1], 2))
+    adapter = bert.ZeroTokenTypeModel(model)
+
+    with torch.no_grad():
+        adapter(input_ids, mask_2d)
+
+    seen = model.seen_attention_mask
+    assert seen is not None
+    assert seen.shape == (mask_2d.shape[0], 1, 1, mask_2d.shape[1])
+    assert seen.dtype == torch.float32
+    assert torch.equal(seen, masks.padding_mask(mask_2d))
+    assert torch.equal(seen == 0, mask_2d.bool()[:, None, None, :])
 
 
 def test_adapter_returns_the_model_output_tuple_unchanged() -> None:
@@ -695,6 +742,59 @@ def test_tracing_keeps_the_pinned_inputs() -> None:
     assert torch.equal(replayed, expected)
 
 
+# Tolerance between the wrapped model (finite-fill 4-D mask, eager attention)
+# and the framework's own path (2-D mask, sdpa attention); what is left is
+# the difference between the finite fill and the float32 minimum, plus the
+# kernel difference between the two attention implementations.
+_FRAMEWORK_PATH_TOLERANCE = 1e-5
+
+
+def test_the_adapter_computes_what_the_framework_path_computes() -> None:
+    """At every real token, the 4-D mask path equals the framework's 2-D mask path."""
+    model = _tiny_model()
+    input_ids, attention_mask = _tiny_inputs(6)
+    real = attention_mask.to(torch.bool)
+
+    model.config._attn_implementation = "sdpa"
+    with torch.no_grad():
+        reference = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+        unmasked = model(input_ids=input_ids, attention_mask=torch.ones_like(attention_mask))[0]
+    model.config._attn_implementation = "eager"
+    with torch.no_grad():
+        adapted = bert.ZeroTokenTypeModel(model)(input_ids, attention_mask)[0]
+
+    # Guard: the padding must matter here, or the comparison proves nothing.
+    assert (reference[real] - unmasked[real]).abs().max().item() > 1e-3
+    assert torch.isfinite(adapted).all()
+    assert (adapted[real] - reference[real]).abs().max().item() <= _FRAMEWORK_PATH_TOLERANCE
+
+
+@pytest.mark.parametrize("pooling", ["mean", "cls"])
+def test_the_wrapped_embedding_equals_the_framework_path(pooling: str) -> None:
+    """The pooled output of the wrapper equals the pooled framework output for a padded batch."""
+    model = _tiny_model()
+    input_ids, attention_mask = _tiny_inputs(6, batch_size=3)
+    attention_mask[0, 5:] = 0  # a second, differently padded row
+
+    real = attention_mask.to(torch.bool)
+
+    model.config._attn_implementation = "sdpa"
+    with torch.no_grad():
+        hidden = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+        unmasked = model(input_ids=input_ids, attention_mask=torch.ones_like(attention_mask))[0]
+    expected = common.mean_pool(hidden, attention_mask) if pooling == "mean" else hidden[:, 0]
+    model.config._attn_implementation = "eager"
+    wrapper = bert.BertBackend().wrap(_loaded(model, "embedding", pooling=pooling))
+    with torch.no_grad():
+        wrapped = wrapper(input_ids, attention_mask)
+
+    # Guard: the padding must matter here, or the comparison proves nothing.
+    assert (hidden[real] - unmasked[real]).abs().max().item() > 1e-3
+    assert wrapped.shape == expected.shape
+    assert torch.isfinite(wrapped).all()
+    assert (wrapped - expected).abs().max().item() <= _FRAMEWORK_PATH_TOLERANCE
+
+
 def test_backbone_returns_the_last_hidden_state_first() -> None:
     """The wrappers pool ``outputs[0]``; for this family that is the hidden state."""
     model = _tiny_model()
@@ -720,6 +820,11 @@ def test_backbone_returns_the_last_hidden_state_first() -> None:
 # length, and what the explicit inputs of the adapter avoid.
 _DYNAMIC_SIZE_NODE = "aten::Int"
 
+# Second node the converter cannot translate: the op the framework
+# materializes its own attention mask with, which the 4-D mask the adapter
+# hands over avoids.
+_NEW_ONES_NODE = "aten::new_ones"
+
 # Sequence length of the conversion tests: within the tiny position budget
 # and large enough that a wrong position row would be a real difference.
 _CONVERSION_SEQ_LEN = _TINY_POSITIONS - 2
@@ -740,6 +845,13 @@ def test_the_traced_graph_has_no_dynamic_size_node() -> None:
     graph = str(_traced_tiny_wrapper().inlined_graph)
 
     assert _DYNAMIC_SIZE_NODE not in graph
+
+
+def test_the_traced_graph_builds_no_mask_with_new_ones() -> None:
+    """Handed the 4-D mask, the framework builds none, so no ``new_ones`` is recorded."""
+    graph = str(_traced_tiny_wrapper().inlined_graph)
+
+    assert _NEW_ONES_NODE not in graph
 
 
 def test_the_traced_wrapper_converts_to_core_ml() -> None:

@@ -8,13 +8,19 @@ the single source of truth for the ModernBERT patches, the wrappers, the
 fixed trace fixtures, this family's own Japanese sanity fixtures and the
 FP32 reference computations.
 
-The two monkeypatches are mandatory parts of the conversion, not optional
-tweaks:
+The three monkeypatches are mandatory parts of the conversion, not
+optional tweaks, and each of them is needed under transformers 5:
 
 * :func:`patch_rotate_half` makes the model convertible at all under
-  coremltools 9.0 + numpy 2.x.
+  coremltools 9.0 + numpy 2.x: the upstream ``rotate_half`` still slices
+  with a traced size, which records a cast the converter rejects.
 * :func:`patch_eager_attention_rank4` keeps the compiled model loadable on
-  the ANE for batch sizes greater than one.
+  the ANE for batch sizes greater than one: the upstream attention still
+  splits the fused projection through a rank-5 tensor.
+* :func:`patch_mask_builders` makes the graph convertible and keeps it
+  finite in FP16: the backbone now builds its masks through the
+  framework's shared mask helpers, which record an op the converter has
+  no translation for and fill masked positions with the float32 minimum.
 
 Everything that is not specific to this architecture -- pooling, the
 sentence-transformers declaration readers, the stable sigmoid,
@@ -78,11 +84,13 @@ from eeane.compiler.backends.common import (
 from eeane.compiler.backends.common import (
     SANITY_TEXT_SETS as SHARED_SANITY_TEXT_SETS,
 )
+from eeane.compiler.backends.masks import MASK_FILL_VALUE, bidirectional_masks
 
 # Public surface of this module, including the architecture-independent
 # helpers it re-exports from :mod:`eeane.compiler.backends.common`.
 __all__ = [
     "EMBEDDING_WRAPPERS",
+    "MASK_FILL_VALUE",
     "OUTPUT_NAMES",
     "POOLING_DIRNAME",
     "POOLING_MODE_KEYS",
@@ -101,7 +109,7 @@ __all__ = [
     "load_dense",
     "mean_pool",
     "patch_eager_attention_rank4",
-    "patch_mask_fill_value",
+    "patch_mask_builders",
     "patch_rotate_half",
     "read_pooling_mode",
     "score_pytorch",
@@ -208,6 +216,12 @@ BATCH_PADDING_PAIR: tuple[str, str] = ("", "")
 # that applying the patch twice cannot recurse.
 _ORIGINAL_ATTENTION_FORWARD = modeling_modernbert.ModernBertAttention.forward
 
+# Captured at import time for the same two reasons: patch_mask_builders()
+# delegates every mask it does not build itself to these upstream builders,
+# and applying it twice must not make a replacement delegate to another one.
+_ORIGINAL_CREATE_FULL_MASK = modeling_modernbert.create_bidirectional_mask
+_ORIGINAL_CREATE_SLIDING_MASK = modeling_modernbert.create_bidirectional_sliding_window_mask
+
 
 def patch_rotate_half() -> None:
     """Replace ModernBert's ``rotate_half`` with a static-shape equivalent.
@@ -233,21 +247,21 @@ def patch_eager_attention_rank4() -> None:
     """Rewrite ModernBert's eager attention without rank-5 intermediates.
 
     Upstream splits the fused projection with
-    ``qkv.view(bs, -1, 3, heads, head_dim).transpose(3, 1).unbind(dim=2)``,
-    which materializes rank-5 tensors. At B=1 the leading batch axis is
+    ``qkv.view(*input_shape, 3, -1, head_dim).unbind(dim=-3)``, which
+    materializes a rank-5 tensor. At B=1 the leading batch axis is
     degenerate and the ANE compiler copes, but for B>1 loading the compiled
     model on CPU_AND_NE fails with
     "MILCompilerForANE error: failed to compile ANE model using ANEF.
     Error=_ANECompiler : ANECCompile() FAILED." and the whole model silently
-    falls back to CPU (where the ``finfo.min`` mask makes the outputs NaN,
-    the v0.1 known limitation).
+    falls back to CPU.
 
     Because ``Wqkv`` emits the three projections contiguously along the last
     axis with the 3 as the outermost sub-index, ``chunk(3, dim=-1)``
     followed by a rank-4 ``view``/``transpose`` selects exactly the same
-    elements as the upstream rank-5 path. The rewrite is therefore
-    bit-exact (verified: max |patched - upstream| = 0.0 on ruri-v3-310m)
-    and only changes tensor rank, never semantics.
+    elements as the upstream rank-5 path. The rotary embedding and the
+    attention itself stay upstream's own ``apply_rotary_pos_emb`` and
+    ``eager_attention_forward``, so the rewrite is bit-exact against the
+    upstream eager path and only changes tensor rank, never semantics.
 
     Only the ``eager`` attention path is rewritten; ``sdpa`` and
     ``flash_attention_2`` keep the upstream implementation, so the FP32
@@ -257,107 +271,125 @@ def patch_eager_attention_rank4() -> None:
 
     Raises:
         ValueError: If a patched module's head geometry contradicts the
-            ``heads * head_dim == all_head_size`` layout assumption.
+            ``heads * head_dim == hidden_size`` layout assumption.
     """
-
-    def eager_attention_rank4(
-        module: modeling_modernbert.ModernBertAttention,
-        qkv: torch.Tensor,
-        attention_mask: torch.Tensor,
-        sliding_window_mask: torch.Tensor,
-        position_ids: torch.Tensor | None,
-        local_attention: tuple[int, int],
-        bs: int,
-        dim: int,
-        output_attentions: bool = False,
-        **_kwargs: Any,
-    ) -> tuple[torch.Tensor, ...]:
-        """Eager attention over a rank-3 ``qkv`` of shape (B, S, 3*H*D)."""
-        cos, sin = module.rotary_emb(qkv, position_ids=position_ids)
-        heads, head_dim = module.num_heads, module.head_dim
-        # (B, S, 3*H*D) -> three (B, H, S, D) tensors, all rank 4.
-        query, key, value = (
-            part.view(bs, -1, heads, head_dim).transpose(1, 2) for part in qkv.chunk(3, dim=-1)
-        )
-        query, key = modeling_modernbert.apply_rotary_pos_emb(query, key, cos, sin)
-
-        scale = head_dim**-0.5
-        attn_weights = torch.matmul(query, key.transpose(2, 3)) * scale
-        if local_attention != (-1, -1):
-            attention_mask = sliding_window_mask
-        attn_weights = attn_weights + attention_mask
-        # Upstream upcasts the softmax to fp32 before casting back.
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query.dtype
-        )
-        attn_weights = torch.nn.functional.dropout(
-            attn_weights, p=module.attention_dropout, training=module.training
-        )
-        attn_output = torch.matmul(attn_weights, value)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, dim)
-        if output_attentions:
-            return (attn_output, attn_weights)
-        return (attn_output,)
 
     def attention_forward(
         self: modeling_modernbert.ModernBertAttention,
         hidden_states: torch.Tensor,
-        output_attentions: bool = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Replacement for ``ModernBertAttention.forward``."""
         if self.config._attn_implementation != "eager":
             return _ORIGINAL_ATTENTION_FORWARD(
-                self, hidden_states, output_attentions=output_attentions, **kwargs
+                self,
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
             )
-        if self.all_head_size != self.num_heads * self.head_dim:
+        heads, head_dim = self.config.num_attention_heads, self.head_dim
+        if heads * head_dim != self.config.hidden_size:
             raise ValueError(
                 "unexpected ModernBert head geometry "
-                f"({self.num_heads} heads x {self.head_dim} != {self.all_head_size}); "
+                f"({heads} heads x {head_dim} != {self.config.hidden_size}); "
                 "the rank-4 qkv split assumption does not hold"
             )
-        # The rank-5 view of the upstream forward is skipped entirely.
-        attn_outputs = eager_attention_rank4(
-            self,
-            qkv=self.Wqkv(hidden_states),
-            local_attention=self.local_attention,
-            bs=hidden_states.shape[0],
-            dim=self.all_head_size,
-            output_attentions=output_attentions,
-            **kwargs,
+        bs = hidden_states.shape[0]
+        # (B, S, 3*H*D) -> three (B, H, S, D) tensors, all rank 4: the
+        # rank-5 view of the upstream forward is skipped entirely.
+        query, key, value = (
+            part.view(bs, -1, heads, head_dim).transpose(1, 2)
+            for part in self.Wqkv(hidden_states).chunk(3, dim=-1)
         )
-        hidden_states = self.out_drop(self.Wo(attn_outputs[0]))
-        return (hidden_states,) + attn_outputs[1:]
+        cos, sin = position_embeddings
+        # Looked up on the module at call time, so that the rotary
+        # embedding uses the rotate_half of patch_rotate_half().
+        query, key = modeling_modernbert.apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=1)
+        # The layer's mask already encodes its sliding window, so none is
+        # passed: upstream's eager function ignores it anyway.
+        attn_output, attn_weights = modeling_modernbert.eager_attention_forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            scaling=head_dim**-0.5,
+            dropout=self.attention_dropout if self.training else 0.0,
+        )
+        attn_output = attn_output.reshape(bs, -1, heads * head_dim)
+        return self.out_drop(self.Wo(attn_output)), attn_weights
 
     modeling_modernbert.ModernBertAttention.forward = attention_forward
 
 
-def patch_mask_fill_value(model: torch.nn.Module, fill_value: float) -> None:
-    """Override ModernBert attention mask generation with a finite fill value.
+def patch_mask_builders() -> None:
+    """Build ModernBert's eager attention masks in-graph with a finite fill value.
 
-    ``ModernBertModel._update_attention_mask`` fills masked positions with
-    ``torch.finfo(float32).min``, which becomes ``-inf`` once the graph is
-    cast to FP16 and can make softmax produce NaN for fully masked rows.
-    This monkeypatch reproduces the same masks with a finite fill value.
+    The backbone builds one additive mask per layer type -- the full mask
+    and the sliding-window mask -- by calling the framework's shared mask
+    helpers through two module-level names of the modeling module. On the
+    eager path that construction stands in the way of the conversion
+    twice: it materializes the mask with a ``new_ones`` op, which the Core
+    ML converter has no translation for, and it fills the masked positions
+    with ``torch.finfo(float32).min``, which becomes ``-inf`` once the graph
+    runs in FP16 and makes softmax produce NaN for a fully masked row (a
+    padding query whose whole window is padding, for instance).
 
-    Args:
-        model: The loaded ModernBertModel instance (the backbone, not a
-            SequenceClassification wrapper; see
-            :meth:`ModernBertBackend.apply_patches`).
-        fill_value: Finite value used for masked positions (e.g. -30000.0).
+    Both names are rebound to replacements that, on the eager path and
+    given a 2-D mask, build the two masks with
+    :func:`~eeane.compiler.backends.masks.bidirectional_masks` instead:
+    static-shape operations only, and :data:`MASK_FILL_VALUE` in the masked
+    positions. The positions they hide are exactly the ones upstream hides
+    -- the configured window is an inclusive radius, so the builder's
+    exclusive half-width is that radius plus one -- and only the fill value
+    differs. Each layer still receives the 4-D mask of its type, and the
+    2-D mask the backbone was given still reaches a classification head
+    that pools with it.
+
+    Every other case -- a non-eager implementation (in particular the
+    ``sdpa`` FP32 reference, which thereby stays an independent check of
+    these masks), no mask, or a mask that is not 2-D -- is delegated to the
+    upstream builder captured at import time, so re-applying the patch is
+    harmless.
     """
-    local_attention = model.config.local_attention
 
-    def _update(attention_mask: torch.Tensor, output_attentions: bool = False) -> tuple:
-        seq_len = attention_mask.shape[-1]
-        global_mask = (1.0 - attention_mask[:, None, None, :].float()) * fill_value  # (B,1,1,S)
-        rows = torch.arange(seq_len).unsqueeze(0)
-        distance = (rows - rows.T).abs()  # (S, S)
-        window = (distance <= local_attention // 2)[None, None, :, :]  # (1,1,S,S)
-        sliding_window_mask = global_mask.masked_fill(~window, fill_value)  # (B,1,S,S)
-        return global_mask, sliding_window_mask
+    def create_bidirectional_mask(
+        config: Any,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Replacement for the full-attention mask builder."""
+        built = _in_graph_masks(config, attention_mask)
+        if built is None:
+            return _ORIGINAL_CREATE_FULL_MASK(
+                config, inputs_embeds, attention_mask, *args, **kwargs
+            )
+        return built[0]
 
-    model._update_attention_mask = _update
+    def create_bidirectional_sliding_window_mask(
+        config: Any,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Replacement for the sliding-window mask builder."""
+        built = _in_graph_masks(config, attention_mask)
+        if built is None:
+            return _ORIGINAL_CREATE_SLIDING_MASK(
+                config, inputs_embeds, attention_mask, *args, **kwargs
+            )
+        return built[1]
+
+    modeling_modernbert.create_bidirectional_mask = create_bidirectional_mask
+    modeling_modernbert.create_bidirectional_sliding_window_mask = (
+        create_bidirectional_sliding_window_mask
+    )
 
 
 class ModernBertBackend:
@@ -387,11 +419,12 @@ class ModernBertBackend:
                 for the FP32 reference.
 
         Returns:
-            A handle holding the model in eval/FP32 mode with
-            ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
-            outputs), its tokenizer, its configuration and -- for an
-            embedding model -- the pooling and the Dense projection
-            declared by the model directory.
+            A handle holding the model in eval/FP32 mode -- an embedding
+            model with ``config.return_dict = False``, a reranker with
+            the configuration's own setting (see below) -- its tokenizer,
+            its configuration and -- for an embedding model -- the
+            pooling and the Dense projection declared by the model
+            directory.
 
         Raises:
             ValueError: If ``kind`` is not supported by this backend, if
@@ -410,7 +443,13 @@ class ModernBertBackend:
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         loader = AutoModel if embedding else AutoModelForSequenceClassification
         model = loader.from_pretrained(model_dir, attn_implementation=attn, dtype=torch.float32)
-        model.config.return_dict = False
+        if embedding:
+            model.config.return_dict = False
+        # A reranker keeps structured outputs: its classification head reads
+        # the backbone's output by attribute, and the backbone, sharing the
+        # configuration, would return a plain tuple. The wrappers and the
+        # FP32 reference take ``outputs[0]`` -- the logits -- either way,
+        # and the traced graph's own output is that tensor.
         return LoadedModel(
             model=model.eval(),
             tokenizer=tokenizer,
@@ -426,32 +465,37 @@ class ModernBertBackend:
     def apply_patches(
         self, loaded: LoadedModel, mask_fill_value: float | None = None
     ) -> dict[str, Any]:
-        """Apply the mandatory (and optional) ModernBERT graph patches.
+        """Apply the mandatory ModernBERT graph patches.
 
-        ``patch_rotate_half`` and ``patch_eager_attention_rank4`` are
-        mandatory constituents of the conversion, applied at every batch
-        size so that one graph shape is produced instead of mixing rank-5
-        (B=1) and rank-4 (B>1) variants. Both patch global
-        ``transformers`` symbols, so they affect every ModernBert instance
-        in the process; both are semantically equivalent to upstream, and
-        re-applying them is harmless.
+        :func:`patch_rotate_half`, :func:`patch_eager_attention_rank4` and
+        :func:`patch_mask_builders` are mandatory constituents of the
+        conversion, applied at every batch size so that one graph shape is
+        produced instead of mixing rank-5 (B=1) and rank-4 (B>1) variants.
+        All three patch global ``transformers`` symbols, so they affect
+        every ModernBert instance in the process; all three compute what
+        upstream computes -- the masks with a finite fill value in place of
+        the float32 minimum -- and re-applying them is harmless.
 
         Args:
             loaded: Handle returned by :meth:`load`.
-            mask_fill_value: Optional finite attention-mask fill value; when
-                given, :func:`patch_mask_fill_value` is applied to the
-                backbone of the loaded model.
+            mask_fill_value: Optional finite attention-mask fill value.
+                The patched graph always builds its masks itself with
+                :data:`MASK_FILL_VALUE` (already a finite value); the
+                argument is therefore only accepted when it names that
+                very value.
 
         Returns:
-            ``{"rotate_half_static": True, "eager_attention_rank4": True}``,
-            plus ``"mask_fill_value": mask_fill_value`` when one was given:
-            the two rewrites are always applied by this backend, the mask
-            fill only when requested.
+            ``{"rotate_half_static": True, "eager_attention_rank4": True,
+            "mask_builders_static": True, "mask_fill_value":
+            MASK_FILL_VALUE}``: the three rewrites are always applied by
+            this backend, and the fill value of the masks the graph builds
+            is always recorded with them.
 
         Raises:
             ValueError: If the RoPE head dimension is odd (which would make
                 the ``chunk``-based ``rotate_half`` rewrite inexact), or if
-                no ModernBert backbone can be found for the mask patch.
+                a mask fill value other than :data:`MASK_FILL_VALUE` is
+                requested. Nothing is rebound in either case.
         """
         config = loaded.config
         head_dim = config.hidden_size // config.num_attention_heads
@@ -459,13 +503,20 @@ class ModernBertBackend:
             raise ValueError(
                 f"odd RoPE head dim ({head_dim}) is incompatible with patch_rotate_half"
             )
+        if mask_fill_value is not None and mask_fill_value != MASK_FILL_VALUE:
+            raise ValueError(
+                f"{self.name} builds its attention masks inside the traced graph with a "
+                f"mask fill value of {MASK_FILL_VALUE}; {mask_fill_value} cannot be applied"
+            )
         patch_rotate_half()
         patch_eager_attention_rank4()
-        applied: dict[str, Any] = {"rotate_half_static": True, "eager_attention_rank4": True}
-        if mask_fill_value is not None:
-            patch_mask_fill_value(_resolve_backbone(loaded.model), mask_fill_value)
-            applied["mask_fill_value"] = mask_fill_value
-        return applied
+        patch_mask_builders()
+        return {
+            "rotate_half_static": True,
+            "eager_attention_rank4": True,
+            "mask_builders_static": True,
+            "mask_fill_value": MASK_FILL_VALUE,
+        }
 
     def wrap(self, loaded: LoadedModel) -> torch.nn.Module:
         """Wrap the loaded model into the traceable module for its kind.
@@ -695,21 +746,27 @@ class ModernBertBackend:
             raise ValueError(f"unsupported kind '{kind}' for {self.name} (supported: {supported})")
 
 
-def _resolve_backbone(model: torch.nn.Module) -> torch.nn.Module:
-    """Return the ModernBertModel backbone owning ``_update_attention_mask``.
+def _in_graph_masks(
+    config: Any, attention_mask: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Build the (full, sliding) masks :func:`patch_mask_builders` hands the layers.
 
-    The mask helper lives on the backbone, which *is* the model for an
-    embedding model but is ``model.model`` for a SequenceClassification
-    model.
+    Args:
+        config: Configuration the backbone hands its mask builders.
+        attention_mask: Mask the backbone was given.
 
-    Raises:
-        ValueError: If neither the model nor its ``model`` attribute owns
-            ``_update_attention_mask``.
+    Returns:
+        Both additive masks, each of shape ``(B, 1, S, S)``, on the eager
+        path for a 2-D mask; ``None`` for every case the upstream builders
+        keep (a non-eager implementation, no mask, or a mask that is not
+        2-D).
     """
-    for candidate in (model, getattr(model, "model", None)):
-        if candidate is not None and hasattr(candidate, "_update_attention_mask"):
-            return candidate
-    raise ValueError(
-        f"cannot locate a ModernBert backbone with _update_attention_mask on "
-        f"{type(model).__name__}; the mask fill patch cannot be applied"
+    if config._attn_implementation != "eager":
+        return None
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        return None
+    # ``sliding_window`` is an inclusive radius (a key is visible when
+    # ``abs(query - key) <= radius``); the builder takes an exclusive one.
+    return bidirectional_masks(
+        attention_mask, window=config.sliding_window + 1, fill_value=MASK_FILL_VALUE
     )

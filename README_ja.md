@@ -274,6 +274,16 @@ uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@main
 タグ)はリリース済みのリビジョンを固定します。既存のインストールを
 切り替えるには、同じコマンドに`--force`を付けて実行してください。
 
+### eeANE 1.xからのアップグレード
+
+eeANE 2.0は、モデルのコンパイルにtransformers 4.57ではなく5.20を使い
+ます。eeANE 1.xでコンパイルしたモデルは、2.0のサーバーでそのまま使え
+ます(サーバーはtransformersを使いません)。そのモデルに対して
+`eeane compile`をもう一度実行すると、コンパイル済みモデルに記録された
+依存の版が変わっているため、自動的に作り直されます(`--force`は不要)。
+transformers 4.57でコンパイルし続けたい場合は、eeANE 1.7.xに留めてく
+ださい(例: `uv tool install "eeane[compile]>=1.7,<2"`)。
+
 ## クイックスタート
 
 ```sh
@@ -429,6 +439,10 @@ embeddingモデルをコンパイルします(meanプーリングの後に2段�
 バックエンドごとで、モデル名からは必ずしも判別できない点に注意して
 ください(`paraphrase-multilingual-mpnet-base-v2`はXLM-RoBERTa系、
 `multilingual-e5-small`はBERT系です)。
+
+いずれもeeANE 2.0.0(transformers 5.20)でコンパイルし直してセルフ
+チェックに通過しています。各系統の参照モデルは、参照実装との突き合わせ
+に加えて、eeANE 1.7が生成するコンパイル済みモデルとも出力を比べました。
 
 これら5系統のアーキテクチャに基づく他のモデルも動作する可能性が高く、
 以下は実際に一通り動作を確認したものの一覧にすぎません。
@@ -1131,6 +1145,7 @@ rerankingモデルをサービングしたい場合、またはもっと幅広�
 
 | バージョン | ハイライト |
 |---|---|
+| 2.0.0 | `eeane compile`がtransformers 4.57から5.20へ移行(huggingface_hubは2系)。eeANE 1.xでコンパイルしたモデルは2.0のサーバーでそのまま使え、`eeane compile`を再実行すると自動的に作り直される(transformers 4.57でコンパイルし続けたい場合はeeANE 1.7.xに留める)。ModernBERT・BERT・XLM-RoBERTaのバックエンドはアテンションマスクをコンパイル済みグラフの中で作るようになり、これらのモデルはNeural Engineで実行される割合もわずかに上がった。検証済みの63モデルをすべてコンパイルし直して再検証。一部のXLM-RoBERTa系モデルの凍結トークナイザは、SentencePieceモデルと同じく末尾の空白をトークンにしなくなった |
 | 1.7.0 | Neural Engineの大きさの上限を超えるコンパイル済みモデルを、それぞれが上限に収まる部分へ自動的に分割し、`eeane serve`が順に実行するように(API・設定・結果は変わらず、重みはすべてFP16のまま)。上限は`eeane compile`を実行するmacOSのバージョンで決まり(macOS 26までは2 GiB、macOS 27以降は1 GiB)、`--ne-size-limit`で上書きできる。XLM-RoBERTa large級の7モデルがmacOS 27で使えるように。Qwen3モデルの埋め込み表を8ビット整数で保存する必要がなくなり、この回避策は廃止。起動時の警告は、分割済みのモデルを部分ごとに判定するように。`model_info.json`は形式4になった(eeANE 1.6.1以前では読み込めない) |
 | 1.6.1 | macOS 27(Neural Engineが受け付けるモデルの大きさが2 GiBから1 GiBへ下がった)で、Qwen3系のモデルが再びNeural Engineで動くようになった: macOS 27以降でコンパイルしたQwen3モデルが上限を超える場合、`eeane compile`が語彙の埋め込み表を8ビット整数で保存し、コンパイル済みモデルが上限に収まる(配置率・速度・精度はmacOS 26と同水準)。`eeane serve`は、Neural Engineで実行されないモデルを起動時に警告する。XLM-RoBERTa large級のモデルは、当面macOS 27では使えないことを明記 |
 | 1.6.0 | Gemma 3(双方向のembeddingモデル)がeeANEの5つ目の対応アーキテクチャ系統になり、通常の`eeane compile`でコンパイルして既存のサーバーでそのまま提供できるように。生成用・マルチモーダル・Gemma 3nは理由つきで拒否。関数としては同値な書き換えでモデルをFP16の範囲に収める。検証済みモデルを1件追加(google/embeddinggemma-300m、62→63)。利用承諾の要るモデルの取得に失敗したとき、対処を案内するように |

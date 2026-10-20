@@ -11,7 +11,8 @@ Three layers:
   rule only holds while each set really covers its own language.
 * ``eeane.compiler.backends.modernbert``: the numerics ported from the
   frozen PoC scripts (masked mean pooling, stable sigmoid, patched-eager
-  == unpatched-sdpa forward outputs) plus the conformance of every
+  == unpatched-sdpa forward outputs), the in-graph mask builders, the
+  traced and converted patched graph, plus the conformance of every
   registered backend to the interface that pipeline.py drives.
 
 Tests needing the real 310M models skip themselves when
@@ -28,13 +29,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import coremltools as ct
 import numpy as np
 import pytest
 import torch
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, masking_utils
 from transformers.models.modernbert import modeling_modernbert
 
+from eeane.compiler import conversion
 from eeane.compiler.backends import base, bert, common
 from eeane.compiler.backends import gemma3 as g3
 from eeane.compiler.backends import modernbert as mb
@@ -55,20 +58,35 @@ SMOKE_SEQ_LEN = 128
 # here is the eager-vs-sdpa kernel difference in FP32.
 PATCH_ABS_TOLERANCE = 1e-4
 
+# The upstream attention forward and rotate_half the backend rebinds,
+# captured before any test of this module applies the patches. The upstream
+# mask builders need no such capture: ``masking_utils`` keeps them, and only
+# the names bound in the modeling module are rebound.
+_UPSTREAM_ATTENTION_FORWARD = modeling_modernbert.ModernBertAttention.forward
+_UPSTREAM_ROTATE_HALF = modeling_modernbert.rotate_half
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _restore_transformers_patches() -> Iterator[None]:
     """Undo the global ModernBert monkeypatches after this module's tests."""
     original_rotate_half = modeling_modernbert.rotate_half
     original_forward = modeling_modernbert.ModernBertAttention.forward
+    original_full_mask = modeling_modernbert.create_bidirectional_mask
+    original_sliding_mask = modeling_modernbert.create_bidirectional_sliding_window_mask
     yield
     modeling_modernbert.rotate_half = original_rotate_half
     modeling_modernbert.ModernBertAttention.forward = original_forward
+    modeling_modernbert.create_bidirectional_mask = original_full_mask
+    modeling_modernbert.create_bidirectional_sliding_window_mask = original_sliding_mask
 
 
-def _tiny_model(seed: int = 0, vocab_size: int = 128) -> torch.nn.Module:
-    """Build a randomly initialised ModernBertModel small enough for a unit test."""
-    config = modeling_modernbert.ModernBertConfig(
+def _tiny_config(vocab_size: int = 128, **overrides: Any) -> Any:
+    """Build a ModernBertConfig small enough for a unit test.
+
+    ``local_attention=8`` gives the sliding layers an inclusive window
+    radius of 4, a quarter of the 16 tokens of :func:`_tiny_inputs`.
+    """
+    return modeling_modernbert.ModernBertConfig(
         vocab_size=vocab_size,
         hidden_size=32,
         num_attention_heads=4,
@@ -77,9 +95,23 @@ def _tiny_model(seed: int = 0, vocab_size: int = 128) -> torch.nn.Module:
         max_position_embeddings=64,
         local_attention=8,
         pad_token_id=0,
+        **overrides,
     )
+
+
+def _tiny_model(seed: int = 0, vocab_size: int = 128) -> torch.nn.Module:
+    """Build a randomly initialised ModernBertModel small enough for a unit test."""
+    config = _tiny_config(vocab_size)
     torch.manual_seed(seed)
     model = modeling_modernbert.ModernBertModel(config)
+    return model.eval()
+
+
+def _tiny_classifier(classifier_pooling: str, seed: int = 0) -> torch.nn.Module:
+    """Build a randomly initialised single-logit classifier pooling as given."""
+    config = _tiny_config(num_labels=1, classifier_pooling=classifier_pooling)
+    torch.manual_seed(seed)
+    model = modeling_modernbert.ModernBertForSequenceClassification(config)
     return model.eval()
 
 
@@ -619,31 +651,60 @@ def test_apply_patches_rejects_odd_rope_head_dim() -> None:
         backend.apply_patches(_loaded(model))
 
 
+# Record apply_patches returns: the three mandatory rewrites, and the fill
+# value of the masks the patched graph builds, which is always recorded
+# because those masks are always built in-graph.
+_EXPECTED_PATCH_RECORD = {
+    "rotate_half_static": True,
+    "eager_attention_rank4": True,
+    "mask_builders_static": True,
+    "mask_fill_value": mb.MASK_FILL_VALUE,
+}
+
+
 def test_apply_patches_returns_the_applied_patch_record() -> None:
-    """The two mandatory rewrites must be reported, without a mask fill entry."""
+    """The three mandatory rewrites and the in-graph mask fill value must be reported."""
     backend = mb.ModernBertBackend()
     model = SimpleNamespace(config=SimpleNamespace(hidden_size=32, num_attention_heads=4))
 
     applied = backend.apply_patches(_loaded(model))
 
-    assert applied == {"rotate_half_static": True, "eager_attention_rank4": True}
+    assert applied == _EXPECTED_PATCH_RECORD
 
 
 def test_apply_patches_records_the_mask_fill_value_when_given() -> None:
-    """A given mask_fill_value must be recorded verbatim in the returned record."""
+    """Asking for exactly the value the graph's masks use is accepted and recorded."""
     backend = mb.ModernBertBackend()
-    model = SimpleNamespace(
-        config=SimpleNamespace(hidden_size=32, num_attention_heads=4, local_attention=8),
-        _update_attention_mask=lambda *args, **kwargs: None,
-    )
+    model = SimpleNamespace(config=SimpleNamespace(hidden_size=32, num_attention_heads=4))
 
-    applied = backend.apply_patches(_loaded(model), mask_fill_value=-30000.0)
+    applied = backend.apply_patches(_loaded(model), mask_fill_value=mb.MASK_FILL_VALUE)
 
-    assert applied == {
-        "rotate_half_static": True,
-        "eager_attention_rank4": True,
-        "mask_fill_value": -30000.0,
+    assert applied == _EXPECTED_PATCH_RECORD
+
+
+def test_apply_patches_refuses_a_fill_value_the_graph_does_not_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The graph's mask fill is fixed by the mask patch; a different one must not be claimed."""
+    backend = mb.ModernBertBackend()
+    model = SimpleNamespace(config=SimpleNamespace(hidden_size=32, num_attention_heads=4))
+    # Stand-ins for the rebound symbols, so that a refused request is seen
+    # to rebind nothing whichever patches earlier tests already applied.
+    sentinels = {
+        "rotate_half": object(),
+        "create_bidirectional_mask": object(),
+        "create_bidirectional_sliding_window_mask": object(),
     }
+    for name, sentinel in sentinels.items():
+        monkeypatch.setattr(modeling_modernbert, name, sentinel)
+    sentinel_forward = object()
+    monkeypatch.setattr(modeling_modernbert.ModernBertAttention, "forward", sentinel_forward)
+
+    with pytest.raises(ValueError, match="mask fill value"):
+        backend.apply_patches(_loaded(model), mask_fill_value=-30000.0)
+
+    assert all(getattr(modeling_modernbert, name) is value for name, value in sentinels.items())
+    assert modeling_modernbert.ModernBertAttention.forward is sentinel_forward
 
 
 # --- pooling detection -------------------------------------------------------
@@ -808,13 +869,43 @@ def test_max_seq_len_of_a_corrupt_config_is_none(tmp_path: Path) -> None:
 
 
 def test_patched_eager_matches_unpatched_sdpa_on_a_tiny_model() -> None:
-    """The patched eager path must reproduce the untouched sdpa outputs."""
+    """The patched eager path must reproduce the untouched sdpa and eager outputs."""
     model = _tiny_model()
     input_ids, attention_mask = _tiny_inputs()
+    batch_size, seq_len = attention_mask.shape
 
-    model.config._attn_implementation = "sdpa"
-    with torch.no_grad():
-        reference = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+    # Both references run on upstream's own symbols, whichever patches
+    # earlier tests of this module already applied.
+    references: dict[str, torch.Tensor] = {}
+    with pytest.MonkeyPatch.context() as upstream:
+        upstream.setattr(modeling_modernbert, "rotate_half", _UPSTREAM_ROTATE_HALF)
+        upstream.setattr(
+            modeling_modernbert.ModernBertAttention, "forward", _UPSTREAM_ATTENTION_FORWARD
+        )
+        upstream.setattr(
+            modeling_modernbert,
+            "create_bidirectional_mask",
+            masking_utils.create_bidirectional_mask,
+        )
+        upstream.setattr(
+            modeling_modernbert,
+            "create_bidirectional_sliding_window_mask",
+            masking_utils.create_bidirectional_sliding_window_mask,
+        )
+        for attn in ("sdpa", "eager"):
+            model.config._attn_implementation = attn
+            with torch.no_grad():
+                references[attn] = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+        # Guard for the full comparison below: the last layer slides, and
+        # the padded row holds a query whose whole window is padding.
+        sliding = masking_utils.create_bidirectional_sliding_window_mask(
+            config=model.config,
+            inputs_embeds=torch.zeros(batch_size, seq_len, model.config.hidden_size),
+            attention_mask=attention_mask,
+        )
+
+    assert model.config.layer_types[-1] == "sliding_attention"
+    assert (sliding != 0).all(dim=-1).any()
 
     mb.ModernBertBackend().apply_patches(_loaded(model))
     model.config._attn_implementation = "eager"
@@ -822,7 +913,15 @@ def test_patched_eager_matches_unpatched_sdpa_on_a_tiny_model() -> None:
         patched = model(input_ids=input_ids, attention_mask=attention_mask)[0]
 
     assert torch.isfinite(patched).all()
-    assert (patched - reference).abs().max().item() < PATCH_ABS_TOLERANCE
+    # Under transformers 5 the sdpa path returns zeros for a query row whose
+    # keys are all masked (the fully padded window of the last sliding
+    # layer), whereas eager returns a softmax-weighted average. Such rows
+    # are hidden as keys in every layer and discarded by pooling, so only
+    # real-token rows are comparable across the two kernels; against
+    # upstream's own eager path every position is.
+    real = attention_mask.bool()
+    assert (patched - references["sdpa"])[real].abs().max().item() < PATCH_ABS_TOLERANCE
+    assert (patched - references["eager"]).abs().max().item() < PATCH_ABS_TOLERANCE
 
 
 def test_patches_are_idempotent() -> None:
@@ -843,6 +942,26 @@ def test_patches_are_idempotent() -> None:
     assert torch.equal(once, twice)
 
 
+def test_the_rank4_attention_is_bit_exact_against_upstream_eager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given the same masks, the rank-4 split must change tensor rank only, never a value."""
+    model = _tiny_model()
+    input_ids, attention_mask = _tiny_inputs()
+    mb.ModernBertBackend().apply_patches(_loaded(model))
+    model.config._attn_implementation = "eager"
+    with torch.no_grad():
+        patched = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+
+    monkeypatch.setattr(
+        modeling_modernbert.ModernBertAttention, "forward", _UPSTREAM_ATTENTION_FORWARD
+    )
+    with torch.no_grad():
+        upstream = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+
+    assert torch.equal(patched, upstream)
+
+
 def test_rotate_half_patch_matches_the_upstream_formula() -> None:
     """The static-shape rotate_half must return the same values as the sliced one."""
     torch.manual_seed(0)
@@ -854,35 +973,287 @@ def test_rotate_half_patch_matches_the_upstream_formula() -> None:
     assert torch.equal(modeling_modernbert.rotate_half(x), expected)
 
 
-def test_mask_fill_value_patch_produces_finite_masks() -> None:
-    """The mask patch must replace -inf-prone fills with the requested finite value."""
+def test_attention_patch_rejects_a_head_geometry_the_rank4_split_cannot_serve() -> None:
+    """Heads that do not tile the hidden size would mis-split qkv, so they must raise."""
     model = _tiny_model()
-    fill_value = -30000.0
+    input_ids, attention_mask = _tiny_inputs()
+    mb.ModernBertBackend().apply_patches(_loaded(model))
+    model.config._attn_implementation = "eager"
+    model.layers[0].attn.head_dim = 6  # 4 heads x 6 != hidden size 32
 
-    mb.patch_mask_fill_value(model, fill_value)
-    attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.long)
-    global_mask, sliding_window_mask = model._update_attention_mask(attention_mask)
-
-    assert global_mask.shape == (1, 1, 1, 4)
-    assert sliding_window_mask.shape == (1, 1, 4, 4)
-    assert torch.isfinite(global_mask).all()
-    assert torch.isfinite(sliding_window_mask).all()
-    # Unmasked positions stay at 0.0, masked ones carry exactly fill_value.
-    assert global_mask[0, 0, 0].tolist() == [0.0, 0.0, 0.0, fill_value]
-    # local_attention=8 -> a +-4 window, so every position is in-window here.
-    assert sliding_window_mask[0, 0, 0].tolist() == [0.0, 0.0, 0.0, fill_value]
+    with pytest.raises(ValueError, match="head geometry"), torch.no_grad():
+        model(input_ids=input_ids, attention_mask=attention_mask)
 
 
-def test_mask_fill_value_patch_masks_outside_the_sliding_window() -> None:
-    """Positions beyond local_attention//2 must be filled even when unmasked."""
+@pytest.mark.parametrize("classifier_pooling", ["mean", "cls"])
+def test_patched_eager_classifier_matches_unpatched_sdpa(classifier_pooling: str) -> None:
+    """The classification head must still pool with the 2-D mask under the mask patch."""
+    model = _tiny_classifier(classifier_pooling)
+    input_ids, attention_mask = _tiny_inputs()
+
+    model.config._attn_implementation = "sdpa"
+    with torch.no_grad():
+        reference = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+
+    mb.ModernBertBackend().apply_patches(_loaded(model, kind="reranker"))
+    model.config._attn_implementation = "eager"
+    with torch.no_grad():
+        patched = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+
+    assert patched.shape == (2, 1)
+    assert torch.isfinite(patched).all()
+    assert (patched - reference).abs().max().item() < PATCH_ABS_TOLERANCE
+
+
+# --- in-graph mask builders ----------------------------------------------------
+
+# Each mask builder the mask patch rebinds, by its name in the modeling
+# module, next to the upstream builder it has to agree with.
+_MASK_BUILDERS = pytest.mark.parametrize(
+    ("name", "upstream"),
+    [
+        ("create_bidirectional_mask", masking_utils.create_bidirectional_mask),
+        (
+            "create_bidirectional_sliding_window_mask",
+            masking_utils.create_bidirectional_sliding_window_mask,
+        ),
+    ],
+    ids=["full", "sliding"],
+)
+
+
+def _mask_example(attn: str) -> tuple[Any, torch.Tensor, torch.Tensor]:
+    """Return a tiny config using ``attn``, a right-padded (B, S) mask and matching embeddings.
+
+    The 16 positions are four times the inclusive window radius, so the
+    sliding window cuts keys off on both sides of the middle queries. The
+    rows are unpadded, half padded, and padded after 13 tokens.
+    """
+    config = _tiny_config()
+    config._attn_implementation = attn
+    attention_mask = torch.ones(3, 16, dtype=torch.long)
+    attention_mask[1, 8:] = 0
+    attention_mask[2, 13:] = 0
+    embeds = torch.zeros(3, 16, config.hidden_size)
+    return config, attention_mask, embeds
+
+
+def _build_mask(
+    builder: Any, config: Any, attention_mask: torch.Tensor | None, embeds: torch.Tensor
+) -> Any:
+    """Call a mask builder the way the ModernBERT backbone calls it."""
+    return builder(config=config, inputs_embeds=embeds, attention_mask=attention_mask)
+
+
+def _hidden(mask: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
+    """Return the positions an additive mask hides, broadcast to ``(B, 1, S, S)``."""
+    return (mask != 0).expand(batch_size, 1, seq_len, seq_len)
+
+
+def test_the_tiny_sliding_window_cuts_keys_off_on_both_sides() -> None:
+    """Guard for the tests below: upstream's middle query sees four keys either way."""
+    config, attention_mask, embeds = _mask_example("eager")
+
+    sliding = _build_mask(
+        masking_utils.create_bidirectional_sliding_window_mask, config, attention_mask, embeds
+    )
+
+    assert config.sliding_window == 4
+    assert (sliding[0, 0, 8] == 0).nonzero().flatten().tolist() == list(range(4, 13))
+
+
+@_MASK_BUILDERS
+def test_the_patched_mask_builders_hide_what_upstream_hides(name: str, upstream: Any) -> None:
+    """For eager, each patched builder returns a finite 4-D mask over upstream's positions."""
+    config, attention_mask, embeds = _mask_example("eager")
+    batch_size, seq_len = attention_mask.shape
+
+    mb.patch_mask_builders()
+    ours = _build_mask(getattr(modeling_modernbert, name), config, attention_mask, embeds)
+    theirs = _build_mask(upstream, config, attention_mask, embeds)
+
+    assert ours.shape == (batch_size, 1, seq_len, seq_len)
+    assert ours.dtype == torch.float32
+    assert set(ours.unique().tolist()) == {0.0, mb.MASK_FILL_VALUE}
+    assert torch.equal(_hidden(ours, batch_size, seq_len), _hidden(theirs, batch_size, seq_len))
+
+
+@_MASK_BUILDERS
+def test_the_patched_mask_builders_leave_sdpa_to_upstream(name: str, upstream: Any) -> None:
+    """The sdpa FP32 reference must keep upstream's own masks, as an independent check."""
+    config, attention_mask, embeds = _mask_example("sdpa")
+
+    mb.patch_mask_builders()
+    ours = _build_mask(getattr(modeling_modernbert, name), config, attention_mask, embeds)
+    theirs = _build_mask(upstream, config, attention_mask, embeds)
+
+    assert ours.dtype == theirs.dtype
+    assert torch.equal(ours, theirs)
+
+
+@_MASK_BUILDERS
+def test_the_patched_mask_builders_leave_a_missing_mask_to_upstream(
+    name: str, upstream: Any
+) -> None:
+    """Without a 2-D mask there is nothing to build from, so upstream decides."""
+    config, _, embeds = _mask_example("eager")
+
+    mb.patch_mask_builders()
+    ours = _build_mask(getattr(modeling_modernbert, name), config, None, embeds)
+    theirs = _build_mask(upstream, config, None, embeds)
+
+    assert (ours is None) == (theirs is None)
+    assert theirs is None or torch.equal(ours, theirs)
+
+
+@_MASK_BUILDERS
+def test_the_patched_mask_builders_pass_a_prepared_mask_through(name: str, upstream: Any) -> None:
+    """A 4-D mask is already prepared; like upstream, the patch must hand it back as is."""
+    config, attention_mask, embeds = _mask_example("eager")
+    prepared = torch.zeros(3, 1, 16, 16)
+
+    mb.patch_mask_builders()
+
+    assert _build_mask(getattr(modeling_modernbert, name), config, prepared, embeds) is prepared
+    assert _build_mask(upstream, config, prepared, embeds) is prepared
+
+
+def test_the_mask_builder_patch_is_idempotent() -> None:
+    """Applying it twice must not recurse, nor change what either path builds."""
+    eager_config, attention_mask, embeds = _mask_example("eager")
+    sdpa_config, _, _ = _mask_example("sdpa")
+    names = ("create_bidirectional_mask", "create_bidirectional_sliding_window_mask")
+
+    def build_all() -> list[torch.Tensor]:
+        return [
+            _build_mask(getattr(modeling_modernbert, name), config, attention_mask, embeds)
+            for config in (eager_config, sdpa_config)
+            for name in names
+        ]
+
+    mb.patch_mask_builders()
+    once = build_all()
+    mb.patch_mask_builders()
+    twice = build_all()
+
+    assert all(torch.equal(first, second) for first, second in zip(once, twice, strict=True))
+    assert torch.equal(
+        twice[2],
+        _build_mask(masking_utils.create_bidirectional_mask, sdpa_config, attention_mask, embeds),
+    )
+
+
+# --- tracing and Core ML conversion of the patched model ---------------------
+
+# Graph nodes the Core ML converter has no translation for: the op the
+# framework's mask construction materializes its mask with, and the cast
+# of a traced size to a Python integer.
+_NEW_ONES_NODE = "aten::new_ones"
+_DYNAMIC_SIZE_NODE = "aten::Int"
+
+# Widest tensor the graph may hold: for a batch above one, the ANE compiler
+# rejects a rank-5 tensor and the whole model falls back to the CPU.
+_MAX_GRAPH_RANK = 4
+
+# Fixed shape of the trace and conversion tests: a batch above one, where
+# a rank-5 tensor matters, and the 16 tokens of :func:`_tiny_inputs`.
+_TRACE_BATCH_SIZE = 2
+_TRACE_SEQ_LEN = 16
+
+
+def _trace_tokens() -> dict[str, np.ndarray]:
+    """Return the right-padded int32 batch the trace and conversion tests use."""
+    input_ids, attention_mask = _tiny_inputs(_TRACE_SEQ_LEN, _TRACE_BATCH_SIZE)
+    return {
+        "input_ids": input_ids.numpy().astype(np.int32),
+        "attention_mask": attention_mask.numpy().astype(np.int32),
+    }
+
+
+def _traced_tiny_wrapper(model: torch.nn.Module) -> torch.jit.ScriptModule:
+    """Wrap the tiny model for mean pooling and trace it, eager, with the pipeline's helper."""
+    model.config._attn_implementation = "eager"  # what ``load`` requests by default
+    model.config.return_dict = False
+    wrapper = mb.ModernBertBackend().wrap(_loaded(model, "embedding", pooling="mean"))
+    return conversion.trace_model(wrapper, _trace_tokens())
+
+
+def _node_kinds(traced: torch.jit.ScriptModule) -> set[str]:
+    """Return the kinds of a traced graph's inlined nodes."""
+    return {node.kind() for node in traced.inlined_graph.nodes()}
+
+
+def _traced_ranks(traced: torch.jit.ScriptModule) -> list[int]:
+    """Return the rank of every tensor a traced graph produces."""
+    ranks: list[int] = []
+    for node in traced.inlined_graph.nodes():
+        for output in node.outputs():
+            value_type = output.type()
+            if isinstance(value_type, torch.TensorType) and value_type.dim() is not None:
+                ranks.append(int(value_type.dim()))
+    return ranks
+
+
+def test_the_upstream_eager_trace_holds_what_the_patches_remove(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard for the test below: unpatched, the trace holds the rejected op and a rank-5 tensor."""
+    monkeypatch.setattr(
+        modeling_modernbert.ModernBertAttention, "forward", _UPSTREAM_ATTENTION_FORWARD
+    )
+    monkeypatch.setattr(
+        modeling_modernbert, "create_bidirectional_mask", masking_utils.create_bidirectional_mask
+    )
+    monkeypatch.setattr(
+        modeling_modernbert,
+        "create_bidirectional_sliding_window_mask",
+        masking_utils.create_bidirectional_sliding_window_mask,
+    )
+
+    traced = _traced_tiny_wrapper(_tiny_model())
+
+    assert _NEW_ONES_NODE in _node_kinds(traced)
+    assert max(_traced_ranks(traced)) > _MAX_GRAPH_RANK
+
+
+def test_the_patched_trace_is_static_and_stays_within_rank_four() -> None:
+    """Patched, the batch-2 trace builds no mask the converter rejects and no rank-5 tensor."""
     model = _tiny_model()
-    model.config.local_attention = 2  # +-1 window
-    fill_value = -30000.0
+    mb.ModernBertBackend().apply_patches(_loaded(model))
 
-    mb.patch_mask_fill_value(model, fill_value)
-    _, sliding_window_mask = model._update_attention_mask(torch.ones(1, 4, dtype=torch.long))
+    traced = _traced_tiny_wrapper(model)
 
-    assert sliding_window_mask[0, 0, 0].tolist() == [0.0, 0.0, fill_value, fill_value]
+    kinds = _node_kinds(traced)
+    assert _NEW_ONES_NODE not in kinds
+    assert _DYNAMIC_SIZE_NODE not in kinds
+    assert max(_traced_ranks(traced)) <= _MAX_GRAPH_RANK
+
+
+def test_the_patched_trace_converts_to_core_ml_at_batch_two() -> None:
+    """The batch-2 trace must convert, and run in FP16 without the padding turning into NaN."""
+    backend = mb.ModernBertBackend()
+    model = _tiny_model()
+    backend.apply_patches(_loaded(model))
+    traced = _traced_tiny_wrapper(model)
+    name = backend.output_name("embedding")
+
+    mlmodel = conversion.convert_model(
+        traced, _TRACE_SEQ_LEN, "fp16", "macos13", name, batch_size=_TRACE_BATCH_SIZE
+    )
+
+    description = mlmodel.get_spec().description
+    assert [tensor.name for tensor in description.input] == ["input_ids", "attention_mask"]
+    assert [list(tensor.type.multiArrayType.shape) for tensor in description.input] == [
+        [_TRACE_BATCH_SIZE, _TRACE_SEQ_LEN]
+    ] * 2
+    assert [tensor.name for tensor in description.output] == [name]
+    # The CPU is the one place a prediction is reproducible. The padded row
+    # holds queries whose whole window is padding: a mask fill that is not
+    # finite in FP16 would make them, and the pooled row, NaN.
+    cpu_model = ct.models.MLModel(mlmodel.package_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+    prediction = np.asarray(cpu_model.predict(_trace_tokens())[name], dtype=np.float32)
+    assert prediction.shape == (_TRACE_BATCH_SIZE, model.config.hidden_size)
+    assert np.isfinite(prediction).all()
 
 
 # --- real-model smoke tests (local only) ------------------------------------
@@ -961,7 +1332,38 @@ def _write_model_directory(directory: Path, pooling_flag: str) -> Path:
     # (256 bytes + 4 special tokens), so the vocabulary must be larger than
     # the default _tiny_model() size to keep every id addressable.
     _tiny_model(vocab_size=300).save_pretrained(directory)
+    _write_tokenizer(directory)
 
+    _write_json(
+        directory / mb.POOLING_DIRNAME / "config.json",
+        {"word_embedding_dimension": 32, pooling_flag: True},
+    )
+    return directory
+
+
+def _write_reranker_directory(directory: Path) -> Path:
+    """Save a tiny randomly initialised reranker as a HuggingFace directory.
+
+    Args:
+        directory: Destination directory; created if needed.
+
+    Returns:
+        ``directory``, holding weights, config and tokenizer files of a
+        single-logit sequence classifier that mean-pools, as the rerankers
+        of this family do.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    config = _tiny_config(vocab_size=300, num_labels=1, classifier_pooling="mean")
+    torch.manual_seed(0)
+    modeling_modernbert.ModernBertForSequenceClassification(config).eval().save_pretrained(
+        directory
+    )
+    _write_tokenizer(directory)
+    return directory
+
+
+def _write_tokenizer(directory: Path) -> None:
+    """Save a byte-level fast tokenizer into ``directory``."""
     # Byte-level vocabulary with no merges: every byte is its own token, so
     # Japanese fixtures tokenize without shipping a real vocab file.
     vocab = {"<pad>": 0, "<unk>": 1, "<s>": 2, "</s>": 3}
@@ -983,12 +1385,6 @@ def _write_model_directory(directory: Path, pooling_flag: str) -> Path:
         eos_token="</s>",
         model_max_length=64,
     ).save_pretrained(directory)
-
-    _write_json(
-        directory / mb.POOLING_DIRNAME / "config.json",
-        {"word_embedding_dimension": 32, pooling_flag: True},
-    )
-    return directory
 
 
 @pytest.fixture(scope="module")
@@ -1017,6 +1413,27 @@ def test_synthetic_cls_embedding_model_wrap_matches_the_fp32_reference(
     assert np.abs(smoke["patched"] - smoke["reference"]).max() < PATCH_ABS_TOLERANCE
 
 
+@pytest.fixture(scope="module")
+def reranker_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Synthetic ModernBERT reranker directory."""
+    return _write_reranker_directory(tmp_path_factory.mktemp("modernbert-reranker"))
+
+
+def test_synthetic_reranker_wrap_matches_the_fp32_reference(reranker_dir: Path) -> None:
+    """A reranker must load, wrap and score like its FP32 reference.
+
+    The classification head reads the backbone's output by attribute, so a
+    load that makes the backbone return a plain tuple breaks the forward
+    pass itself; this runs on a tiny synthetic directory, so it is caught
+    without the real reranker at hand.
+    """
+    smoke = _run_smoke(reranker_dir, "reranker", seq_len=_SYNTHETIC_SMOKE_SEQ_LEN)
+
+    assert smoke["handle"]["pooling"] is None
+    assert np.isfinite(smoke["patched"]).all()
+    assert np.abs(smoke["patched"] - smoke["reference"]).max() < PATCH_ABS_TOLERANCE
+
+
 @pytest.mark.parametrize("smoke_fixture", ["embedding_smoke", "reranker_smoke"])
 def test_tokenize_returns_fixed_shape_int32_arrays(
     smoke_fixture: str, request: pytest.FixtureRequest
@@ -1032,13 +1449,23 @@ def test_tokenize_returns_fixed_shape_int32_arrays(
 
 
 @pytest.mark.parametrize(
-    ("smoke_fixture", "kind", "pooling"),
-    [("embedding_smoke", "embedding", "mean"), ("reranker_smoke", "reranker", None)],
+    ("smoke_fixture", "kind", "pooling", "return_dict"),
+    [
+        ("embedding_smoke", "embedding", "mean", False),
+        ("reranker_smoke", "reranker", None, True),
+    ],
 )
 def test_load_returns_a_conforming_handle(
-    smoke_fixture: str, kind: str, pooling: str | None, request: pytest.FixtureRequest
+    smoke_fixture: str,
+    kind: str,
+    pooling: str | None,
+    return_dict: bool,
+    request: pytest.FixtureRequest,
 ) -> None:
-    """load must hand back an eval/FP32/tuple-output model plus its tokenizer and config.
+    """load must hand back an eval/FP32 model plus its tokenizer and config.
+
+    An embedding backbone returns tuples; a reranker keeps structured
+    outputs, which its classification head relies on.
 
     ``pooling`` for the embedding case is not a hard-coded constant: it is
     whatever load() detected from ruri-v3-310m's own
@@ -1053,7 +1480,7 @@ def test_load_returns_a_conforming_handle(
     assert handle["model_dir"].is_dir()
     assert handle["training"] is False
     assert handle["dtype"] == torch.float32
-    assert handle["return_dict"] is False
+    assert handle["return_dict"] is return_dict
     assert handle["config_is_model_config"] is True
     assert handle["tokenizer_encodes"] is True
 

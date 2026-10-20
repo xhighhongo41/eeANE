@@ -613,11 +613,11 @@ def test_the_split_attention_broadcasts_a_mask_without_query_rows(
 def test_the_split_attention_uses_only_the_mask_columns_of_its_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A mask wider than the keys is cut to them, as upstream cuts it."""
+    """A mask wider than the keys is cut to them: its extra columns change nothing."""
     module, query, key, value, mask = _attention_arguments(seq_len=6)
     assert mask is not None
     wider = torch.cat([mask, torch.zeros(2, 1, 6, 3)], dim=-1)
-    expected_output, _ = _UPSTREAM_EAGER_ATTENTION(module, query, key, value, wider)
+    expected_output, _ = _UPSTREAM_EAGER_ATTENTION(module, query, key, value, mask)
 
     g3.patch_attention_query_chunks()
     unsplit, _ = modeling_gemma3.eager_attention_forward(module, query, key, value, wider)

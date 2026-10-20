@@ -274,6 +274,16 @@ uv tool install "eeane[compile] @ git+https://github.com/xhighhongo41/eeANE@main
 release tag) pins a released revision. To switch an existing install,
 run the same command with `--force`.
 
+### Upgrading from eeANE 1.x
+
+eeANE 2.0 compiles models with transformers 5.20 instead of 4.57.
+Models you compiled with eeANE 1.x keep working with the 2.0 server as
+they are: the server does not use transformers. Running `eeane compile`
+for such a model again rebuilds it automatically (no `--force` needed),
+because the dependency versions recorded with the compiled model have
+changed. To keep compiling with transformers 4.57, stay on eeANE 1.7.x,
+for example with `uv tool install "eeane[compile]>=1.7,<2"`.
+
 ## Quick start
 
 ```sh
@@ -430,6 +440,11 @@ maximum sequence length. Models are grouped by the backend their
 `config.json` selects — note that a model's name does not always
 predict it (`paraphrase-multilingual-mpnet-base-v2` is an
 XLM-RoBERTa model, and `multilingual-e5-small` is a BERT one).
+
+All of them were compiled again with eeANE 2.0.0 (transformers 5.20)
+and passed the self-check; the reference models of each family were
+also compared against their reference implementation and against the
+compiled models eeANE 1.7 produces.
 
 Any other model built on one of these five architectures is likely to
 work as well; these are simply the ones that have been run end to end.
@@ -1113,6 +1128,7 @@ means use Infinity.
 
 | Version | Highlights |
 |---|---|
+| 2.0.0 | `eeane compile` moves from transformers 4.57 to 5.20 (with huggingface_hub 2); models compiled by eeANE 1.x keep working with the 2.0 server, and `eeane compile` rebuilds them automatically when run again (stay on eeANE 1.7.x to keep compiling with transformers 4.57); the ModernBERT, BERT and XLM-RoBERTa backends build their attention masks inside the compiled graph, which also puts slightly more of these models on the Neural Engine; all 63 verified models were compiled again and re-verified; the frozen tokenizer of some XLM-RoBERTa models no longer emits a token for trailing whitespace, matching their SentencePiece model |
 | 1.7.0 | A compiled model above the Neural Engine size limit is split automatically into parts that each fit, which `eeane serve` runs one after another (same API, configuration and results; every weight stays FP16); the limit is decided by the macOS version `eeane compile` runs on (2 GiB up to macOS 26, 1 GiB from macOS 27) and can be overridden with `--ne-size-limit`; the seven XLM-RoBERTa large-class models become usable on macOS 27; Qwen3 models no longer need their embedding table stored as 8-bit integers (that workaround is removed); the start-up warning judges a split model part by part; `model_info.json` format 4, which eeANE 1.6.1 and earlier cannot read |
 | 1.6.1 | Qwen3 models run on the Neural Engine again on macOS 27, where the size of model it accepts dropped from 2 GiB to 1 GiB: when a Qwen3 model compiled on macOS 27 or later exceeds the limit, `eeane compile` stores its vocabulary embedding table as 8-bit integers and the compiled model fits again (placement, speed and accuracy match macOS 26); `eeane serve` warns at start-up about a model that will not run on the Neural Engine; XLM-RoBERTa large-class models are documented as not usable on macOS 27 for now |
 | 1.6.0 | Gemma 3 (bidirectional embedding models) becomes eeANE's fifth supported architecture family, compiled through the regular `eeane compile` path and served as-is; generative, multimodal and Gemma 3n variants are rejected with a reason; function-preserving rewrites keep the model within the FP16 range; one more verified model (google/embeddinggemma-300m; 62 -> 63); fetch failures for models that require accepting terms now say what to do |

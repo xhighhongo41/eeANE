@@ -1848,8 +1848,14 @@ def test_e2e_writes_variant_metadata(compiled: dict[str, Any]) -> None:
     assert metadata["args"]["buckets"] == [E2E_SEQ_LEN]
     assert metadata["versions"]["eeane"] == __version__
     # Recorded verbatim from ModernBertBackend.apply_patches()'s return
-    # value: the two mandatory rewrites, no mask fill (never requested).
-    assert metadata["patches"] == {"rotate_half_static": True, "eager_attention_rank4": True}
+    # value: the three mandatory rewrites and the fill value of the masks
+    # they build in the graph.
+    assert metadata["patches"] == {
+        "rotate_half_static": True,
+        "eager_attention_rank4": True,
+        "mask_builders_static": True,
+        "mask_fill_value": -1e4,
+    }
     assert {"load", "trace", "convert", "compile", "total"} <= set(metadata["timings_sec"])
     assert Path(metadata["artifacts"]["mlmodelc"]).is_dir()
     assert "mlpackage" not in metadata["artifacts"]

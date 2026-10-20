@@ -25,8 +25,13 @@ Three properties set this family apart from the other backends:
   the model is asked to score, which is why this backend compiles
   embedding models only.
 * Attention is a plain rank-4 implementation with no rotary embeddings,
-  so the conversion needs no graph rewrites at all and
-  :meth:`BertBackend.apply_patches` is a no-op.
+  so the conversion needs no rewrite of the model's code. What it does
+  need is the attention mask built outside the framework's own mask
+  helpers: those record an op the Core ML converter has no translation
+  for and write a value FP16 cannot hold. :class:`ZeroTokenTypeModel`
+  therefore hands the model its padding mask already built, in 4-D, with
+  a finite fill value, and :meth:`BertBackend.apply_patches` only records
+  that.
 
 The pooling of an embedding model is not part of the HF configuration; it
 is declared by the sentence-transformers pooling module in the model
@@ -78,6 +83,7 @@ from eeane.compiler.backends.common import (
     read_pooling_mode,
     tokenize_batch,
 )
+from eeane.compiler.backends.masks import MASK_FILL_VALUE, padding_mask
 
 # The only model kind this backend compiles.
 KIND_EMBEDDING = "embedding"
@@ -124,11 +130,11 @@ BATCH_PADDING_TEXT = ""
 
 
 class ZeroTokenTypeModel(torch.nn.Module):
-    """Adapter that supplies the two implicit embedding inputs explicitly.
+    """Adapter that supplies the implicit inputs of the model explicitly.
 
     The compiled graph is built from ``input_ids`` and ``attention_mask``
-    alone, so everything the embedding layer would otherwise derive by
-    itself has to be decided while tracing:
+    alone, so everything the model would otherwise derive by itself has to
+    be decided while tracing:
 
     * ``token_type_ids`` are pinned to zeros, reproducing what HuggingFace
       does when the argument is omitted (its ``token_type_ids`` buffer is
@@ -141,6 +147,15 @@ class ZeroTokenTypeModel(torch.nn.Module):
       translate; passing the positions in removes that node. Each bucket
       is traced at its own fixed length, so the constant is exactly the
       one that bucket needs.
+    * The attention mask is handed over already built, as the additive 4-D
+      mask of :func:`~eeane.compiler.backends.masks.padding_mask`, with the
+      finite fill value :data:`~eeane.compiler.backends.masks.MASK_FILL_VALUE`.
+      The framework passes a 4-D mask through unchanged, so no mask is
+      built in the graph: neither the ``new_ones`` op its own construction
+      records nor the float32 minimum it fills with (which FP16 cannot
+      hold) reaches the converter. The positions that are hidden are the
+      framework's own -- the padded keys -- so the model computes the same
+      function and only the fill value differs.
 
     Placed between the backbone and the pooling wrappers of
     :mod:`eeane.compiler.backends.common`, so those stay
@@ -160,11 +175,13 @@ class ZeroTokenTypeModel(torch.nn.Module):
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
-        """Run the model with segment ids and positions fixed.
+        """Run the model with segment ids, positions and the 4-D mask fixed.
 
         Args:
             input_ids: Token ids, shape (B, S).
-            attention_mask: Attention mask, shape (B, S).
+            attention_mask: Attention mask, shape (B, S); non-zero marks a
+                real token. The model itself receives it as the additive
+                4-D mask built from it.
 
         Returns:
             The model's own output tuple, unchanged.
@@ -179,7 +196,7 @@ class ZeroTokenTypeModel(torch.nn.Module):
         ).unsqueeze(0)
         return self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            attention_mask=padding_mask(attention_mask, MASK_FILL_VALUE),
             token_type_ids=token_type_ids,
             position_ids=position_ids,
         )
@@ -256,30 +273,41 @@ class BertBackend:
     def apply_patches(
         self, loaded: LoadedModel, mask_fill_value: float | None = None
     ) -> dict[str, Any]:
-        """Do nothing: this architecture converts without any rewrite.
+        """Record how the traced graph builds its attention mask; rebind nothing.
 
         Its attention is a plain rank-4 implementation without rotary
-        embeddings, so neither the shape rewrites nor the mask remedy of
-        other families apply here. A requested mask fill value is refused
-        rather than ignored, so that a caller cannot believe a remedy was
-        applied when it was not.
+        embeddings, so neither the shape rewrites of other families nor a
+        patch of the framework's mask helpers apply here: nothing in
+        transformers is rebound and the model is left as loaded. The mask
+        remedy lives in the wrapper instead -- :class:`ZeroTokenTypeModel`
+        builds the 4-D padding mask in the traced graph with
+        :data:`~eeane.compiler.backends.masks.MASK_FILL_VALUE` -- and the
+        record returned here states that, for the metadata of the compiled
+        variant.
 
         Args:
             loaded: Handle returned by :meth:`load`.
-            mask_fill_value: Not supported by this backend.
+            mask_fill_value: Optional finite attention-mask fill value.
+                The wrapper fixes the fill value of its mask, so the
+                argument is only accepted when it names that very value.
 
         Returns:
-            Always an empty dict: no patch is ever applied.
+            A dict with ``mask_4d_static`` set to ``True`` and
+            ``mask_fill_value`` set to the fill value of the traced
+            graph's mask; recorded verbatim in the compiled variant's
+            metadata.
 
         Raises:
-            ValueError: If ``mask_fill_value`` is given.
+            ValueError: If a mask fill value other than
+                :data:`~eeane.compiler.backends.masks.MASK_FILL_VALUE` is
+                requested.
         """
-        if mask_fill_value is not None:
+        if mask_fill_value is not None and mask_fill_value != MASK_FILL_VALUE:
             raise ValueError(
-                f"{self.name} does not implement a mask fill patch "
-                f"(requested fill value: {mask_fill_value})"
+                f"{self.name} builds its attention masks inside the traced graph with a "
+                f"mask fill value of {MASK_FILL_VALUE}; {mask_fill_value} cannot be applied"
             )
-        return {}
+        return {"mask_4d_static": True, "mask_fill_value": MASK_FILL_VALUE}
 
     def wrap(self, loaded: LoadedModel) -> torch.nn.Module:
         """Wrap the loaded model into the traceable module for its kind.
@@ -291,7 +319,8 @@ class BertBackend:
 
         Returns:
             The pooling wrapper matching ``loaded.pooling``, in eval mode,
-            over the zero-segment adapter.
+            over the adapter that fixes the segment ids, the positions and
+            the 4-D mask. The wrapper pools with the 2-D mask it takes.
 
         Raises:
             ValueError: If ``loaded.kind`` is not supported by this
