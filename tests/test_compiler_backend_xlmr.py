@@ -9,6 +9,11 @@ Three layers:
 * ``eeane.compiler.backends.common``: the CLS pooling added for this
   family (wrapper and FP32 baseline), checked against hand-computed
   values.
+* The architecture assumptions this backend encodes, checked against a
+  tiny randomly initialised model: that handing the model its padding mask
+  already built in 4-D computes what the framework's own mask path
+  computes, and that the traced graphs of an embedding model and of a
+  reranker really convert to Core ML and agree with the FP32 wrapper.
 * Conformance to the backend interface, driven by the protocol in
   ``eeane.compiler.backends.base``.
 
@@ -23,11 +28,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import coremltools as ct
 import numpy as np
 import pytest
 import torch
 
-from eeane.compiler.backends import common
+from eeane.compiler import conversion
+from eeane.compiler.backends import common, masks
 from eeane.compiler.backends import xlm_roberta as xlmr
 
 # Ids the stand-in tokenizer below uses for the special/padding tokens.
@@ -99,17 +106,19 @@ class _FakeEncoder(torch.nn.Module):
 
 
 class _FixedHiddenModel(torch.nn.Module):
-    """Backbone stand-in returning one fixed hidden state, ignoring its inputs."""
+    """Backbone stand-in returning one fixed hidden state and recording its mask."""
 
     def __init__(self, hidden: torch.Tensor) -> None:
         """Store the hidden state every forward call returns."""
         super().__init__()
         self.hidden = hidden
+        self.seen_attention_mask: torch.Tensor | None = None
 
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
-        """Return the stored hidden state as a tuple, like return_dict=False."""
+        """Record the mask and return the stored hidden state as a tuple."""
+        self.seen_attention_mask = attention_mask
         return (self.hidden,)
 
 
@@ -403,11 +412,21 @@ def test_reference_outputs_rejects_empty_inputs(tmp_path: Path) -> None:
         xlmr.XlmRobertaBackend().reference_outputs(tmp_path, "embedding", [], 8)
 
 
-# --- patches (this architecture needs none) ----------------------------------
+# --- patches (nothing is rebound; the record states how the mask is built) --
 
 
-def test_apply_patches_is_a_no_op() -> None:
-    """A model that needs no rewrite must come back untouched and unrewritten."""
+def test_apply_patches_records_how_the_mask_is_built() -> None:
+    """The record names the mask the graph is traced with, as a JSON-serializable dict."""
+    backend = xlmr.XlmRobertaBackend()
+
+    applied = backend.apply_patches(_loaded(_FakeEncoder()))
+
+    assert applied == {"mask_4d_static": True, "mask_fill_value": masks.MASK_FILL_VALUE}
+    assert json.loads(json.dumps(applied)) == applied
+
+
+def test_apply_patches_leaves_the_model_untouched() -> None:
+    """Nothing is rebound or rewritten: the model computes the same before and after."""
     backend = xlmr.XlmRobertaBackend()
     model = _FakeEncoder()
     input_ids = torch.tensor([[1, 7, 9, 0]])
@@ -415,7 +434,7 @@ def test_apply_patches_is_a_no_op() -> None:
     with torch.no_grad():
         before = model(input_ids=input_ids, attention_mask=attention_mask)[0]
 
-    assert backend.apply_patches(_loaded(model)) == {}
+    backend.apply_patches(_loaded(model))
 
     with torch.no_grad():
         after = model(input_ids=input_ids, attention_mask=attention_mask)[0]
@@ -423,11 +442,20 @@ def test_apply_patches_is_a_no_op() -> None:
 
 
 def test_apply_patches_rejects_a_mask_fill_value() -> None:
-    """An unimplemented remedy must be refused loudly, not accepted and ignored."""
+    """A fill value other than the one the graph uses must be refused, not claimed."""
     backend = xlmr.XlmRobertaBackend()
 
     with pytest.raises(ValueError, match="mask fill"):
         backend.apply_patches(_loaded(_FakeEncoder()), mask_fill_value=-30000.0)
+
+
+def test_apply_patches_accepts_the_fill_value_the_graph_uses() -> None:
+    """Asking for exactly the value the graph already uses is a no-op, not an error."""
+    backend = xlmr.XlmRobertaBackend()
+
+    applied = backend.apply_patches(_loaded(_FakeEncoder()), mask_fill_value=masks.MASK_FILL_VALUE)
+
+    assert applied == backend.apply_patches(_loaded(_FakeEncoder()))
 
 
 # --- wrappers ----------------------------------------------------------------
@@ -446,6 +474,56 @@ def test_wrap_selects_the_wrapper_of_the_detected_pooling() -> None:
     assert isinstance(cls_wrapper, common.ClsEmbeddingWrapper)
     assert isinstance(reranker_wrapper, common.RerankerWrapper)
     assert not any(wrapper.training for wrapper in (mean_wrapper, cls_wrapper, reranker_wrapper))
+
+
+@pytest.mark.parametrize(
+    ("kind", "pooling"), [("embedding", "mean"), ("embedding", "cls"), ("reranker", None)]
+)
+def test_wrap_puts_the_mask_adapter_around_the_model(kind: str, pooling: str | None) -> None:
+    """Every wrapper must reach the model through the adapter that builds the 4-D mask."""
+    backend = xlmr.XlmRobertaBackend()
+    model = torch.nn.Identity()
+
+    wrapper = backend.wrap(_loaded(model, kind, pooling=pooling))
+
+    assert isinstance(wrapper.model, masks.AdditiveMaskModel)
+    assert wrapper.model.model is model
+    assert wrapper.model.fill_value == masks.MASK_FILL_VALUE
+    assert wrapper.model.training is False
+
+
+@pytest.mark.parametrize(
+    ("kind", "pooling"), [("embedding", "mean"), ("embedding", "cls"), ("reranker", None)]
+)
+def test_wrapped_model_receives_the_4d_padding_mask(kind: str, pooling: str | None) -> None:
+    """The model must get the built additive mask in place of the 2-D one, and nothing else."""
+    hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+    model = _FixedHiddenModel(hidden)
+    wrapper = xlmr.XlmRobertaBackend().wrap(_loaded(model, kind, pooling=pooling))
+    attention_mask = torch.tensor([[1, 1, 0]])
+
+    with torch.no_grad():
+        # _FixedHiddenModel takes the two keyword inputs only, so a position
+        # or segment argument passed on top would raise here.
+        wrapper(torch.tensor([[7, 8, 1]]), attention_mask)
+
+    seen = model.seen_attention_mask
+    assert seen is not None
+    assert seen.shape == (1, 1, 1, 3)
+    assert torch.equal(seen, masks.padding_mask(attention_mask))
+
+
+def test_wrapped_embedding_still_pools_with_the_2d_mask() -> None:
+    """The adapter must not change pooling: padding is still ignored by the mean."""
+    hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+    wrapper = xlmr.XlmRobertaBackend().wrap(
+        _loaded(_FixedHiddenModel(hidden), "embedding", pooling="mean")
+    )
+
+    with torch.no_grad():
+        pooled = wrapper(torch.tensor([[7, 8, 1]]), torch.tensor([[1, 1, 0]]))
+
+    assert torch.allclose(pooled, torch.tensor([[2.0, 3.0]]))
 
 
 @pytest.mark.parametrize("pooling", [None, "max", "lasttoken", ""])
@@ -618,6 +696,10 @@ def test_tokenize_rejects_a_non_positive_sequence_length(seq_len: int) -> None:
 # limit into the ground within a unit test.
 _TINY_POSITIONS = 10
 
+# Padding index of the tiny models below. This family derives its positions
+# from the ids, so a padded position has to carry this id to be one.
+_TINY_PAD_ID = 1
+
 
 def _tiny_config(**overrides: Any) -> Any:
     """Build a minimal XLM-RoBERTa configuration for a unit-test-sized model."""
@@ -631,7 +713,7 @@ def _tiny_config(**overrides: Any) -> Any:
         intermediate_size=32,
         max_position_embeddings=_TINY_POSITIONS,
         type_vocab_size=1,
-        pad_token_id=1,
+        pad_token_id=_TINY_PAD_ID,
         **overrides,
     )
 
@@ -730,3 +812,221 @@ def test_eager_and_sdpa_agree_without_any_patch() -> None:
 
     assert torch.isfinite(eager).all()
     assert (eager - sdpa).abs().max().item() < 1e-6
+
+
+# --- the 4-D mask path against the framework's own ---------------------------
+
+# Tolerance between the wrapped model (finite-fill 4-D mask, eager attention)
+# and the framework's own path (2-D mask, sdpa attention); what is left is
+# the difference between the finite fill and the float32 minimum, plus the
+# kernel difference between the two attention implementations.
+_FRAMEWORK_PATH_TOLERANCE = 1e-5
+
+
+def _padded_inputs(seq_len: int, batch_size: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (input_ids, attention_mask) whose masked positions hold the padding id."""
+    input_ids, attention_mask = _tiny_inputs(seq_len, batch_size)
+    input_ids[attention_mask == 0] = _TINY_PAD_ID
+    return input_ids, attention_mask
+
+
+def _redraw(layer: torch.nn.Linear, generator: torch.Generator, scale: float) -> None:
+    """Draw the weights of ``layer`` again from a normal distribution of the given scale."""
+    with torch.no_grad():
+        layer.weight.copy_(torch.randn(layer.weight.shape, generator=generator) * scale)
+
+
+def _sensitive_model(for_classification: bool = False) -> torch.nn.Module:
+    """Build a tiny model that reacts visibly to a key it is wrongly allowed to attend to.
+
+    The default initialisation leaves the attention output negligible next
+    to the residual stream and, for a classification model, the logits near
+    1e-3. There, neither a padded key left visible nor an FP16 rounding
+    error would show, so the attention projections (and the classification
+    head) are drawn again at a larger scale.
+    """
+    model = _tiny_model(for_classification=for_classification)
+    generator = torch.Generator().manual_seed(2)
+    backbone = model.roberta if for_classification else model
+    for layer in backbone.encoder.layer:
+        attention = layer.attention
+        for projection in (
+            attention.self.query,
+            attention.self.key,
+            attention.self.value,
+            attention.output.dense,
+        ):
+            _redraw(projection, generator, scale=0.5)
+    if for_classification:
+        _redraw(model.classifier.dense, generator, scale=0.5)
+        _redraw(model.classifier.out_proj, generator, scale=0.5)
+    return model
+
+
+@pytest.mark.parametrize("pooling", ["mean", "cls"])
+def test_the_wrapped_embedding_equals_the_framework_path(pooling: str) -> None:
+    """The pooled output of the wrapper equals the pooled framework output for a padded batch."""
+    model = _sensitive_model()
+    input_ids, attention_mask = _padded_inputs(6, batch_size=3)
+    attention_mask[0, 5:] = 0  # a second, differently padded row
+    input_ids[0, 5:] = _TINY_PAD_ID
+
+    model.config._attn_implementation = "sdpa"
+    with torch.no_grad():
+        hidden = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+        unmasked = model(input_ids=input_ids, attention_mask=torch.ones_like(attention_mask))[0]
+    expected = common.mean_pool(hidden, attention_mask) if pooling == "mean" else hidden[:, 0]
+    model.config._attn_implementation = "eager"
+    wrapper = xlmr.XlmRobertaBackend().wrap(_loaded(model, "embedding", pooling=pooling))
+    with torch.no_grad():
+        wrapped = wrapper(input_ids, attention_mask)
+
+    # Guard: the padding must matter here, or the comparison proves nothing.
+    assert (hidden[attention_mask.bool()] - unmasked[attention_mask.bool()]).abs().max() > 1e-3
+    assert wrapped.shape == expected.shape
+    assert torch.isfinite(wrapped).all()
+    assert (wrapped - expected).abs().max().item() <= _FRAMEWORK_PATH_TOLERANCE
+
+
+def test_the_wrapped_reranker_equals_the_framework_path() -> None:
+    """The logits of the wrapper equal the framework's logits for a padded batch."""
+    model = _sensitive_model(for_classification=True)
+    input_ids, attention_mask = _padded_inputs(6, batch_size=3)
+    attention_mask[0, 5:] = 0
+    input_ids[0, 5:] = _TINY_PAD_ID
+
+    model.config._attn_implementation = "sdpa"
+    with torch.no_grad():
+        expected = model(input_ids=input_ids, attention_mask=attention_mask)[0]
+        unmasked = model(input_ids=input_ids, attention_mask=torch.ones_like(attention_mask))[0]
+    model.config._attn_implementation = "eager"
+    wrapper = xlmr.XlmRobertaBackend().wrap(_loaded(model, "reranker"))
+    with torch.no_grad():
+        wrapped = wrapper(input_ids, attention_mask)
+
+    # Guard: the padding must matter here, or the comparison proves nothing.
+    assert (expected - unmasked).abs().max() > 1e-3
+    assert wrapped.shape == expected.shape == (3, 1)
+    assert torch.isfinite(wrapped).all()
+    assert (wrapped - expected).abs().max().item() <= _FRAMEWORK_PATH_TOLERANCE
+
+
+# --- Core ML conversion of the traced wrapper --------------------------------
+
+# Graph nodes the converter cannot translate: the op the framework
+# materializes its own attention mask with, which the 4-D mask the wrapper
+# hands over avoids, and the cast of a traced size to an integer.
+_NEW_ONES_NODE = "aten::new_ones"
+_DYNAMIC_SIZE_NODE = "aten::Int"
+
+# Fixed shape of the conversion tests: the longest sequence the tiny position
+# budget leaves room for, so a wrong position row would be a real difference.
+_CONVERSION_SEQ_LEN = _TINY_POSITIONS - xlmr.POSITION_OFFSET
+_CONVERSION_BATCH_SIZE = 2
+
+# Minimum cosine between the converted FP16 embedding and the FP32 wrapper.
+_CONVERSION_COSINE_THRESHOLD = 0.99
+
+# Largest absolute difference between the converted FP16 logits and the FP32
+# wrapper's; far below what ignoring the padding would change them by.
+_CONVERSION_LOGIT_TOLERANCE = 1e-2
+
+
+def _traced_wrapper(kind: str) -> tuple[torch.nn.Module, Any, dict[str, np.ndarray]]:
+    """Build, patch, wrap and trace a tiny model the way the pipeline does.
+
+    Args:
+        kind: ``"embedding"`` (mean pooling) or ``"reranker"``.
+
+    Returns:
+        The FP32 wrapper, its traced module and the int32 tokens it was
+        traced on.
+    """
+    backend = xlmr.XlmRobertaBackend()
+    model = _sensitive_model(for_classification=kind == "reranker")
+    model.config._attn_implementation = "eager"  # what ``load`` requests by default
+    loaded = _loaded(model, kind, pooling="mean")
+    backend.apply_patches(loaded)
+    wrapper = backend.wrap(loaded)
+    input_ids, attention_mask = _padded_inputs(_CONVERSION_SEQ_LEN, _CONVERSION_BATCH_SIZE)
+    tokens = {
+        "input_ids": input_ids.numpy().astype(np.int32),
+        "attention_mask": attention_mask.numpy().astype(np.int32),
+    }
+    return wrapper, conversion.trace_model(wrapper, tokens), tokens
+
+
+def _fp32_output(wrapper: torch.nn.Module, tokens: dict[str, np.ndarray]) -> np.ndarray:
+    """Run the FP32 wrapper on ``tokens``."""
+    with torch.no_grad():
+        output = wrapper(
+            torch.from_numpy(tokens["input_ids"]).long(),
+            torch.from_numpy(tokens["attention_mask"]).long(),
+        )
+    return output.numpy().astype(np.float32)
+
+
+def _converted_output(
+    traced: Any, tokens: dict[str, np.ndarray], kind: str
+) -> tuple[Any, np.ndarray]:
+    """Convert ``traced`` to FP16 Core ML and predict ``tokens`` on the CPU.
+
+    Returns:
+        The converted model and its output as float32 of shape ``(B, -1)``.
+    """
+    backend = xlmr.XlmRobertaBackend()
+    name = backend.output_name(kind)
+    mlmodel = conversion.convert_model(
+        traced, _CONVERSION_SEQ_LEN, "fp16", "macos13", name, batch_size=_CONVERSION_BATCH_SIZE
+    )
+    # The default compute units may put the program on the GPU or the Neural
+    # Engine; the CPU is the one place the comparison is reproducible.
+    cpu_model = ct.models.MLModel(mlmodel.package_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+    prediction = cpu_model.predict(dict(tokens))
+    output = np.asarray(prediction[name], dtype=np.float32).reshape(_CONVERSION_BATCH_SIZE, -1)
+    return mlmodel, output
+
+
+@pytest.mark.parametrize("kind", ["embedding", "reranker"])
+def test_the_traced_graph_records_no_node_the_converter_rejects(kind: str) -> None:
+    """Neither a mask built in the graph nor a position cast to a size may be recorded."""
+    _, traced, _ = _traced_wrapper(kind)
+
+    graph = str(traced.inlined_graph)
+
+    assert _NEW_ONES_NODE not in graph
+    assert _DYNAMIC_SIZE_NODE not in graph
+
+
+def test_the_traced_embedding_converts_and_agrees_with_the_fp32_wrapper() -> None:
+    """The converted embedding wrapper must compute the same embedding as the FP32 one."""
+    wrapper, traced, tokens = _traced_wrapper("embedding")
+    hidden_size = _tiny_config().hidden_size
+    expected = _fp32_output(wrapper, tokens)
+
+    mlmodel, embeddings = _converted_output(traced, tokens, "embedding")
+
+    description = mlmodel.get_spec().description
+    assert [tensor.name for tensor in description.input] == ["input_ids", "attention_mask"]
+    assert [tensor.name for tensor in description.output] == ["embedding"]
+    assert embeddings.shape == expected.shape == (_CONVERSION_BATCH_SIZE, hidden_size)
+    assert bool(np.isfinite(embeddings).all())
+    cosines = np.sum(embeddings * expected, axis=1) / (
+        np.linalg.norm(embeddings, axis=1) * np.linalg.norm(expected, axis=1)
+    )
+    assert float(cosines.min()) >= _CONVERSION_COSINE_THRESHOLD
+
+
+def test_the_traced_reranker_converts_and_agrees_with_the_fp32_wrapper() -> None:
+    """The converted reranker wrapper must compute the same logits as the FP32 one."""
+    wrapper, traced, tokens = _traced_wrapper("reranker")
+    expected = _fp32_output(wrapper, tokens)
+
+    mlmodel, logits = _converted_output(traced, tokens, "reranker")
+
+    description = mlmodel.get_spec().description
+    assert [tensor.name for tensor in description.input] == ["input_ids", "attention_mask"]
+    assert [tensor.name for tensor in description.output] == ["logits"]
+    assert logits.shape == expected.shape == (_CONVERSION_BATCH_SIZE, 1)
+    assert bool(np.isfinite(logits).all())
+    assert float(np.abs(logits - expected).max()) <= _CONVERSION_LOGIT_TOLERANCE

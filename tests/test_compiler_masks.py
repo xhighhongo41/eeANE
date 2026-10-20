@@ -29,7 +29,7 @@ import pytest
 import torch
 from transformers import masking_utils
 
-from eeane.compiler.backends import bert, decoder_patches, gemma3, masks
+from eeane.compiler.backends import decoder_patches, gemma3, masks
 
 # Graph nodes the Core ML converter has no translation for: the op the
 # framework's mask construction materializes its mask with, and the cast
@@ -441,6 +441,32 @@ class _TwoDimensionalMask(torch.nn.Module):
         return self.model(input_ids=input_ids, attention_mask=attention_mask)
 
 
+class _PinnedPositions(torch.nn.Module):
+    """Hands a BERT model fixed segment ids and positions, and the mask it is given.
+
+    The same inputs the BERT backend's adapter pins, without the mask that
+    adapter builds as well: the tests below decide which mask reaches the
+    model.
+    """
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        """Store the model to call."""
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Any:
+        """Run the model with zero segment ids and ``arange`` positions."""
+        position_ids = torch.arange(
+            input_ids.shape[1], dtype=input_ids.dtype, device=input_ids.device
+        ).unsqueeze(0)
+        return self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=torch.zeros_like(input_ids),
+            position_ids=position_ids,
+        )
+
+
 def _unchanged(model: torch.nn.Module) -> torch.nn.Module:
     """Return ``model`` itself: a backbone that derives no dynamic size of its own."""
     return model
@@ -448,12 +474,12 @@ def _unchanged(model: torch.nn.Module) -> torch.nn.Module:
 
 # Tiny backbones to trace, each with what removes a dynamic-size node of
 # its own. Left to itself, BERT slices its position buffer with the traced
-# sequence length and records one; the adapter of its backend that pins
-# the positions removes it, so what is left to look at is the mask.
-# XLM-RoBERTa derives its positions from the ids and needs nothing.
+# sequence length and records one; pinning the positions, as its backend
+# does, removes it, so what is left to look at is the mask. XLM-RoBERTa
+# derives its positions from the ids and needs nothing.
 _TRACED_ENCODERS = pytest.mark.parametrize(
     ("build_model", "pin_positions"),
-    [(_tiny_bert, bert.ZeroTokenTypeModel), (_tiny_xlmr, _unchanged)],
+    [(_tiny_bert, _PinnedPositions), (_tiny_xlmr, _unchanged)],
     ids=["bert", "xlmr"],
 )
 
