@@ -23,10 +23,10 @@ A unit test enforces that no runtime module imports torch/transformers.
 | Python | >=3.11,<3.13 | Version the project is developed and verified on. |
 | torch | >=2.7,<2.8 | coremltools 9.0 officially supports torch 2.7.x; newer torch versions are outside the tested matrix and have broken conversions before. |
 | coremltools | >=9.0,<10 | Conversion (`ct.convert`, `torch.jit.trace` route) and runtime loading (`CompiledMLModel`) are verified against 9.0. |
-| transformers | >=5.20.1,<5.21 | The series every verified model was re-converted and checked on. eeANE's conversion depends on transformers *internals* that are not a stable API and have changed within 5.x: the ModernBERT patches rebind functions and the attention `forward` of `modeling_modernbert`, the Gemma 3 and Qwen3 patches rebind module-level helpers of their modeling modules, and every encoder backend relies on the framework passing an already built 4-D attention mask through unchanged. |
+| transformers | >=5.20.1,<5.21 | The series every verified model was re-converted and checked on. eeANE's conversion depends on transformers *internals* that are not a stable API and have changed within 5.x: the ModernBERT patches rebind functions and the attention `forward` of `modeling_modernbert`, the Gemma 3, EmbeddingGemma 2 and Qwen3 patches rebind module-level helpers of their modeling modules, and every encoder backend relies on the framework passing an already built 4-D attention mask through unchanged. |
 | huggingface_hub | >=2,<3 | Required range of transformers 5.20 (`>=1.31,<3`), narrowed to the 2.x series the downloads and their error handling are verified with. |
 | tokenizers | >=0.22,<0.24 | The compile side gets 0.23 through transformers 5.20 (`>=0.23.1,<0.24`). The runtime accepts 0.22 as well: a `tokenizer.json` frozen with 0.23 loads with 0.22 and produces the same tokens. |
-| sentence-transformers (development only) | >=5.2,<7 | Used only to cross-check converted models against their reference implementation; 5.2 is the first release that supports transformers 5. |
+| sentence-transformers (development only) | >=5.2,<7 | Used only to cross-check converted models against their reference implementation; 5.2 is the first release that supports transformers 5. The 6.x series requires huggingface-hub below 2, so it cannot be installed in the same environment as the huggingface_hub 2.x eeANE uses, and the development environment stays on 5.x. Models saved by sentence-transformers 6 (for example embeddinggemma-2, which declares 6.1 or later) are cross-checked against the original transformers implementation instead. The range `>=5.2,<7` is unchanged. |
 
 The optional `kernels` package, which lets transformers swap some modeling
 functions for Hub kernels at run time, is not supported in the conversion
@@ -64,6 +64,7 @@ coremltools, numpy, or tokenizers must be accompanied by:
    XLM-RoBERTa: multilingual-e5-base,
    bge-reranker-v2-m3, and bge-m3, the last of which also exercises the
    `--allow-pickle` path; Gemma 3: embeddinggemma-300m, embedding only;
+   EmbeddingGemma 2: embeddinggemma-2, embedding only;
    Qwen3: Qwen3-Embedding-0.6B and Qwen3-Reranker-0.6B, which also
    exercise splitting a model into parts),
 2. all self-checks passing (accuracy sanity, NE placement, warm latency

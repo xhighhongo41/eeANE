@@ -32,7 +32,8 @@ SUPPORTED_ARCHITECTURES = (
     "ModernBERT (e.g. cl-nagoya/ruri-v3-310m), "
     "XLM-RoBERTa / RoBERTa (e.g. intfloat/multilingual-e5-base, BAAI/bge-reranker-v2-m3), "
     "Qwen3 decoder-style models (e.g. Qwen/Qwen3-Embedding-0.6B, Qwen/Qwen3-Reranker-0.6B) and "
-    "Gemma 3 bidirectional embedding models (e.g. google/embeddinggemma-300m)"
+    "Gemma 3 bidirectional embedding models (e.g. google/embeddinggemma-300m), "
+    "as well as EmbeddingGemma 2 text embedding models (e.g. google/embeddinggemma-2)"
 )
 
 # Architecture-name prefix -> "module:attribute" of the backend class. The
@@ -44,6 +45,12 @@ SUPPORTED_ARCHITECTURES = (
 # would also capture the multimodal model of that family and the models of
 # a later generation whose names merely begin the same way, none of which
 # the backend registered here implements.
+#
+# ``EmbeddingGemma2`` is the prefix of the multimodal root class that
+# EmbeddingGemma 2 text embedding models (e.g. google/embeddinggemma-2) are
+# published under. The backend registered for it reads the text model out
+# of that root and compiles text embeddings only; it refuses, with a
+# reason, a directory holding the text model saved on its own.
 BACKEND_REGISTRY: dict[str, str] = {
     "Bert": "eeane.compiler.backends.bert:BertBackend",
     "ModernBert": "eeane.compiler.backends.modernbert:ModernBertBackend",
@@ -51,6 +58,7 @@ BACKEND_REGISTRY: dict[str, str] = {
     "Roberta": "eeane.compiler.backends.xlm_roberta:XlmRobertaBackend",
     "Qwen3": "eeane.compiler.backends.qwen3:Qwen3Backend",
     "Gemma3Text": "eeane.compiler.backends.gemma3:Gemma3Backend",
+    "EmbeddingGemma2": "eeane.compiler.backends.embedding_gemma2:EmbeddingGemma2Backend",
 }
 
 # Architecture-name suffix that identifies a cross-encoder reranker.

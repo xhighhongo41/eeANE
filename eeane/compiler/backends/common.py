@@ -61,13 +61,30 @@ POOLING_MODE_KEYS: dict[str, str] = {
     "pooling_mode_lasttoken": POOLING_LASTTOKEN,
 }
 
+# The declaration has two dialects. Earlier sentence-transformers releases
+# write one boolean flag per mode (the keys above, exactly one set to
+# true); the 6 series writes the mode as a single string under
+# ``pooling_mode``. This key deliberately does not start with
+# ``POOLING_MODE_PREFIX``, so the scan for flags never mistakes it for one.
+# The names are the library's own spelling and are matched exactly: a
+# near-miss such as "MEAN" is a declaration this module cannot claim to
+# understand, and the library's other modes ("max", "weightedmean",
+# "mean_sqrt_len_tokens") have no implementation here.
+POOLING_MODE_KEY = "pooling_mode"
+POOLING_MODE_NAMES: dict[str, str] = {
+    "mean": POOLING_MEAN,
+    "cls": POOLING_CLS,
+    "lasttoken": POOLING_LASTTOKEN,
+}
+
 # Appended to every pooling-detection error: an embedding model whose
 # pooling cannot be read must fail loudly rather than default silently,
 # because the wrong pooling produces a plausible but wrong embedding.
 _POOLING_REQUIREMENT = (
     "An embedding model must declare its pooling in the sentence-transformers "
-    f"'{POOLING_DIRNAME}/{POOLING_CONFIG_FILENAME}' with exactly one of "
-    f"{' / '.join(POOLING_MODE_KEYS)} set to true."
+    f"'{POOLING_DIRNAME}/{POOLING_CONFIG_FILENAME}', either with exactly one of "
+    f"{' / '.join(POOLING_MODE_KEYS)} set to true or with '{POOLING_MODE_KEY}' "
+    f"set to one of {' / '.join(POOLING_MODE_NAMES)}."
 )
 
 # sentence-transformers module declaration: the file listing the modules a
@@ -80,6 +97,26 @@ ST_MODULE_TRANSFORMER = "sentence_transformers.models.Transformer"
 ST_MODULE_POOLING = "sentence_transformers.models.Pooling"
 ST_MODULE_DENSE = "sentence_transformers.models.Dense"
 ST_MODULE_NORMALIZE = "sentence_transformers.models.Normalize"
+
+# The same four modules by role. The 6 series of sentence-transformers
+# publishes each of them under a nested namespace (``...base.modules.
+# transformer.Transformer`` rather than ``...models.Transformer``) while
+# the module itself is unchanged, so the chain is checked by the role a
+# type name denotes, not by one spelling of it: a full-name comparison
+# would refuse every model saved by the newer library for a difference in
+# nothing but the name. Only a class of sentence-transformers' own counts,
+# and the class name must be exactly a role name.
+ST_NAMESPACE_PREFIX = "sentence_transformers."
+ST_ROLE_TRANSFORMER = "Transformer"
+ST_ROLE_POOLING = "Pooling"
+ST_ROLE_DENSE = "Dense"
+ST_ROLE_NORMALIZE = "Normalize"
+ST_ROLES: tuple[str, ...] = (
+    ST_ROLE_TRANSFORMER,
+    ST_ROLE_POOLING,
+    ST_ROLE_DENSE,
+    ST_ROLE_NORMALIZE,
+)
 
 # Files of one Dense module, and the keys its checkpoint stores the linear
 # layer under: sentence-transformers holds that layer as ``self.linear``,
@@ -114,18 +151,19 @@ DENSE_ACTIVATIONS: dict[str, str] = {
 # anyway would produce a graph that silently leaves out a transformation
 # the model's published embeddings depend on.
 _MODULE_CHAIN_REQUIREMENT = (
-    "This backend reproduces a sentence-transformers chain of a "
-    f"'{ST_MODULE_TRANSFORMER}', one '{ST_MODULE_POOLING}', any number of "
-    f"'{ST_MODULE_DENSE}' projections and an optional trailing "
-    f"'{ST_MODULE_NORMALIZE}', in that order."
+    f"This backend reproduces a sentence-transformers chain of a {ST_ROLE_TRANSFORMER}, "
+    f"one {ST_ROLE_POOLING}, any number of {ST_ROLE_DENSE} projections and an optional "
+    f"trailing {ST_ROLE_NORMALIZE}, in that order; a module has one of these roles when "
+    f"its type is a class of that name under any '{ST_NAMESPACE_PREFIX}' namespace."
 )
 
 # Module-type suffixes of the two-module chain a generative reranker
 # declares. They are matched by suffix, not compared in full, because the
 # same two roles are published under more than one namespace (a
 # ``...models.Transformer`` and a ``...base.modules.transformer.Transformer``
-# are the same module); the chain check above keeps its exact match, since
-# the modules it accepts carry weights this package reads by path.
+# are the same module); the embedding chain check above compares roles
+# instead (see ST_ROLES), which also requires sentence-transformers' own
+# package and an exact class name.
 ST_TRANSFORMER_SUFFIX = ".Transformer"
 ST_LOGIT_SCORE_SUFFIX = ".LogitScore"
 
@@ -339,6 +377,13 @@ def override_sanity_set(
 def read_pooling_mode(model_dir: Path) -> str:
     """Read the pooling mode an embedding model directory declares.
 
+    The declaration may use either dialect: one boolean flag per mode
+    (``pooling_mode_<x>: true``, exactly one of :data:`POOLING_MODE_KEYS`
+    set), or the single string ``pooling_mode`` naming one of
+    :data:`POOLING_MODE_NAMES`. A file that states both is accepted only
+    when both state the same mode. Any other key, such as
+    ``include_prompt``, is not read.
+
     Args:
         model_dir: Local HuggingFace-format model directory, expected to
             carry a sentence-transformers pooling module.
@@ -349,7 +394,8 @@ def read_pooling_mode(model_dir: Path) -> str:
 
     Raises:
         ValueError: If the pooling declaration is missing, unreadable,
-            malformed, or does not select exactly one supported mode.
+            malformed, selects no supported mode or more than one, or
+            states two different modes.
     """
     path = model_dir / POOLING_DIRNAME / POOLING_CONFIG_FILENAME
     try:
@@ -364,6 +410,50 @@ def read_pooling_mode(model_dir: Path) -> str:
         raise ValueError(f"'{path}' is not valid JSON: {exc}. {_POOLING_REQUIREMENT}") from exc
     if not isinstance(declaration, dict):
         raise ValueError(f"'{path}' does not contain a JSON object. {_POOLING_REQUIREMENT}")
+    # Each dialect is judged on its own first: a valid statement must never
+    # rescue an invalid one written beside it, since the file would then
+    # claim something this module read only half of.
+    flag_key = _enabled_pooling_flag(path, declaration)
+    if POOLING_MODE_KEY not in declaration:
+        if flag_key is None:
+            raise ValueError(
+                f"'{path}' does not enable exactly one supported pooling mode "
+                f"(enabled: none). {_POOLING_REQUIREMENT}"
+            )
+        return POOLING_MODE_KEYS[flag_key]
+    name = declaration[POOLING_MODE_KEY]
+    # The type test comes first: a list or a dict cannot be looked up.
+    if not isinstance(name, str) or name not in POOLING_MODE_NAMES:
+        supported = ", ".join(POOLING_MODE_NAMES)
+        raise ValueError(
+            f"'{path}' declares {POOLING_MODE_KEY}={name!r}, which is not a pooling mode "
+            f"this backend supports (supported: {supported}). {_POOLING_REQUIREMENT}"
+        )
+    mode = POOLING_MODE_NAMES[name]
+    if flag_key is not None and POOLING_MODE_KEYS[flag_key] != mode:
+        raise ValueError(
+            f"'{path}' declares {POOLING_MODE_KEY}={name!r} but also enables {flag_key}, "
+            f"which selects '{POOLING_MODE_KEYS[flag_key]}'. {_POOLING_REQUIREMENT}"
+        )
+    return mode
+
+
+def _enabled_pooling_flag(path: Path, declaration: dict[str, Any]) -> str | None:
+    """Find the one boolean pooling flag a declaration enables, if it has any.
+
+    Args:
+        path: The declaration file, named in the error.
+        declaration: Its parsed contents.
+
+    Returns:
+        The key of the single enabled flag, or ``None`` when no flag is
+        enabled -- which is not an error here, since the declaration may
+        use the string dialect instead.
+
+    Raises:
+        ValueError: If more than one flag is enabled, or the flag enabled
+            is not one of :data:`POOLING_MODE_KEYS`.
+    """
     # Only a literal ``true`` counts: anything else (a string, a number)
     # is a declaration this backend cannot claim to understand.
     enabled = [
@@ -371,13 +461,12 @@ def read_pooling_mode(model_dir: Path) -> str:
         for key, value in declaration.items()
         if key.startswith(POOLING_MODE_PREFIX) and value is True
     ]
-    if len(enabled) != 1 or enabled[0] not in POOLING_MODE_KEYS:
-        declared = ", ".join(sorted(enabled)) if enabled else "none"
+    if len(enabled) > 1 or (enabled and enabled[0] not in POOLING_MODE_KEYS):
         raise ValueError(
             f"'{path}' does not enable exactly one supported pooling mode "
-            f"(enabled: {declared}). {_POOLING_REQUIREMENT}"
+            f"(enabled: {', '.join(sorted(enabled))}). {_POOLING_REQUIREMENT}"
         )
-    return POOLING_MODE_KEYS[enabled[0]]
+    return enabled[0] if enabled else None
 
 
 @dataclass(frozen=True)
@@ -424,6 +513,13 @@ def read_dense_modules(model_dir: Path) -> tuple[DenseStage, ...]:
     can be compiled at all, and finding that out first avoids loading
     gigabytes of parameters for a model that would then be refused.
 
+    A module is a Dense one by its role, so ``...models.Dense`` and the
+    nested ``...base.modules.dense.Dense`` of the 6 series of
+    sentence-transformers are both read. The module's own ``config.json``
+    and weights are read in the layout they have always had, whichever
+    namespace declared it; a module whose files are not in that layout is
+    refused with the reason, never guessed at.
+
     A trailing ``Normalize`` module is read past on purpose. The compiled
     graph always returns the unnormalized embedding and the server applies
     L2 normalization according to its own configuration, so baking it into
@@ -455,7 +551,7 @@ def read_dense_modules(model_dir: Path) -> tuple[DenseStage, ...]:
     stages = tuple(
         _read_dense_stage(model_dir, modules_path, declared_path)
         for module_type, declared_path in entries
-        if module_type == ST_MODULE_DENSE
+        if _module_role(module_type) == ST_ROLE_DENSE
     )
     _check_dense_widths(stages)
     return stages
@@ -572,8 +668,31 @@ def _read_module_entries(
     return entries
 
 
+def _module_role(module_type: str) -> str | None:
+    """Name the role a declared module type plays in an embedding chain.
+
+    Args:
+        module_type: A ``type`` value of ``modules.json``.
+
+    Returns:
+        One of :data:`ST_ROLES` when ``module_type`` is a class of
+        sentence-transformers' own whose name (its last dotted element) is
+        exactly that role, whatever namespace it is spelled under; ``None``
+        for everything else, including a same-named class of another
+        package and a name that merely contains a role name.
+    """
+    if not module_type.startswith(ST_NAMESPACE_PREFIX):
+        return None
+    class_name = module_type.rsplit(".", 1)[-1]
+    return class_name if class_name in ST_ROLES else None
+
+
 def _check_module_chain(modules_path: Path, module_types: Sequence[str]) -> None:
     """Validate the declared module order against the chain this backend reproduces.
+
+    The chain is compared by role (see :func:`_module_role`), so any mix of
+    the namespaces sentence-transformers has used for the same module is
+    accepted; the order and count of the roles are what is checked.
 
     Args:
         modules_path: The declaration file, named in the error.
@@ -584,15 +703,15 @@ def _check_module_chain(modules_path: Path, module_types: Sequence[str]) -> None
             Pooling, any number of Dense modules and an optional trailing
             Normalize.
     """
-    leading = list(module_types[:2])
-    if leading != [ST_MODULE_TRANSFORMER, ST_MODULE_POOLING]:
+    roles = [_module_role(module_type) for module_type in module_types]
+    if roles[:2] != [ST_ROLE_TRANSFORMER, ST_ROLE_POOLING]:
         raise _module_chain_error(modules_path, module_types)
-    rest = list(module_types[2:])
+    rest = roles[2:]
     dense_count = 0
-    while dense_count < len(rest) and rest[dense_count] == ST_MODULE_DENSE:
+    while dense_count < len(rest) and rest[dense_count] == ST_ROLE_DENSE:
         dense_count += 1
     trailing = rest[dense_count:]
-    if trailing and trailing != [ST_MODULE_NORMALIZE]:
+    if trailing and trailing != [ST_ROLE_NORMALIZE]:
         raise _module_chain_error(modules_path, module_types)
 
 

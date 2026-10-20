@@ -1,6 +1,6 @@
 [project]
 name = "eeane"
-version = "2.0.0"
+version = "2.1.0"
 description = "Run text embedding and reranking models on the Apple Neural Engine of Apple Silicon Macs"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -19,6 +19,7 @@ keywords = [
     "xlm-roberta",
     "qwen3",
     "gemma3",
+    "embeddinggemma",
     "inference-server",
     "openai-compatible",
 ]
