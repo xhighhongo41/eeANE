@@ -106,19 +106,24 @@ class _FakeEncoder(torch.nn.Module):
 
 
 class _FixedHiddenModel(torch.nn.Module):
-    """Backbone stand-in returning one fixed hidden state and recording its mask."""
+    """Backbone stand-in returning one fixed hidden state and recording its inputs."""
 
     def __init__(self, hidden: torch.Tensor) -> None:
         """Store the hidden state every forward call returns."""
         super().__init__()
         self.hidden = hidden
         self.seen_attention_mask: torch.Tensor | None = None
+        self.seen_token_type_ids: torch.Tensor | None = None
 
     def forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        """Record the mask and return the stored hidden state as a tuple."""
+        """Record the mask and segment ids; return the stored hidden state as a tuple."""
         self.seen_attention_mask = attention_mask
+        self.seen_token_type_ids = token_type_ids
         return (self.hidden,)
 
 
@@ -486,6 +491,7 @@ def test_wrap_puts_the_mask_adapter_around_the_model(kind: str, pooling: str | N
 
     wrapper = backend.wrap(_loaded(model, kind, pooling=pooling))
 
+    assert isinstance(wrapper.model, xlmr.ZeroTokenTypeModel)
     assert isinstance(wrapper.model, masks.AdditiveMaskModel)
     assert wrapper.model.model is model
     assert wrapper.model.fill_value == masks.MASK_FILL_VALUE
@@ -496,21 +502,26 @@ def test_wrap_puts_the_mask_adapter_around_the_model(kind: str, pooling: str | N
     ("kind", "pooling"), [("embedding", "mean"), ("embedding", "cls"), ("reranker", None)]
 )
 def test_wrapped_model_receives_the_4d_padding_mask(kind: str, pooling: str | None) -> None:
-    """The model must get the built additive mask in place of the 2-D one, and nothing else."""
+    """The model must get the built mask and zero segment ids, and no positions."""
     hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
     model = _FixedHiddenModel(hidden)
     wrapper = xlmr.XlmRobertaBackend().wrap(_loaded(model, kind, pooling=pooling))
+    input_ids = torch.tensor([[7, 8, 1]])
     attention_mask = torch.tensor([[1, 1, 0]])
 
     with torch.no_grad():
-        # _FixedHiddenModel takes the two keyword inputs only, so a position
-        # or segment argument passed on top would raise here.
-        wrapper(torch.tensor([[7, 8, 1]]), attention_mask)
+        # _FixedHiddenModel takes no position argument, so positions passed
+        # on top would raise here: the model derives them from the ids.
+        wrapper(input_ids, attention_mask)
 
     seen = model.seen_attention_mask
     assert seen is not None
     assert seen.shape == (1, 1, 1, 3)
     assert torch.equal(seen, masks.padding_mask(attention_mask))
+    segments = model.seen_token_type_ids
+    assert segments is not None
+    assert segments.dtype == input_ids.dtype
+    assert torch.equal(segments, torch.zeros_like(input_ids))
 
 
 def test_wrapped_embedding_still_pools_with_the_2d_mask() -> None:
@@ -996,6 +1007,22 @@ def test_the_traced_graph_records_no_node_the_converter_rejects(kind: str) -> No
 
     assert _NEW_ONES_NODE not in graph
     assert _DYNAMIC_SIZE_NODE not in graph
+
+
+@pytest.mark.parametrize("kind", ["embedding", "reranker"])
+def test_the_traced_graph_does_not_look_the_segment_ids_up_by_position(kind: str) -> None:
+    """The segment ids must come in as zeros, not be gathered from the model's buffer.
+
+    Left to itself the model gathers its all-zero segment buffer by
+    position; that gather, and the embedding lookup of its result, cannot
+    be folded away by the converter and stay on the CPU. Handed zeros of a
+    fixed shape, both fold into a constant.
+    """
+    _, traced, _ = _traced_wrapper(kind)
+
+    kinds = {node.kind() for node in traced.inlined_graph.nodes()}
+
+    assert "aten::gather" not in kinds
 
 
 def test_the_traced_embedding_converts_and_agrees_with_the_fp32_wrapper() -> None:

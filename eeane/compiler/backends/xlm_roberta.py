@@ -22,10 +22,10 @@ Two properties set this family apart from the other backends:
   need is the attention mask built outside the framework's own mask
   helpers: those record an op the Core ML converter has no translation
   for and write a value FP16 cannot hold. The backend therefore wraps the
-  model in :class:`~eeane.compiler.backends.masks.AdditiveMaskModel`,
-  which hands it the padding mask already built, in 4-D, with a finite
-  fill value, and :meth:`XlmRobertaBackend.apply_patches` only records
-  that.
+  model in :class:`ZeroTokenTypeModel`, which hands it the padding mask
+  already built, in 4-D, with a finite fill value (and its all-zero
+  segment ids, which would otherwise be gathered in the graph), and
+  :meth:`XlmRobertaBackend.apply_patches` only records that.
 
 The pooling of an embedding model is not part of the HF configuration; it
 is declared by the sentence-transformers pooling module in the model
@@ -76,7 +76,7 @@ from eeane.compiler.backends.common import (
     tokenize_batch,
     tokenize_pairs,
 )
-from eeane.compiler.backends.masks import MASK_FILL_VALUE, AdditiveMaskModel
+from eeane.compiler.backends.masks import MASK_FILL_VALUE, AdditiveMaskModel, padding_mask
 
 # Public surface of this module, including the pooling-declaration reader
 # and its constants, re-exported from
@@ -95,6 +95,7 @@ __all__ = [
     "SANITY_TEXT_SETS",
     "SUPPORTED_KINDS",
     "XlmRobertaBackend",
+    "ZeroTokenTypeModel",
     "load_dense",
     "read_pooling_mode",
 ]
@@ -153,6 +154,41 @@ SANITY_SPECS: dict[str, SanitySpec] = {
 # would risk NaN).
 BATCH_PADDING_TEXT = ""
 BATCH_PADDING_PAIR: tuple[str, str] = ("", "")
+
+
+class ZeroTokenTypeModel(AdditiveMaskModel):
+    """Mask adapter that also hands the model its segment ids, all zeros.
+
+    On top of the 4-D padding mask of
+    :class:`~eeane.compiler.backends.masks.AdditiveMaskModel`, the segment
+    ids are passed in explicitly as zeros. That is the value the model
+    would use anyway -- these models have a single segment type, and the
+    buffer it falls back on holds zeros -- but left to itself the model
+    gathers that buffer by position. The gather, and the embedding lookup
+    of its result, stay in the converted graph and run on the CPU; zeros
+    of the fixed traced shape fold into a constant instead.
+
+    The positions are not passed: the model derives them from the ids,
+    with its padding offset, as it always has.
+    """
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Any:
+        """Run the model with the 4-D padding mask and zero segment ids.
+
+        Args:
+            input_ids: Token ids, shape (B, S).
+            attention_mask: Attention mask, shape (B, S); non-zero marks a
+                real token.
+
+        Returns:
+            The model's own output tuple, unchanged.
+        """
+        return self.model(
+            input_ids=input_ids,
+            attention_mask=padding_mask(attention_mask, self.fill_value),
+            # zeros_like keeps the dtype and shape of the ids the graph takes.
+            token_type_ids=torch.zeros_like(input_ids),
+        )
 
 
 class XlmRobertaBackend:
@@ -237,8 +273,8 @@ class XlmRobertaBackend:
         patch of the framework's mask helpers apply here: nothing in
         transformers is rebound and the model is left as loaded. The mask
         remedy lives in the wrapper instead -- :meth:`wrap` puts the model
-        behind :class:`~eeane.compiler.backends.masks.AdditiveMaskModel`,
-        which builds the 4-D padding mask in the traced graph with
+        behind :class:`ZeroTokenTypeModel`, which builds the 4-D padding
+        mask in the traced graph with
         :data:`~eeane.compiler.backends.masks.MASK_FILL_VALUE` -- and the
         record returned here states that, for the metadata of the compiled
         variant.
@@ -279,9 +315,9 @@ class XlmRobertaBackend:
             The pooling wrapper matching ``loaded.pooling`` for an
             embedding model, or the raw-logits wrapper for a reranker, in
             eval mode. Either one reaches the model through
-            :class:`~eeane.compiler.backends.masks.AdditiveMaskModel`,
-            which hands it the 4-D padding mask built from the 2-D mask
-            the wrapper takes; the pooling still uses the 2-D mask. The
+            :class:`ZeroTokenTypeModel`, which hands it the 4-D padding
+            mask built from the 2-D mask the wrapper takes, and zero
+            segment ids; the pooling still uses the 2-D mask. The
             positions are not passed: the model derives them from the ids,
             with its padding offset.
 
@@ -292,14 +328,14 @@ class XlmRobertaBackend:
         """
         self._check_kind(loaded.kind)
         if loaded.kind == KIND_RERANKER:
-            return RerankerWrapper(AdditiveMaskModel(loaded.model)).eval()
+            return RerankerWrapper(ZeroTokenTypeModel(loaded.model)).eval()
         wrapper_class = EMBEDDING_WRAPPERS.get(loaded.pooling or "")
         if wrapper_class is None:
             supported = ", ".join(EMBEDDING_WRAPPERS)
             raise ValueError(
                 f"unsupported pooling '{loaded.pooling}' for {self.name} (supported: {supported})"
             )
-        return wrapper_class(AdditiveMaskModel(loaded.model), dense=loaded.dense).eval()
+        return wrapper_class(ZeroTokenTypeModel(loaded.model), dense=loaded.dense).eval()
 
     def output_name(self, kind: str) -> str:
         """Return the Core ML graph output name used for ``kind``.
