@@ -494,6 +494,8 @@ def test_resolve_dispatch_unsupported_architecture_lists_supported_models(tmp_pa
     assert "Qwen/Qwen3-Reranker-0.6B" in message
     assert "Gemma 3" in message
     assert "google/embeddinggemma-300m" in message
+    assert "EmbeddingGemma 2" in message
+    assert "google/embeddinggemma-2" in message
 
 
 def test_resolve_dispatch_missing_config_json(tmp_path: Path) -> None:
@@ -551,6 +553,7 @@ def test_resolve_dispatch_bad_architectures_field(tmp_path: Path, config: object
         ("XLMRobertaModel", "XlmRobertaBackend", "XLMRoberta"),
         ("RobertaModel", "XlmRobertaBackend", "XLMRoberta"),
         ("Gemma3TextModel", "Gemma3Backend", "Gemma3Text"),
+        ("EmbeddingGemma2Model", "EmbeddingGemma2Backend", "EmbeddingGemma2"),
     ],
 )
 def test_dispatch_load_backend_returns_the_registered_backend(

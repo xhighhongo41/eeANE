@@ -13,6 +13,7 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 import torch
+from transformers.models.embedding_gemma2 import modeling_embedding_gemma2
 from transformers.models.gemma3 import modeling_gemma3
 from transformers.models.qwen3 import modeling_qwen3
 
@@ -24,10 +25,12 @@ from eeane.compiler.backends import qwen3 as q3
 _UPSTREAM_ROTATE_HALF: dict[str, Callable[..., torch.Tensor]] = {
     "qwen3": modeling_qwen3.rotate_half,
     "gemma3": modeling_gemma3.rotate_half,
+    "embedding_gemma2": modeling_embedding_gemma2.rotate_half,
 }
 _UPSTREAM_REPEAT_KV: dict[str, Callable[..., torch.Tensor]] = {
     "qwen3": modeling_qwen3.repeat_kv,
     "gemma3": modeling_gemma3.repeat_kv,
+    "embedding_gemma2": modeling_embedding_gemma2.repeat_kv,
 }
 
 
