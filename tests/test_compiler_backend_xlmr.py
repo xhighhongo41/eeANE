@@ -679,8 +679,10 @@ def test_max_seq_len_matches_the_length_the_model_actually_accepts(tmp_path: Pat
     too_long_ids, too_long_mask = _tiny_inputs(reported + 1)
     with torch.no_grad():
         model(input_ids=usable_ids, attention_mask=usable_mask)  # must be accepted
-    with pytest.raises(IndexError):
-        # One token more addresses a position the table does not have.
+    with pytest.raises((IndexError, RuntimeError)):
+        # One token more addresses a position the tables do not have: the
+        # position embedding (IndexError) or, first in transformers 5, the
+        # default segment ids gathered by position (RuntimeError).
         with torch.no_grad():
             model(input_ids=too_long_ids, attention_mask=too_long_mask)
 
