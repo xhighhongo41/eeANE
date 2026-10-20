@@ -96,6 +96,7 @@ from eeane.compiler.backends.common import (
     read_pooling_mode,
     tokenize_batch,
 )
+from eeane.compiler.backends.masks import bidirectional_masks as build_bidirectional_masks
 
 # Public surface of this module.
 __all__ = [
@@ -826,76 +827,6 @@ def _condition_loaded_model(loaded: LoadedModel) -> dict[str, Any]:
     # A copy, so that a caller editing its metadata cannot alter what the
     # model remembers.
     return copy.deepcopy(record)
-
-
-def build_bidirectional_masks(
-    attention_mask: torch.Tensor, window: int, fill_value: float = MASK_FILL_VALUE
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the two additive 4-D attention masks of a bidirectional stack.
-
-    Both masks are ``0.0`` where a query position may attend to a key
-    position and ``fill_value`` everywhere else:
-
-    * the *full* mask hides a key only when it is padding;
-    * the *sliding* mask additionally hides every key that is ``window``
-      or more positions away from the query, in either direction -- the
-      bound is exclusive, so a key is visible when
-      ``abs(query - key) < window``.
-
-    Handing these to the backbone as a mapping from layer type to mask
-    replaces the framework's own mask construction with these few
-    operations. The numbers are the ones the framework's path produces
-    (with the finite fill value substituted), which is what keeps the FP32
-    baseline -- which does go through the framework's path -- an
-    independent check.
-
-    Both conditions are combined as booleans before anything is filled, so
-    a key that is hidden twice (padding *and* out of reach) is still
-    filled exactly once. Only ``torch.arange`` comparisons, a broadcast
-    and ``torch.where`` are used, with no data-dependent control flow: the
-    distance half is a constant the tracer folds away, and the padding
-    half stays a broadcast of the input mask. Both masks are always built,
-    whichever layer types the model at hand happens to hold.
-
-    Args:
-        attention_mask: 2-D mask of shape ``(B, S)``, integer or float,
-            where a non-zero value marks a real token.
-        window: Exclusive half-width of the sliding layers' window, as
-            held by the *loaded* configuration (which has already derived
-            it from the stored value). A window of ``S`` or more hides
-            nothing, and the sliding mask then equals the full one.
-        fill_value: Additive value written into masked positions; see
-            :data:`MASK_FILL_VALUE` for why it is a finite number.
-
-    Returns:
-        Tuple ``(full, sliding)`` of float32 tensors, each of shape
-        ``(B, 1, S, S)``.
-
-    Raises:
-        ValueError: If ``window`` is not a positive integer.
-    """
-    # bool is a subclass of int, but ``True`` is not a window.
-    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
-        raise ValueError(f"window must be a positive integer (got {window!r})")
-    device = attention_mask.device
-    seq_len = attention_mask.shape[-1]
-    positions = torch.arange(seq_len, device=device)
-    # distance[i, j] is how far key j is from query i, in either direction.
-    distance = (positions.unsqueeze(0) - positions.unsqueeze(-1)).abs()  # (S, S)
-    within_window = distance < window  # (S, S)
-    # An all-true (S, S) grid, so the full mask gets its query axis by the
-    # same broadcast as the sliding one instead of by an expand over a
-    # traced size. It is written as a comparison, like the window above,
-    # because that is what reaches the Core ML converter as a boolean: a
-    # ``ones_like`` of a boolean tensor arrives there as a float, which
-    # the logical "and" below does not accept.
-    everywhere = distance >= 0
-    key_is_real = attention_mask.to(torch.bool)[:, None, None, :]  # (B, 1, 1, S)
-    zero = torch.zeros((), dtype=torch.float32, device=device)
-    fill = torch.full((), fill_value, dtype=torch.float32, device=device)
-    full = torch.where(everywhere[None, None, :, :] & key_is_real, zero, fill)
-    sliding = torch.where(within_window[None, None, :, :] & key_is_real, zero, fill)
-    return full, sliding
 
 
 class BidirectionalMeanWrapper(torch.nn.Module):
