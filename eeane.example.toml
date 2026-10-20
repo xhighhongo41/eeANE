@@ -83,6 +83,12 @@ id = "cl-nagoya/ruri-v3-reranker-310m"
 # [[models]]
 # id = "google/embeddinggemma-300m"
 
+# EmbeddingGemma 2 (text embeddings only). The prefix strings are the same
+# as for google/embeddinggemma-300m above and are likewise added by the
+# client, not by eeANE (see API in the README).
+# [[models]]
+# id = "google/embeddinggemma-2"
+
 # The explicit form pins every field independently of the cache -- for
 # artifacts moved elsewhere, or to serve a hand-picked bucket set.
 # Requests are routed to the smallest bucket that fits; longer inputs
