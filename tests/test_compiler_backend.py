@@ -1332,7 +1332,38 @@ def _write_model_directory(directory: Path, pooling_flag: str) -> Path:
     # (256 bytes + 4 special tokens), so the vocabulary must be larger than
     # the default _tiny_model() size to keep every id addressable.
     _tiny_model(vocab_size=300).save_pretrained(directory)
+    _write_tokenizer(directory)
 
+    _write_json(
+        directory / mb.POOLING_DIRNAME / "config.json",
+        {"word_embedding_dimension": 32, pooling_flag: True},
+    )
+    return directory
+
+
+def _write_reranker_directory(directory: Path) -> Path:
+    """Save a tiny randomly initialised reranker as a HuggingFace directory.
+
+    Args:
+        directory: Destination directory; created if needed.
+
+    Returns:
+        ``directory``, holding weights, config and tokenizer files of a
+        single-logit sequence classifier that mean-pools, as the rerankers
+        of this family do.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    config = _tiny_config(vocab_size=300, num_labels=1, classifier_pooling="mean")
+    torch.manual_seed(0)
+    modeling_modernbert.ModernBertForSequenceClassification(config).eval().save_pretrained(
+        directory
+    )
+    _write_tokenizer(directory)
+    return directory
+
+
+def _write_tokenizer(directory: Path) -> None:
+    """Save a byte-level fast tokenizer into ``directory``."""
     # Byte-level vocabulary with no merges: every byte is its own token, so
     # Japanese fixtures tokenize without shipping a real vocab file.
     vocab = {"<pad>": 0, "<unk>": 1, "<s>": 2, "</s>": 3}
@@ -1354,12 +1385,6 @@ def _write_model_directory(directory: Path, pooling_flag: str) -> Path:
         eos_token="</s>",
         model_max_length=64,
     ).save_pretrained(directory)
-
-    _write_json(
-        directory / mb.POOLING_DIRNAME / "config.json",
-        {"word_embedding_dimension": 32, pooling_flag: True},
-    )
-    return directory
 
 
 @pytest.fixture(scope="module")
@@ -1388,6 +1413,27 @@ def test_synthetic_cls_embedding_model_wrap_matches_the_fp32_reference(
     assert np.abs(smoke["patched"] - smoke["reference"]).max() < PATCH_ABS_TOLERANCE
 
 
+@pytest.fixture(scope="module")
+def reranker_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Synthetic ModernBERT reranker directory."""
+    return _write_reranker_directory(tmp_path_factory.mktemp("modernbert-reranker"))
+
+
+def test_synthetic_reranker_wrap_matches_the_fp32_reference(reranker_dir: Path) -> None:
+    """A reranker must load, wrap and score like its FP32 reference.
+
+    The classification head reads the backbone's output by attribute, so a
+    load that makes the backbone return a plain tuple breaks the forward
+    pass itself; this runs on a tiny synthetic directory, so it is caught
+    without the real reranker at hand.
+    """
+    smoke = _run_smoke(reranker_dir, "reranker", seq_len=_SYNTHETIC_SMOKE_SEQ_LEN)
+
+    assert smoke["handle"]["pooling"] is None
+    assert np.isfinite(smoke["patched"]).all()
+    assert np.abs(smoke["patched"] - smoke["reference"]).max() < PATCH_ABS_TOLERANCE
+
+
 @pytest.mark.parametrize("smoke_fixture", ["embedding_smoke", "reranker_smoke"])
 def test_tokenize_returns_fixed_shape_int32_arrays(
     smoke_fixture: str, request: pytest.FixtureRequest
@@ -1403,13 +1449,23 @@ def test_tokenize_returns_fixed_shape_int32_arrays(
 
 
 @pytest.mark.parametrize(
-    ("smoke_fixture", "kind", "pooling"),
-    [("embedding_smoke", "embedding", "mean"), ("reranker_smoke", "reranker", None)],
+    ("smoke_fixture", "kind", "pooling", "return_dict"),
+    [
+        ("embedding_smoke", "embedding", "mean", False),
+        ("reranker_smoke", "reranker", None, True),
+    ],
 )
 def test_load_returns_a_conforming_handle(
-    smoke_fixture: str, kind: str, pooling: str | None, request: pytest.FixtureRequest
+    smoke_fixture: str,
+    kind: str,
+    pooling: str | None,
+    return_dict: bool,
+    request: pytest.FixtureRequest,
 ) -> None:
-    """load must hand back an eval/FP32/tuple-output model plus its tokenizer and config.
+    """load must hand back an eval/FP32 model plus its tokenizer and config.
+
+    An embedding backbone returns tuples; a reranker keeps structured
+    outputs, which its classification head relies on.
 
     ``pooling`` for the embedding case is not a hard-coded constant: it is
     whatever load() detected from ruri-v3-310m's own
@@ -1424,7 +1480,7 @@ def test_load_returns_a_conforming_handle(
     assert handle["model_dir"].is_dir()
     assert handle["training"] is False
     assert handle["dtype"] == torch.float32
-    assert handle["return_dict"] is False
+    assert handle["return_dict"] is return_dict
     assert handle["config_is_model_config"] is True
     assert handle["tokenizer_encodes"] is True
 

@@ -117,7 +117,8 @@ def test_freeze_tokenizer_reports_what_it_froze(tmp_path: Path) -> None:
     info = freeze_tokenizer(DEFAULT_RERANKER_DIR, out_path)
 
     assert out_path.is_file()  # parent directories are created
-    assert info["tokenizer_class"] == "LlamaTokenizerFast"
+    # transformers 5 serves every fast tokenizer through one backend class.
+    assert info["tokenizer_class"] == "TokenizersBackend"
     assert info["pad_token"] == "<pad>"
     assert info["padding_direction"] == "right"
     assert Path(info["path"]) == out_path

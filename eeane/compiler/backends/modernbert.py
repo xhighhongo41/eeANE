@@ -419,11 +419,12 @@ class ModernBertBackend:
                 for the FP32 reference.
 
         Returns:
-            A handle holding the model in eval/FP32 mode with
-            ``config.return_dict = False`` (``torch.jit.trace`` needs tuple
-            outputs), its tokenizer, its configuration and -- for an
-            embedding model -- the pooling and the Dense projection
-            declared by the model directory.
+            A handle holding the model in eval/FP32 mode -- an embedding
+            model with ``config.return_dict = False``, a reranker with
+            the configuration's own setting (see below) -- its tokenizer,
+            its configuration and -- for an embedding model -- the
+            pooling and the Dense projection declared by the model
+            directory.
 
         Raises:
             ValueError: If ``kind`` is not supported by this backend, if
@@ -442,7 +443,13 @@ class ModernBertBackend:
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         loader = AutoModel if embedding else AutoModelForSequenceClassification
         model = loader.from_pretrained(model_dir, attn_implementation=attn, dtype=torch.float32)
-        model.config.return_dict = False
+        if embedding:
+            model.config.return_dict = False
+        # A reranker keeps structured outputs: its classification head reads
+        # the backbone's output by attribute, and the backbone, sharing the
+        # configuration, would return a plain tuple. The wrappers and the
+        # FP32 reference take ``outputs[0]`` -- the logits -- either way,
+        # and the traced graph's own output is that tensor.
         return LoadedModel(
             model=model.eval(),
             tokenizer=tokenizer,
